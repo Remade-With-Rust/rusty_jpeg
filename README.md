@@ -65,8 +65,9 @@ Where the speed comes from, all gated on byte-identical output:
 - **buffered entropy reads with a bulk 8-byte refill**, and **recycled** output
   planes and MCU-row coefficient buffers;
 - **no rayon.** Upstream `jpeg-decoder` enables it by default; measured here it
-  is a net loss at every image size — turning it off took 1080p decode from
-  6.94 to **3.82 ms/frame**.
+  is a net loss at **every** image size — 1.32× slower at 640×480, **1.91×** at
+  1920×1080, 1.32× at 3840×2160. The fork-join costs more than the parallelism
+  it buys within a single frame.
 
 `Decoder::set_single_threaded(true)` selects the synchronous worker, which uses
 **~38% less CPU** than the threaded one; the threaded default is still the
