@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      # The encoder is gated against the decoder as a round-trip oracle, and the
+      # AVX2 kernels are gated byte-identical against their scalar/SSSE3 twins.
+      # Release mode matters: the SIMD paths are what those oracles compare.
+      - name: Test (release)
+        run: cargo test --release
+      # The no-SIMD, forbid(unsafe_code) configuration must also stay green.
+      - name: Test (platform_independent)
+        run: cargo test --release --no-default-features --features std,platform_independent
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings

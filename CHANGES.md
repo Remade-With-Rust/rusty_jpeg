@@ -1,0 +1,92 @@
+# Changes since vendoring
+
+Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
+`jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
+upstream possible.
+
+## 0.1.2
+
+Performance and one real API defect. All changes gated on **unchanged decoded
+output** (whole-image checksums on six fixtures) and the full suite.
+
+- **AVX2 two-block IDCT.** The SSSE3 kernel widened to 256 bits, transforming
+  two 8×8 blocks per instruction stream — block A in the low 128-bit lane, block
+  B in the high one. Every operation involved is lane-independent (the
+  arithmetic is elementwise; `unpack`/`packus` never cross the lane boundary, so
+  the 8×8 transpose transposes each block separately), which makes the output
+  **byte-identical to running the SSSE3 kernel twice** rather than merely close.
+  A 64-round oracle test asserts exactly that, including a saturation round at
+  `i16::MAX`/`i16::MIN`/`u16::MAX`. Worth **7.8%** of whole-frame decode; covers
+  98.5% of blocks needing a full transform (the rest are DC-only and take a
+  cheaper fill).
+- **`set_single_threaded` actually works now.** It was a public API that did
+  **nothing** on baseline JPEGs: the scan-loop call site hardcoded the
+  multithreaded worker, and because the worker is cached on first use that site
+  won. Nothing caught it because output is identical either way — only cost
+  differs, and it differed a lot. The synchronous worker uses **~38% less CPU**,
+  and enabling it also made `reclaim_buffer` live, so MCU-row coefficient
+  buffers are recycled instead of reallocating ~6.3 MB per 1080p frame
+  (`DecMcuRowAlloc` 5.82% → 1.57%). Regression-gated by
+  `single_threaded_flag_selects_the_immediate_worker_on_baseline`, with the
+  choice observable via `decode::last_worker_was_immediate()`.
+- **DC-only fill split out** (`fill_dc_only`) so a caller that has already
+  established a block has no AC energy takes the shortcut without rescanning all
+  63 coefficients.
+- Loop-invariant hoists on the fast-AC path (the `ac_lut` `Option` discriminant
+  and `ac_table.unwrap()`), kept for being strictly less work — the speed effect
+  measured inside the noise floor.
+- New `counters` feature, split from `profile`: deterministic event counters
+  (symbols, refills, LUT hits/misses, IDCT pairs). Separate on purpose —
+  enabling both at once perturbed cycle counts 3×.
+
+Measured against FFmpeg 8.1.2, one pinned core, CPU time, matched output size:
+**encode 1.19× faster**, **decode at parity** (paired ABBA, N=21, inside noise).
+
+## Vendoring (brick 1)
+
+Mechanical only. **Gate: byte-identical encode and decode output vs the
+pre-vendor build, verified on 4K and 8K frames.**
+
+- `jpeg-decoder/src/` → `src/decode/`, `jpeg-encoder/src/` → `src/encode/`;
+  each upstream `lib.rs` became the module's `mod.rs`.
+- Intra-crate paths re-rooted (`crate::x` → `crate::decode::x` / `crate::encode::x`).
+- Crate-level attributes moved to `src/lib.rs`. The encoder's `#![no_std]` was
+  dropped (the merged crate is `std`); its `forbid(unsafe_code)`-unless-`simd`
+  and the decoder's `deny(unsafe_code)` are preserved as module-level
+  attributes, so the unsafe surface is unchanged.
+- Upstream crate-level doc comments replaced with module docs (their doctests
+  referenced test fixtures that were not vendored).
+- The encoder's round-trip tests used `jpeg-decoder` as a dev-dependency; they
+  now use `crate::decode`, making the round-trip oracle in-crate and permanent.
+- Features renamed into one namespace. **`simd` is now ON by default** — this
+  is the one behavioural change, and it is why encode output is byte-identical
+  to the *simd-enabled* pre-vendor build rather than the workspace's previous
+  scalar default.
+
+## Planar Y'CbCr encode input (brick 2)
+
+Added [`encode::PlanarYcbcrImage`] — an `ImageBuffer` over planar `yuv420p` /
+`yuv422p` / `yuv444p` planes with per-plane strides.
+
+JPEG *is* a Y'CbCr codec, so a planar video frame already sits in the right
+colour space at the right chroma resolution. Encoding it via RGB, as callers
+previously had to, converted colour twice and resampled chroma up and then back
+down. Measured on a 4K frame: **488 ms → 245 ms** (2.0x) and the chroma
+round-trip loss gone.
+
+It is exactly lossless, and the reason is worth writing down: the encoder
+subsamples in `get_block`, which **point-samples** — it takes every Nth sample
+and does not average. So replicating each chroma sample `h`x`v` times in
+`fill_buffers` is precisely undone. The one condition is that the encoder's
+`SamplingFactor` matches the source layout, which is what
+`PlanarYcbcrImage::sampling_factor()` returns.
+
+> Note for future quality work: that point-sampling is also a real defect when
+> the encoder genuinely has to downsample (a 4:4:4 source asked to emit 4:2:0).
+> Dropping 3 of every 4 chroma samples without a low-pass aliases; libjpeg
+> averages. Fixing it is a candidate for the chroma RD gap, but it changes
+> output, so it needs the corpus gate.
+
+Decode still returns interleaved RGB: the decoder runs its chroma upsampler
+before colour conversion, so a planar decode path needs a tap ahead of the
+upsampler. Not yet done.
