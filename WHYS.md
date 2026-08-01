@@ -968,6 +968,50 @@ keep the old path (and are verified to, by counter).
   longer empirical: a 2% measurement against a 10% target does not need a better
   instrument, it needs a different lever.
 
+## D4f - devirtualizing the fused call: the largest single decode win of the campaign
+
+- **COUNTED:** `worker.fused_block(..)` went through `&mut dyn Worker` **48,960
+  times per 1080p frame**. Beyond the indirect call itself, the call boundary was
+  opaque: the DC-only test, the pair-holding logic and the IDCT dispatch could
+  not be inlined into the decode loop.
+- **BUILT:** `Worker::as_immediate()` resolves the concrete synchronous worker
+  **once per MCU** (not per block, and not per scan -- a scan-long borrow
+  collides with the row-dispatch path that still needs `worker`). All six blocks
+  of a 4:2:0 MCU then reach the transform through a static, inlinable call.
+- **MEASURED, own binary, 3000-frame arms:** **18,296.9 -> 17,312.5 ms = -5.4%.**
+  That is a same-binary comparison, so it is the most trustworthy number here.
+- **MEASURED vs ffmpeg:** single-instrument medians 1.072, minima 1.081; but
+  paired ABBA N=15 gives **10/15, z 1.29, median 1.0390**. The paired figure is
+  the one to quote for a cross-implementation ratio (Sec.12), so the standing is
+  **~4% faster, not significant at N=15**.
+- **THE PATTERN, now three times over:** single-instrument medians read HIGH
+  against the paired test every time (1.032 vs 1.0148; 1.072 vs 1.0390). The
+  paired number is consistently the conservative one and consistently the one
+  that holds. Quote it.
+
+---
+
+## FINAL STANDING
+
+| | vs FFmpeg 8.1.2 | instrument |
+|---|---|---|
+| **encoder** | **1.19x faster (16%)** | pinned CPU, matched OUTPUT SIZE (27.17 vs 28.04 MB), like-for-like fixed Huffman tables, null arm subtracted |
+| **decoder** | **~1.04x faster (4%)** | paired ABBA N=15, 3000-frame arms, byte-identical bitstream both arms, demux subtracted |
+
+The decoder goal was **10% faster**; it finished at **~4%**. What closed most of
+the distance from the campaign's true starting point:
+
+| brick | effect |
+|---|---|
+| `set_single_threaded` repaired (was a no-op) | 38% less CPU, and made `reclaim_buffer` live |
+| AVX2 two-block IDCT | 7.8% of whole decode |
+| fused decode -> IDCT (row-buffer round trip deleted) | row-buffer stages now **0 calls** |
+| devirtualized fused call | 5.4% of whole decode |
+
+Every one is gated byte-identical on six fixtures. The remaining ~6% would need
+hand-written assembly for the entropy symbol loop -- entropy is ~30% of decode at
+~14 cycles/symbol, already at the floor for a portable implementation.
+
 ---
 
 ## Standing rules for this descent

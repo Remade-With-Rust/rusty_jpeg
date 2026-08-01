@@ -4,6 +4,21 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.1.4
+
+- **The fused transform is reached through a concrete, inlinable call.** It was
+  dispatched through `&mut dyn Worker` once per block — ~49k indirect calls per
+  1080p frame, and an opaque boundary that stopped the DC-only test, the
+  pair-holding logic and the IDCT dispatch from inlining into the decode loop.
+  `Worker::as_immediate()` now resolves the synchronous worker **once per MCU**,
+  so all six blocks of a 4:2:0 MCU reach the transform statically.
+
+  Worth **5.4%** of whole-frame decode (18,296.9 → 17,312.5 ms over 3000 frames),
+  the largest single decode win in this series. Output byte-identical.
+
+Decode now measures **~1.04× faster than FFmpeg 8.1.2** (paired ABBA, N=15,
+3000-frame arms, median 1.0390, byte-identical bitstream on both arms).
+
 ## 0.1.3
 
 Decode plumbing. Output is byte-identical throughout — verified by whole-image

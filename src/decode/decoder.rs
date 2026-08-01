@@ -1095,10 +1095,13 @@ impl<R: Read> Decoder<R> {
         // Restricted to baseline interleaved scans: progressive revisits blocks
         // across scans and non-interleaved streams index the row buffer by their
         // position WITHIN a batch, so both still need the buffer.
-        let use_fused = worker.supports_fused()
+        let fused_eligible = worker.supports_fused()
             && !is_progressive
             && is_interleaved
             && scan.successive_approximation_high == 0;
+        // `supports_fused` is true for exactly the worker `as_immediate`
+        // resolves, so this bool decides both paths.
+        let use_fused = fused_eligible;
         let mut dummy_block = [0i16; 64];
         let mut huffman = HuffmanDecoder::new();
         let mut dc_predictors = [0i16; MAX_COMPONENTS];
@@ -1195,6 +1198,12 @@ impl<R: Read> Decoder<R> {
                 }
 
                 let _bl = crate::prof::scope(crate::prof::Stage::DecBlockLoop);
+                // Resolved once per MCU rather than once per block: all six
+                // blocks of a 4:2:0 MCU then reach the transform through a
+                // STATIC call the optimizer can inline, instead of six indirect
+                // ones through `&mut dyn Worker`. The borrow is scoped to this
+                // loop so the row-dispatch code below can still use `worker`.
+                let mut fused_worker = if use_fused { worker.as_immediate() } else { None };
                 for (i, component) in components.iter().enumerate() {
                     // Hoisted out of the per-BLOCK loops below. All of this is
                     // fixed for the whole component, but it used to be
@@ -1226,7 +1235,10 @@ impl<R: Read> Decoder<R> {
                                     (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
                                 let bx =
                                     (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
-                                worker.fused_block(i, by, bx, &block);
+                                fused_worker
+                                    .as_mut()
+                                    .unwrap()
+                                    .fused_block_inner(i, by, bx, &block);
                                 continue;
                             }
                             let coefficients = if is_progressive {

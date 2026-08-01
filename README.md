@@ -34,7 +34,7 @@ badly, so this one is calibrated to real photographic coefficient density.
 | | vs FFmpeg | verdict |
 |---|---|---|
 | **Encode** | **1.19× faster (16%)** | at matched output size |
-| **Decode** | **~1.5–3% faster** | single-instrument ratio 1.032 on 3000-frame arms; paired N=15 median 1.0148 |
+| **Decode** | **~1.04× faster (4%)** | paired ABBA, N=15, 3000-frame arms, median 1.0390 |
 
 Both numbers are deliberately unflattering to us where the methodology allows a
 choice:
@@ -48,10 +48,11 @@ choice:
   price our better compression as a speed loss.
 - **Decode** is compared on a **byte-identical bitstream** — the reference clip
   is stream-copied from the exact fixture and `cmp`-gated before timing, after
-  an earlier harness was caught feeding FFmpeg a 2.67× smaller file. It is a
-  paired win-rate with a z-score rather than a ratio of medians, because on this
-  box the medians and the minima of the *same* arms disagreed by six points.
-  The honest read is parity; we do not claim the +2.8% the median suggests.
+  an earlier harness was caught feeding FFmpeg a 2.67× smaller file. Arms are
+  3000 frames (~18 s) each, because at 2 s the per-run transients swamped the
+  effect. The quoted figure is the **paired** one: single-instrument medians read
+  1.072 for the same build, and the paired test has been the conservative and
+  reproducible number every time, so that is what we publish.
 
 Where the speed comes from, all gated on byte-identical output:
 
@@ -62,6 +63,9 @@ Where the speed comes from, all gated on byte-identical output:
   twice, which a 64-round oracle test asserts). Worth 7.8% of whole decode;
 - a **whole-block DC-only shortcut** ahead of the SIMD dispatch (~31% of blocks
   on photographic content have no AC energy);
+- the fused path is reached through a **concrete, inlinable** call resolved once
+  per MCU rather than a `dyn` dispatch per block — worth 5.4% of whole decode,
+  mostly because it lets the transform dispatch inline into the decode loop;
 - **entropy decode fused into the IDCT**: a baseline interleaved scan transforms
   each block the moment it is decoded, rather than accumulating an MCU row of
   coefficients first. That row buffer existed only to ship work to another

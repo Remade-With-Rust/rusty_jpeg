@@ -192,7 +192,8 @@ impl ImmediateWorker {
     ///
     /// Holds a block back so horizontally adjacent pairs can go through the
     /// two-block AVX2 kernel, exactly as the row-batched path does.
-    fn fused_block_inner(&mut self, index: usize, block_y: usize, block_x: usize, coeffs: &[i16; 64]) {
+    #[inline]
+    pub(crate) fn fused_block_inner(&mut self, index: usize, block_y: usize, block_x: usize, coeffs: &[i16; 64]) {
         let component = self.components[index].as_ref().unwrap();
         let scale = component.dct_scale;
         let line_stride = component.block_size.width as usize * scale;
@@ -285,6 +286,10 @@ impl Worker for ImmediateWorker {
 
     fn supports_fused(&self) -> bool {
         true
+    }
+
+    fn as_immediate(&mut self) -> Option<&mut ImmediateWorker> {
+        Some(self)
     }
 
     fn fused_block(&mut self, index: usize, block_y: usize, block_x: usize, coeffs: &[i16; 64]) {

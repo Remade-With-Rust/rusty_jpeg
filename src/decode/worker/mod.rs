@@ -53,6 +53,17 @@ pub trait Worker {
         Ok(())
     }
 
+    /// Concrete access to the synchronous worker, when this IS one.
+    ///
+    /// `fused_block` is called once per block -- ~49k times per 1080p frame --
+    /// and through `&mut dyn Worker` every one of those is an indirect call that
+    /// also blocks inlining of the transform dispatch into the decode loop.
+    /// Resolving the concrete type ONCE per scan makes the whole fused body a
+    /// static call the optimizer can see through.
+    fn as_immediate(&mut self) -> Option<&mut immediate::ImmediateWorker> {
+        None
+    }
+
     /// Whether this worker can inverse-transform a block the moment it is
     /// decoded, instead of accumulating a whole MCU row of coefficients first.
     ///
