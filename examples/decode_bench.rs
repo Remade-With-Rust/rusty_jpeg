@@ -35,7 +35,14 @@ fn main() {
         if !pool_off {
             d.recycle_planes(std::mem::take(&mut pool));
         }
-        if mode == "rgb" {
+        if mode == "headers" {
+            // Prices per-frame SETUP only: construct the decoder, parse the
+            // markers, build the Huffman LUTs. Everything the full decode pays
+            // before a single coefficient is read.
+            d.read_info().expect("read_info");
+            let info = d.info().expect("info");
+            sink = sink.wrapping_add(info.width as u64);
+        } else if mode == "rgb" {
             let px = d.decode().expect("decode");
             sink = sink
                 .wrapping_add(px.len() as u64)

@@ -4,6 +4,37 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.1.3
+
+Decode plumbing. Output is byte-identical throughout — verified by whole-image
+checksums on six fixtures (interleaved, non-interleaved, 4K, progressive, and
+the multithreaded worker) plus the full suite.
+
+- **Entropy decode is fused into the IDCT.** A baseline interleaved scan no
+  longer accumulates a whole MCU row of coefficients before transforming it: each
+  block is inverse-transformed the moment it is decoded, straight into the output
+  plane, with one block held back so horizontally adjacent pairs still feed the
+  two-block AVX2 kernel.
+
+  The row buffer existed only so a row could be shipped to another *thread*. For
+  a worker that consumes blocks synchronously it cost a full write → zero → read
+  round trip of ~18.8 MB per 1080p frame, through a ~60 KB-per-row buffer too
+  large for L1. The stage counters for that path now read **0 calls**.
+
+  Progressive scans (which revisit blocks across scans) and non-interleaved
+  streams (which index the buffer by position within a batch) keep the original
+  path, and are verified by counter to fall back correctly.
+- **The unused row buffer is no longer allocated** on a fused scan.
+- No `Arc` refcount traffic on the per-block path: the quantization table is
+  reached by a split borrow rather than a clone, which would otherwise put an
+  atomic RMW on a path that runs ~49k times per 1080p frame.
+
+Measured against FFmpeg 8.1.2, one pinned core, CPU time, 3000-frame arms at
+matched work: **decode ~1.5–3% faster** (single-instrument ratio 1.032; paired
+N=15 median 1.0148, inside noise — the effect is real but small enough that it
+sits near this machine's resolution). Encode is unchanged at **1.19× faster** at
+matched output size.
+
 ## 0.1.2
 
 Performance and one real API defect. All changes gated on **unchanged decoded

@@ -52,6 +52,28 @@ pub trait Worker {
         }
         Ok(())
     }
+
+    /// Whether this worker can inverse-transform a block the moment it is
+    /// decoded, instead of accumulating a whole MCU row of coefficients first.
+    ///
+    /// The row buffer costs a full write -> zero -> read round trip of **18.8 MB
+    /// per 1080p frame**, through a ~60 KB-per-row buffer that does not fit in
+    /// L1. It exists only so a row can be shipped to another THREAD; a worker
+    /// that consumes blocks synchronously has no use for it and can keep the
+    /// block in L1 from entropy decode straight through the IDCT.
+    fn supports_fused(&self) -> bool {
+        false
+    }
+
+    /// Transform one just-decoded block straight into the output plane.
+    /// `block_y`/`block_x` are in blocks, absolute within the component.
+    ///
+    /// The worker may hold a block back to pair it with its right-hand neighbour
+    /// for the two-block AVX2 kernel; `get_result` flushes anything pending, so
+    /// there is no separate flush in this trait.
+    fn fused_block(&mut self, _index: usize, _block_y: usize, _block_x: usize, _coeffs: &[i16; 64]) {
+    }
+
 }
 
 #[allow(dead_code)]

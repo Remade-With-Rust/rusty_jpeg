@@ -34,7 +34,7 @@ badly, so this one is calibrated to real photographic coefficient density.
 | | vs FFmpeg | verdict |
 |---|---|---|
 | **Encode** | **1.19× faster (16%)** | at matched output size |
-| **Decode** | **parity** | paired ABBA, N=21: 13/21, z = 1.09 → inside noise |
+| **Decode** | **~1.5–3% faster** | single-instrument ratio 1.032 on 3000-frame arms; paired N=15 median 1.0148 |
 
 Both numbers are deliberately unflattering to us where the methodology allows a
 choice:
@@ -62,8 +62,13 @@ Where the speed comes from, all gated on byte-identical output:
   twice, which a 64-round oracle test asserts). Worth 7.8% of whole decode;
 - a **whole-block DC-only shortcut** ahead of the SIMD dispatch (~31% of blocks
   on photographic content have no AC energy);
+- **entropy decode fused into the IDCT**: a baseline interleaved scan transforms
+  each block the moment it is decoded, rather than accumulating an MCU row of
+  coefficients first. That row buffer existed only to ship work to another
+  thread, and cost a write → zero → read round trip of ~18.8 MB per 1080p frame
+  through a buffer too large for L1;
 - **buffered entropy reads with a bulk 8-byte refill**, and **recycled** output
-  planes and MCU-row coefficient buffers;
+  planes;
 - **no rayon.** Upstream `jpeg-decoder` enables it by default; measured here it
   is a net loss at **every** image size — 1.32× slower at 640×480, **1.91×** at
   1920×1080, 1.32× at 3840×2160. The fork-join costs more than the parallelism

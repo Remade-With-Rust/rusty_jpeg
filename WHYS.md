@@ -717,6 +717,257 @@ and the `set_single_threaded` repair (38% less CPU, and it made `reclaim_buffer`
 live). The goal of 10% FASTER is **not met**; entropy is now the dominant stage
 and the three cheap levers into it are all refuted on measurements recorded above.
 
+## D5f - three redundancy bricks in the glue: all inside noise, KEPT on less-work
+
+Post-AVX2-IDCT profile put `DecEntropy` at **46.5%**, per-block glue
+(`DecBlockLoop - DecEntropy`) at **19.8%** and dispatch glue at **9.9%**, so the
+glue was attacked with `codec-eliminate-redundancy`'s three cheapest moves:
+
+1. **Integer div/mod per block removed.** `append_row_immediate` recovered the
+   block's grid position with `i % blocks_wide` / `i / blocks_wide` -- division
+   by a RUNTIME width, so it does not strength-reduce, ~49k of each per 1080p
+   frame. Replaced with an incremental cursor.
+2. **Per-component invariants hoisted** out of the per-block loops in
+   `decode_scan`: two double indirections through the scan's table indices plus
+   an `Option::as_ref`, and a `Range` clone, per block.
+3. **Hot indices masked** (`& 63`, `& 255`) so the bounds checks fold without
+   reaching for `unsafe`. Semantically no-ops -- the loop already guarantees
+   `index < spectral_selection.end <= 64`.
+
+- **MEASURED**, paired ABBA vs ffmpeg, checksums identical on all six fixtures
+  throughout:
+
+  | after | N | verdict |
+  |---|---|---|
+  | baseline | 21 | 13/21, z 1.09, median 1.0278 |
+  | + div/mod + hoist | 21 | 14/21, z 1.53, median 1.0336 |
+  | + index masks | 21 | 13/21, z 1.09, median 1.0381 |
+  | **same build, higher N** | **31** | **16/31, z 0.18, median 1.0229** |
+
+- **ANSWER: inside noise.** The medians appeared to creep 1.0187 -> 1.0381 across
+  three bricks, which reads like accumulation. Re-running the *same binary* at
+  N=31 gave **1.0229 and z = 0.18** -- the creep was the estimator, not the code.
+  This is Sec.3's "pairing needs N" landing exactly as written: at N=21 a ~2%
+  effect and a ~4% effect are not distinguishable on this box.
+- **KEPT** on "strictly less work, no correctness risk, output byte-identical",
+  **not** on a speed claim (Sec.12). Each is defensible as code; none is
+  defensible as a number.
+- **LESSON:** three small wins that each look like +0.5% are indistinguishable
+  from three measurements of zero. Do not bank a sum of effects that were each
+  individually inside the noise floor -- re-measure the total at higher N, which
+  is what turned a "+3.8%" story back into parity.
+
+## Standing at the end (superseding the table above)
+
+| | vs ffmpeg | how measured |
+|---|---|---|
+| **encoder** | **1.19x FASTER (16%)** | pinned CPU, matched output size, like-for-like fixed Huffman tables |
+| **decoder** | **PARITY** (16/31, z 0.18, median 1.0229) | paired ABBA across binaries, N=31, byte-identical bitstream |
+
+The 10%-faster decoder goal is **NOT met**. Entropy is ~30% of decode at ~14
+cycles/symbol (see D5g -- the "46.5% at 45 cycles" figure was profiled-build
+inflation), and every cheap lever into it is now refuted on record: LUT
+widening (1.6% miss rate), the fast-AC lookup merge (three probes), and the glue
+redundancies above. What is left is a structural change to the symbol loop, not
+another micro-optimisation.
+
+## D5g - TERMINAL: entropy is at ~14 cycles/symbol, i.e. at the practical floor
+
+This is the answer the five preceding refutations were circling, and it was
+reached by correcting an error in **my own instrument reading**, not by another
+experiment.
+
+- **THE ERROR.** Every "entropy has headroom" claim in this file above was
+  derived from the **profiled** build: `DecEntropy 46.5%`, `~45 cycles/symbol`.
+  But that build's `Total` is **56 Mcycles/frame** against the uninstrumented
+  binary's **~19.6** — a **2.9x probe tax**. Sec.6 says in as many words that the
+  profiler is part of the system under test and that per-symbol stages are
+  inflated and must be priced by ablation instead. I read the shares correctly
+  and then used the *absolute cycles* from the same table to decide where the
+  headroom was. Those two numbers do not belong to the same machine.
+- **THE CORRECTED NUMBER**, ablation on the uninstrumented binary:
+
+  | | |
+  |---|---|
+  | full decode | 2000.0 ms / 300 frames |
+  | entropy ablated | 1265.6 ms |
+  | **entropy** | **734.4 ms = 2.45 ms/frame = ~8.1 Mcycles** |
+  | symbol ops/frame | 129,333 decode + 362,002 fast-AC + 69,852 receive_extend = **561,187** |
+  | **cost** | **~14 cycles per symbol operation** |
+
+- **ANSWER: there is no 2-4x sitting in entropy.** ~14 cycles/symbol for a
+  table-driven Huffman decoder is the same neighbourhood as libjpeg-turbo's C.
+  The stage is ~30% of decode, not 46.5%, and it is running near the floor for
+  this design.
+- **WHY THIS IS THE TERMINAL ENTRY.** It retro-explains every refutation above:
+  LUT widening (1.6% miss), the fast-AC lookup merge (three probes, all <= 0),
+  the invariant hoists, the index masks, the branch hoist -- **five levers, five
+  zeros.** That is not five unlucky ideas, it is the signature of a stage with
+  nothing to give. The register-caching idea (libjpeg's `BITREAD_LOAD_STATE`) was
+  then refuted deterministically and for free: `decode_block` does not exist as a
+  standalone symbol in the emitted assembly -- it is **fully inlined** into
+  `decode_scan`, so the bit buffer is already register-resident across the MCU
+  loop.
+- **WHAT WOULD ACTUALLY BE LEFT:** hand-written assembly for the symbol loop
+  (what libjpeg-turbo does, and why it is faster than every portable C JPEG
+  decoder), or a different bit-reader contract entirely. Both are scoped projects
+  with a modest ceiling, not bricks.
+- **LESSON, and it is the same one twice:** a profiled build tells you SHARES,
+  never CYCLES. I used its absolute figure to size a prize and spent four bricks
+  chasing headroom that the uninstrumented binary said was never there. Compute
+  cycles-per-operation from the ABLATION, and do it before the first brick, not
+  after the fifth.
+
+## D3e - the real remaining lever is PLUMBING, not entropy (next brick, priced)
+
+D5g established entropy is at its floor (~14 cyc/symbol) and IDCT is now ~6-20%.
+Subtracting those from a 5.36 ms/frame decode leaves roughly **half the frame in
+plumbing** -- and the plumbing has one dominant term.
+
+- **COUNTED**, per 1080p 4:2:0 frame (48,960 blocks x 64 coefficients x 2 B):
+
+  | traffic | MB/frame |
+  |---|---|
+  | coefficient buffer WRITTEN by the entropy decoder | 6.27 |
+  | ... ZEROED by `resize` once per MCU row | 6.27 |
+  | ... READ BACK by `append_row` for the IDCT | 6.27 |
+  | **round trip a fused path would remove** | **18.80** |
+  | output planes (unavoidable) | 3.11 |
+
+- **THE SHAPE OF THE FIX:** the coefficients take a full write -> zero -> read
+  round trip through `mcu_row_coefficients` purely so the row can be handed to a
+  *worker*. For the **immediate** worker that indirection buys nothing: the block
+  could be decoded into a small stack buffer and inverse-transformed straight
+  into the output plane. Two blocks at a time keeps the AVX2 pair kernel fed.
+- **CEILING:** removes ~18.8 MB/frame of traffic against a 5.36 ms budget. The
+  buffer is L2-resident (~60 KB per MCU row) so this is not a DRAM-bandwidth
+  calculation and the gain will be well under the naive bytes/bandwidth figure --
+  but it is the only remaining term of the right ORDER to move a decoder that is
+  otherwise at parity.
+- **WHY IT IS NOT DONE HERE:** it is a structural change to the worker path
+  (correctness-sensitive: progressive, non-interleaved and restart-marker
+  streams all flow through the same buffer), and the box's spreads reached
+  **1.50** while this was being measured. A subtle change cannot be validated on
+  an instrument in that state -- and manufacturing a result on a noisy box is the
+  failure this whole file documents. Correctness gates would still pass, which is
+  exactly what makes it tempting and wrong.
+- **STATUS: open, priced, and the highest-value brick left.** It is also the only
+  one whose prize was computed from a COUNT rather than a share.
+
+### Why this was missed for five bricks
+
+The profiled build reported `DecEntropy` at **46.5%**, which made entropy look
+like the whole game. Priced by ablation it is ~30%, and the plumbing -- which the
+profiler splits across `DecBlockLoop` glue, `DecRowDispatch` glue,
+`DecMcuRowAlloc` and `DecPlaneInit`, none individually alarming -- is the larger
+half **when summed**. Stage tables invite you to attack the biggest single row.
+Sum the related rows first.
+
+## D3e-BUILT - fused decode->IDCT SHIPPED; decoder now measurably FASTER than ffmpeg
+
+Built the brick D3e priced. `Worker` gained `supports_fused`/`fused_block`/
+`fused_flush`; the immediate worker inverse-transforms each block the moment it
+is decoded, straight into the output plane, holding one block back so
+horizontally adjacent pairs still feed the two-block AVX2 kernel. Restricted to
+**baseline interleaved** scans -- progressive revisits blocks across scans and
+non-interleaved streams index the row buffer by position within a batch, so both
+keep the old path (and are verified to, by counter).
+
+- **GATED:** all six fixture checksums byte-identical (interleaved,
+  non-interleaved, 4K, progressive, and the multithreaded arm), 58/58 tests.
+  Counters confirm the fused path engages on interleaved input and correctly
+  falls back on non-interleaved.
+
+- **THE DEFECT THAT HID THE WIN.** First measurement: **z -0.54, median 0.9825**
+  -- slightly slower. The fused path was doing
+  `quantization_tables[index].as_ref().unwrap().clone()` per block: an **Arc
+  refcount atomic ~49k times per frame**. Replacing the clone with a split borrow
+  of the two fields was the whole difference. A "the idea does not work" verdict
+  was one atomic away from being recorded as fact.
+
+- **THEN THE INSTRUMENT MISBEHAVED.** Three paired runs of the **same binary**:
+
+  | run | N | verdict |
+  |---|---|---|
+  | first | 31 | 24/31, **z +3.05**, median **1.1238** |
+  | confirmation | 31 | 14/31, **z -0.54**, median **1.0000** |
+  | resolution | **61** | 41/61, **z +2.69**, median **1.0297** |
+
+  The first run would have supported a "**12.4% faster, goal met**" claim. It did
+  not reproduce. The box drifts on a timescale longer than a 31-pair run, so ABBA
+  cancels it only partially and N=31 is simply not enough here. **N=61 is the
+  first N at which this comparison is stable.**
+
+- **STANDING (corrected after a further run): ~2-3% faster, NOT reliably
+  resolvable on this box.** A second N=61 run, after a change that only DELETED
+  an unused allocation and so cannot have slowed anything, read **34/61, z 0.90,
+  median 1.0194 -> inside noise**. Four paired runs of near-identical code:
+
+  | N | verdict |
+  |---|---|
+  | 31 | z **+3.05**, median 1.1238 |
+  | 31 | z **-0.54**, median 1.0000 |
+  | 61 | z **+2.69**, median 1.0297 |
+  | 61 | z **+0.90**, median 1.0194 |
+
+  The medians cluster around **1.02-1.03**, so the honest reading is *slightly
+  faster, around 2-3%*. But the z-score crosses and re-crosses significance
+  between runs, which means **this machine cannot resolve a 3% effect even at
+  N=61.** Quoting the 2.69 run alone would be picking the favourable sample.
+
+- **HONEST CAVEAT on attribution.** The pre-fused baseline read median 1.0229 at
+  N=31 with z 0.18 (not significant). Post-fused reads 1.0297 at N=61 with z 2.69.
+  Those medians are close: what unambiguously changed is the CONFIDENCE, not
+  clearly the speed. Proving the fused path itself is worth ~1% would need a
+  paired run of the two OWN binaries against each other, not each against ffmpeg
+  at different N. Kept regardless: it is byte-identical and strictly removes the
+  row-buffer round trip.
+
+- **LESSON:** when a result is one atomic instruction away from inverting, and
+  four runs of near-identical code straddle the significance line, the answer is
+  more N and a reading of your own new code -- not a verdict. And there is a
+  point where the honest conclusion is about the INSTRUMENT: a ~3% effect is
+  below what this box can resolve, so further tuning at this scale cannot be
+  validated here at all. That is a hard stop on the campaign, not a pause.
+
+## D1-FINAL - the arms were 2 s long all campaign; fixing that settles the standing
+
+- **ASKED:** four paired runs straddled significance. Is that the box, or me?
+- **FOUND (Sec.5, violated by me for the entire campaign):** *"Make each arm run
+  >= ~15 s."* My arms were **~2 s**. Any per-invocation transient is therefore a
+  large FRACTION of each sample, which is exactly the variance that was defeating
+  the paired test.
+- **FIXED:** 3000 frames per arm (~18 s), work parity re-verified first --
+  `-stream_loop 9` was confirmed to decode exactly **3000** frames before being
+  trusted, since that flag has silently under-delivered before.
+- **RESULT: spreads 1.25-1.50 -> 1.06-1.08.** Roughly a quarter the variance.
+
+  | arm | cpu_med | spread |
+  |---|---:|---:|
+  | ours, 3000 frames | 18,296.9 ms | 1.06x |
+  | ffmpeg, net of 437.5 ms demux | 18,875.0 ms | 1.08x |
+
+  Single-instrument ratio **1.032**. Paired at N=15: **10/15, z 1.29, median
+  1.0148 -> inside noise.**
+
+- **THE STANDING, across every instrument tried:** medians cluster at
+  **1.015-1.032**. The decoder is **~1.5-3% faster than ffmpeg** -- marginally
+  ahead, and the exact figure is still not resolved because N=15 cannot certify a
+  1.5% effect even on clean arms.
+
+- **BUT THAT NO LONGER MATTERS, AND THIS IS THE POINT.** The goal is **10%**. The
+  EFFECT SIZE is ~2%. Measuring it more precisely cannot move a 2% effect to 10%;
+  the shortfall is real work, not measurement error. Further N buys a tighter
+  confidence interval around a number that is already known to be far short.
+  **The campaign ends here on arithmetic, not on instrument doubt.**
+
+- **LESSON:** when a comparison will not resolve, check your ARM DURATION before
+  concluding the machine is unusable. I spent four paired runs and a "this box
+  cannot resolve 3%" conclusion on what was a harness-geometry error covered by a
+  rule I had loaded. And once resolved, notice when the remaining question is no
+  longer empirical: a 2% measurement against a 10% target does not need a better
+  instrument, it needs a different lever.
+
 ---
 
 ## Standing rules for this descent

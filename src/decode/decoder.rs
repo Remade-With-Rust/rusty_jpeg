@@ -1086,6 +1086,19 @@ impl<R: Read> Decoder<R> {
 
         let is_progressive = frame.coding_process == CodingProcess::DctProgressive;
         let is_interleaved = components.len() > 1;
+        // Fuse entropy decode straight into the IDCT when the worker consumes
+        // blocks synchronously. That removes the write -> zero -> read round trip
+        // through the per-MCU-row coefficient buffer -- 18.8 MB per 1080p frame
+        // through a ~60 KB buffer that does not fit in L1 -- and keeps each block
+        // in L1 from the symbol loop through the transform.
+        //
+        // Restricted to baseline interleaved scans: progressive revisits blocks
+        // across scans and non-interleaved streams index the row buffer by their
+        // position WITHIN a batch, so both still need the buffer.
+        let use_fused = worker.supports_fused()
+            && !is_progressive
+            && is_interleaved
+            && scan.successive_approximation_high == 0;
         let mut dummy_block = [0i16; 64];
         let mut huffman = HuffmanDecoder::new();
         let mut dc_predictors = [0i16; MAX_COMPONENTS];
@@ -1094,7 +1107,9 @@ impl<R: Read> Decoder<R> {
         let mut eob_run = 0;
         let mut mcu_row_coefficients = vec![vec![]; components.len()];
 
-        if !is_progressive {
+        // A fused scan never touches this buffer -- allocating and zeroing it
+        // would be pure waste.
+        if !is_progressive && !use_fused {
             for (i, component) in components.iter().enumerate().filter(|&(i, _)| finished[i]) {
                 let coefficients_per_mcu_row = component.block_size.width as usize
                     * component.vertical_sampling_factor as usize
@@ -1181,13 +1196,43 @@ impl<R: Read> Decoder<R> {
 
                 let _bl = crate::prof::scope(crate::prof::Stage::DecBlockLoop);
                 for (i, component) in components.iter().enumerate() {
+                    // Hoisted out of the per-BLOCK loops below. All of this is
+                    // fixed for the whole component, but it used to be
+                    // re-derived ~49k times per 1080p frame: two double
+                    // indirections through the scan's table indices plus an
+                    // `Option::as_ref`, and a `Range` clone, per block.
+                    let dc_table = self.dc_huffman_tables[scan.dc_table_indices[i]].as_ref();
+                    let ac_table = self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref();
+                    let spectral_selection = scan.spectral_selection.clone();
+                    let blocks_wide = component.block_size.width as usize;
+                    let fused = use_fused && finished[i];
                     for v_pos in 0..mcu_vertical_samples[i] {
                         for h_pos in 0..mcu_horizontal_samples[i] {
+                            if fused {
+                                // Stack-local, so it never leaves L1.
+                                let mut block = [0i16; 64];
+                                decode_block(
+                                    &mut self.reader,
+                                    &mut block,
+                                    &mut huffman,
+                                    dc_table,
+                                    ac_table,
+                                    spectral_selection.clone(),
+                                    scan.successive_approximation_low,
+                                    &mut eob_run,
+                                    &mut dc_predictors[i],
+                                )?;
+                                let by =
+                                    (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
+                                let bx =
+                                    (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
+                                worker.fused_block(i, by, bx, &block);
+                                continue;
+                            }
                             let coefficients = if is_progressive {
                                 let block_y = (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
                                 let block_x = (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
-                                let block_offset =
-                                    (block_y * component.block_size.width as usize + block_x) * 64;
+                                let block_offset = (block_y * blocks_wide + block_x) * 64;
                                 &mut self.coefficients[scan.component_indices[i]]
                                     [block_offset..block_offset + 64]
                             } else if finished[i] {
@@ -1203,8 +1248,7 @@ impl<R: Read> Decoder<R> {
                                 let block_y = (mcu_batch_current_row * mcu_vertical_samples[i]
                                     + v_pos) as usize;
                                 let block_x = (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
-                                let block_offset =
-                                    (block_y * component.block_size.width as usize + block_x) * 64;
+                                let block_offset = (block_y * blocks_wide + block_x) * 64;
                                 &mut mcu_row_coefficients[i][block_offset..block_offset + 64]
                             } else {
                                 &mut dummy_block[..64]
@@ -1217,9 +1261,9 @@ impl<R: Read> Decoder<R> {
                                     &mut self.reader,
                                     coefficients,
                                     &mut huffman,
-                                    self.dc_huffman_tables[scan.dc_table_indices[i]].as_ref(),
-                                    self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref(),
-                                    scan.spectral_selection.clone(),
+                                    dc_table,
+                                    ac_table,
+                                    spectral_selection.clone(),
                                     scan.successive_approximation_low,
                                     &mut eob_run,
                                     &mut dc_predictors[i],
@@ -1229,8 +1273,8 @@ impl<R: Read> Decoder<R> {
                                     &mut self.reader,
                                     coefficients,
                                     &mut huffman,
-                                    self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref(),
-                                    scan.spectral_selection.clone(),
+                                    ac_table,
+                                    spectral_selection.clone(),
                                     scan.successive_approximation_low,
                                     &mut eob_run,
                                 )?;
@@ -1243,6 +1287,10 @@ impl<R: Read> Decoder<R> {
             // Send the coefficients from this MCU row to the worker thread for dequantization and idct.
             for (i, component) in components.iter().enumerate() {
                 if finished[i] {
+                    if use_fused {
+                        // Already transformed block-by-block; nothing buffered.
+                        continue;
+                    }
                     // In the event of non-interleaved streams, if we're still building the buffer out,
                     // keep going; don't send it yet. We also need to ensure we don't skip over the last
                     // row(s) of the image.
@@ -1395,7 +1443,7 @@ fn decode_block<R: Read>(
                 break;
             }
 
-            coefficients[UNZIGZAG[index as usize] as usize] = value << successive_approximation_low;
+            coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = value << successive_approximation_low;
             index += 1;
         } else {
             let byte = huffman.decode(reader, ac_table)?;
@@ -1422,7 +1470,7 @@ fn decode_block<R: Read>(
                     break;
                 }
 
-                coefficients[UNZIGZAG[index as usize] as usize] =
+                coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
                     huffman.receive_extend(reader, s)? << successive_approximation_low;
                 index += 1;
             }
@@ -1508,7 +1556,7 @@ fn decode_block_successive_approximation<R: Read>(
             index = refine_non_zeroes(reader, coefficients, huffman, range, zero_run_length, bit)?;
 
             if value != 0 {
-                coefficients[UNZIGZAG[index as usize] as usize] = value;
+                coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = value;
             }
 
             index += 1;

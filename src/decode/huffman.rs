@@ -40,7 +40,7 @@ impl HuffmanDecoder {
             self.read_bits(reader)?;
         }
 
-        let (value, size) = table.lut[self.peek_bits(LUT_BITS) as usize];
+        let (value, size) = table.lut[self.peek_bits(LUT_BITS) as usize & ((1 << LUT_BITS) - 1)];
 
         if size > 0 {
             crate::prof::bump(crate::prof::Count::DecLutHit, 1);
@@ -74,7 +74,8 @@ impl HuffmanDecoder {
             self.read_bits(reader)?;
         }
 
-        let (value, run_size) = table.ac_lut[self.peek_bits(LUT_BITS) as usize];
+        let (value, run_size) =
+            table.ac_lut[self.peek_bits(LUT_BITS) as usize & ((1 << LUT_BITS) - 1)];
 
         if run_size != 0 {
             crate::prof::bump(crate::prof::Count::DecFastAcHit, 1);

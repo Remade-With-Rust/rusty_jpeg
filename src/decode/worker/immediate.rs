@@ -16,6 +16,9 @@ pub struct ImmediateWorker {
     /// Last coefficient buffer this worker finished with, offered back to the
     /// caller so it can be refilled rather than reallocated.
     spare: Option<Vec<i16>>,
+    /// A block held back so it can be paired with its right-hand neighbour for
+    /// the two-block AVX2 IDCT. `(component, block_y, block_x, coefficients)`.
+    pending: Option<(usize, usize, usize, [i16; 64])>,
 }
 
 impl Default for ImmediateWorker {
@@ -26,6 +29,7 @@ impl Default for ImmediateWorker {
             components: vec![None; MAX_COMPONENTS],
             quantization_tables: vec![None; MAX_COMPONENTS],
             spare: None,
+            pending: None,
         }
     }
 }
@@ -93,10 +97,15 @@ impl ImmediateWorker {
             None
         };
 
+        // Track the block's grid position incrementally instead of recovering it
+        // with `i % blocks_wide` / `i / blocks_wide`. Those are integer div/mod
+        // by a RUNTIME width, so they do not strength-reduce to shifts -- ~49k
+        // of each per 1080p frame.
         let mut i = 0;
+        let (mut bx, mut by) = (0usize, 0usize);
         while i < block_count {
-            let x = (i % blocks_wide) * component.dct_scale;
-            let y = (i / blocks_wide) * component.dct_scale;
+            let x = bx * component.dct_scale;
+            let y = by * component.dct_scale;
             let coefficients: &[i16; 64] = data[i * 64..(i + 1) * 64].try_into().unwrap();
 
             crate::prof::bump(crate::prof::Count::DecBlocks, 1);
@@ -129,6 +138,13 @@ impl ImmediateWorker {
                                 component.dct_scale,
                             );
                         }
+                        // The pair is only formed when `bx + 1 < blocks_wide`,
+                        // so advancing by two crosses at most one row edge.
+                        bx += 2;
+                        if bx >= blocks_wide {
+                            bx -= blocks_wide;
+                            by += 1;
+                        }
                         i += 2;
                         continue;
                     }
@@ -156,6 +172,11 @@ impl ImmediateWorker {
                     output,
                 );
             }
+            bx += 1;
+            if bx == blocks_wide {
+                bx = 0;
+                by += 1;
+            }
             i += 1;
         }
 
@@ -165,6 +186,78 @@ impl ImmediateWorker {
         // now. Keep it for the caller to refill instead of dropping it and
         // making them allocate + zero a replacement for every MCU row.
         self.spare = Some(data);
+    }
+
+    /// Inverse-transform one block straight into the plane.
+    ///
+    /// Holds a block back so horizontally adjacent pairs can go through the
+    /// two-block AVX2 kernel, exactly as the row-batched path does.
+    fn fused_block_inner(&mut self, index: usize, block_y: usize, block_x: usize, coeffs: &[i16; 64]) {
+        let component = self.components[index].as_ref().unwrap();
+        let scale = component.dct_scale;
+        let line_stride = component.block_size.width as usize * scale;
+
+        crate::prof::bump(crate::prof::Count::DecBlocks, 1);
+        let dc_only = crate::decode::idct::is_dc_only(coeffs);
+        if dc_only {
+            crate::prof::bump(crate::prof::Count::DecDcOnlyBlocks, 1);
+        }
+
+        // A DC-only block is a fill, cheaper than half a vectorized IDCT, so it
+        // never joins a pair.
+        if dc_only || scale != 8 {
+            self.flush_pending(index);
+            let off = block_y * scale * line_stride + block_x * scale;
+            // Borrow the two fields separately. Cloning the Arc instead would
+            // put an atomic refcount RMW on a path that runs ~49k times per
+            // 1080p frame.
+            let qt = self.quantization_tables[index].as_ref().unwrap();
+            let out = &mut self.results[index][off..];
+            let _s = crate::prof::scope(crate::prof::Stage::DecIdct);
+            if dc_only && scale == 8 {
+                crate::decode::idct::fill_dc_only(coeffs, qt, line_stride, out);
+            } else {
+                dequantize_and_idct_block(scale, coeffs, qt, line_stride, out);
+            }
+            return;
+        }
+
+        if let Some((pi, py, px, pcoeffs)) = self.pending.take() {
+            if pi == index && py == block_y && px + 1 == block_x {
+                if let Some(idct_pair) = crate::decode::arch::get_dequantize_and_idct_block_8x8_pair()
+                {
+                    let off = py * scale * line_stride + px * scale;
+                    let qt = self.quantization_tables[index].as_ref().unwrap();
+                    let out = &mut self.results[index][off..];
+                    crate::prof::bump(crate::prof::Count::DecIdctPairs, 1);
+                    let _s = crate::prof::scope(crate::prof::Stage::DecIdct);
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        idct_pair(&pcoeffs, coeffs, qt, line_stride, out, scale);
+                    }
+                    return;
+                }
+            }
+            self.emit_single(pi, py, px, &pcoeffs);
+        }
+        self.pending = Some((index, block_y, block_x, *coeffs));
+    }
+
+    fn emit_single(&mut self, index: usize, block_y: usize, block_x: usize, coeffs: &[i16; 64]) {
+        let component = self.components[index].as_ref().unwrap();
+        let scale = component.dct_scale;
+        let line_stride = component.block_size.width as usize * scale;
+        let off = block_y * scale * line_stride + block_x * scale;
+        let qt = self.quantization_tables[index].as_ref().unwrap();
+        let out = &mut self.results[index][off..];
+        let _s = crate::prof::scope(crate::prof::Stage::DecIdct);
+        dequantize_and_idct_block(scale, coeffs, qt, line_stride, out);
+    }
+
+    fn flush_pending(&mut self, _index: usize) {
+        if let Some((pi, py, px, pcoeffs)) = self.pending.take() {
+            self.emit_single(pi, py, px, &pcoeffs);
+        }
     }
 
     pub fn get_result_immediate(&mut self, index: usize) -> Vec<u8> {
@@ -186,6 +279,16 @@ impl Worker for ImmediateWorker {
         Ok(())
     }
     fn get_result(&mut self, index: usize) -> Result<Vec<u8>> {
+        self.flush_pending(index);
         Ok(self.get_result_immediate(index))
     }
+
+    fn supports_fused(&self) -> bool {
+        true
+    }
+
+    fn fused_block(&mut self, index: usize, block_y: usize, block_x: usize, coeffs: &[i16; 64]) {
+        self.fused_block_inner(index, block_y, block_x, coeffs);
+    }
+
 }
