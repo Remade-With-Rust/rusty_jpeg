@@ -76,14 +76,6 @@ pub trait Worker {
         false
     }
 
-    /// Transform one just-decoded block straight into the output plane.
-    /// `block_y`/`block_x` are in blocks, absolute within the component.
-    ///
-    /// The worker may hold a block back to pair it with its right-hand neighbour
-    /// for the two-block AVX2 kernel; `get_result` flushes anything pending, so
-    /// there is no separate flush in this trait.
-    fn fused_block(&mut self, _index: usize, _block_y: usize, _block_x: usize, _coeffs: &[i16; 64]) {
-    }
 
 }
 

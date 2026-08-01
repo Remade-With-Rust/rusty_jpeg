@@ -292,8 +292,4 @@ impl Worker for ImmediateWorker {
         Some(self)
     }
 
-    fn fused_block(&mut self, index: usize, block_y: usize, block_x: usize, coeffs: &[i16; 64]) {
-        self.fused_block_inner(index, block_y, block_x, coeffs);
-    }
-
 }

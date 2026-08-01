@@ -4,6 +4,13 @@ Everything this fork does differently from upstream `jpeg-decoder` 0.3.2 and
 `jpeg-encoder` 0.7.0. Keep this current — it is what makes re-syncing with
 upstream possible.
 
+## 0.1.5
+
+Housekeeping only, no behaviour change: drops the `Worker::fused_block` trait
+method, which became dead when 0.1.4 started calling the concrete worker
+directly. Internal — `Worker` is not public API. Kept as its own version so the
+repository and the registry describe the same code.
+
 ## 0.1.4
 
 - **The fused transform is reached through a concrete, inlinable call.** It was
