@@ -31,6 +31,52 @@ jobs:
       - name: Test (platform_independent)
         run: cargo test --release --no-default-features --features std,platform_independent
 
+  aarch64:
+    name: aarch64 (NEON kernels)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The NEON quantize kernel cannot be executed on the x86 machine it was
+      # written on, so `neon_matches_scalar` — which compares it exhaustively
+      # against the scalar oracle — only certifies it HERE. If this job does not
+      # run, that kernel is unverified.
+      - name: Test (release, NEON)
+        run: cargo test --release
+
+  aarch64-crosscheck:
+    name: aarch64 (cross-compile only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      # Cheap backstop that runs everywhere, so an ARM build break is caught even
+      # if the ARM runner is unavailable. It proves compilation, NOT behaviour.
+      - run: cargo check --target aarch64-unknown-linux-gnu --tests
+
+  fuzz:
+    name: fuzz (short run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      # A decoder is a parser for hostile bytes: Err is a correct outcome for a
+      # corrupt file, a panic is not. Short runs on every push catch regressions;
+      # depth comes from running these targets locally for longer.
+      - name: decode
+        run: cargo fuzz run decode -- -max_total_time=60 -rss_limit_mb=4096
+        working-directory: fuzz
+      - name: decode_planar
+        run: cargo fuzz run decode_planar -- -max_total_time=60 -rss_limit_mb=4096
+        working-directory: fuzz
+      - name: roundtrip
+        run: cargo fuzz run roundtrip -- -max_total_time=60 -rss_limit_mb=4096
+        working-directory: fuzz
+
   lint:
     runs-on: ubuntu-latest
     steps:

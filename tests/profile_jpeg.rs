@@ -855,3 +855,214 @@ fn decode_file() {
         mpx / (ms_rgb / 1000.0)
     );
 }
+
+/// Chroma downsampling must AVERAGE the box, not point-sample it.
+///
+/// Point-sampling is decimation: it aliases chroma above the subsampled Nyquist
+/// straight into the baseband, and no bitrate recovers it. The tell that found
+/// it was a PSNR that sat flat at ~14.1 dB from quality 50 to 95 while the file
+/// doubled — error that does not respond to bitrate is not quantization error.
+///
+/// This gates the fix with content built to expose it: fine vertical chroma bars
+/// at luma-neutral transitions, where essentially all the signal is chroma.
+#[test]
+fn chroma_downsampling_averages_rather_than_decimates() {
+    use rusty_jpeg::decode::Decoder;
+    use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
+    use std::io::Cursor;
+
+    const W: usize = 128;
+    const H: usize = 128;
+    let mut rgb = vec![0u8; W * H * 3];
+    for y in 0..H {
+        for x in 0..W {
+            let o = (y * W + x) * 3;
+            // 3-pixel bars: right at the 4:2:0 chroma Nyquist.
+            let (r, g, b) = if (x / 3) % 2 == 0 {
+                (200u8, 60u8, 60u8)
+            } else {
+                (60, 200, 200)
+            };
+            rgb[o] = r;
+            rgb[o + 1] = g;
+            rgb[o + 2] = b;
+        }
+    }
+
+    let mut jpg = Vec::new();
+    let mut enc = Encoder::new(&mut jpg, 90);
+    enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+    enc.encode(&rgb, W as u16, H as u16, ColorType::Rgb)
+        .expect("encode");
+
+    let out = Decoder::new(Cursor::new(&jpg)).decode().expect("decode");
+    let mse: f64 = rgb
+        .iter()
+        .zip(&out)
+        .map(|(&a, &b)| {
+            let d = a as f64 - b as f64;
+            d * d
+        })
+        .sum::<f64>()
+        / rgb.len() as f64;
+    let psnr = 10.0 * (255.0f64 * 255.0 / mse).log10();
+
+    // Point-sampling scores ~14.2 dB on this content; box-averaging ~16.5 dB.
+    // The threshold sits between them with room for codec drift on either side.
+    assert!(
+        psnr > 15.5,
+        "chroma PSNR {psnr:.2} dB suggests the downsampler is decimating rather \
+         than averaging (point-sampling scores ~14.2 dB here, averaging ~16.5)"
+    );
+}
+
+/// With optimized Huffman tables the encoder must still emit ONE INTERLEAVED
+/// scan, and that scan must round-trip.
+///
+/// Two defects hid behind this gap. The route was chosen on an internal memory
+/// budget, so `-optimize_huffman` produced one scan PER COMPONENT at every
+/// practical resolution — legal, but a layout mainstream encoders never emit.
+/// And when that was fixed, the histogram was gathered AFTER `write_frame_header`
+/// had already emitted the DHT segments, so the file declared one set of tables
+/// and coded the scan with another. Our own decoder tolerated it; ffmpeg did not.
+///
+/// The suite missed both because the raw `Encoder` defaults `optimize_huffman`
+/// OFF, so nothing exercised the path the CLI actually uses.
+#[test]
+fn optimized_huffman_emits_one_interleaved_scan_that_round_trips() {
+    use rusty_jpeg::decode::Decoder;
+    use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
+    use std::io::Cursor;
+
+    /// Components in the first SOS. >1 means interleaved.
+    fn first_sos_components(d: &[u8]) -> usize {
+        let mut i = 2;
+        while i + 4 < d.len() {
+            if d[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let m = d[i + 1];
+            if m == 0xD8 || m == 0xD9 || (0xD0..=0xD7).contains(&m) {
+                i += 2;
+                continue;
+            }
+            let ln = ((d[i + 2] as usize) << 8) | d[i + 3] as usize;
+            if m == 0xDA {
+                return d[i + 4] as usize;
+            }
+            i += 2 + ln;
+        }
+        0
+    }
+
+    // Ragged dimensions on purpose: the last MCU then needs blocks the raster
+    // block grid never materialized, which is where an interleaved walk off the
+    // end of the grid would panic.
+    for (w, h) in [(64usize, 64usize), (127, 65), (200, 97)] {
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let o = (y * w + x) * 3;
+                rgb[o] = ((x * 7 + y * 3) % 256) as u8;
+                rgb[o + 1] = ((x * 3 + y * 11) % 256) as u8;
+                rgb[o + 2] = ((x * 13 + y * 5) % 256) as u8;
+            }
+        }
+
+        let mut jpg = Vec::new();
+        let mut enc = Encoder::new(&mut jpg, 90);
+        enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+        enc.set_optimized_huffman_tables(true);
+        enc.encode(&rgb, w as u16, h as u16, ColorType::Rgb)
+            .expect("encode");
+
+        assert!(
+            first_sos_components(&jpg) > 1,
+            "{w}x{h}: optimized Huffman emitted a NON-INTERLEAVED scan"
+        );
+
+        let out = Decoder::new(Cursor::new(&jpg))
+            .decode()
+            .expect("decode own optimized-Huffman output");
+        assert_eq!(out.len(), w * h * 3, "{w}x{h}: wrong output size");
+
+        // A table/scan mismatch survives a size check but destroys the image, so
+        // gate on fidelity too.
+        let mse: f64 = rgb
+            .iter()
+            .zip(&out)
+            .map(|(&a, &b)| {
+                let d = a as f64 - b as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / rgb.len() as f64;
+        let psnr = 10.0 * (255.0f64 * 255.0 / mse).log10();
+        assert!(psnr > 20.0, "{w}x{h}: round-trip PSNR only {psnr:.1} dB");
+    }
+}
+
+/// Trellis quantization must produce a SMALLER file that still decodes, without
+/// collapsing quality.
+///
+/// It works by choosing where each block's EOB falls: dropping a trailing
+/// coefficient can delete several symbols at once, because keeping it forces the
+/// run before it to be coded too. The gate is rate AND distortion together —
+/// "smaller" alone is trivially satisfiable by throwing the image away.
+#[test]
+fn trellis_reduces_size_without_collapsing_quality() {
+    use rusty_jpeg::decode::Decoder;
+    use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
+    use std::io::Cursor;
+
+    const W: usize = 128;
+    const H: usize = 128;
+    let mut rgb = vec![0u8; W * H * 3];
+    for y in 0..H {
+        for x in 0..W {
+            let o = (y * W + x) * 3;
+            let v = ((x * x + y * y) / 7 % 200) as u8;
+            rgb[o] = v;
+            rgb[o + 1] = v.wrapping_add(40);
+            rgb[o + 2] = v.wrapping_add(90);
+        }
+    }
+
+    let encode = |trellis: bool| -> (usize, f64) {
+        let mut jpg = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut jpg, 85);
+            enc.set_sampling_factor(SamplingFactor::R_4_2_0);
+            enc.set_trellis(trellis);
+            enc.encode(&rgb, W as u16, H as u16, ColorType::Rgb)
+                .expect("encode");
+        }
+        let out = Decoder::new(Cursor::new(&jpg)).decode().expect("decode");
+        let mse: f64 = rgb
+            .iter()
+            .zip(&out)
+            .map(|(&a, &b)| {
+                let d = a as f64 - b as f64;
+                d * d
+            })
+            .sum::<f64>()
+            / rgb.len() as f64;
+        (jpg.len(), 10.0 * (255.0f64 * 255.0 / mse).log10())
+    };
+
+    let (size_off, psnr_off) = encode(false);
+    let (size_on, psnr_on) = encode(true);
+
+    assert!(
+        size_on < size_off,
+        "trellis did not shrink the file: {size_on} vs {size_off}"
+    );
+    // It trades distortion for rate by design; what it must not do is fall off a
+    // cliff. The BD-rate sweep that chose lambda showed well under 1 dB here.
+    assert!(
+        psnr_on > psnr_off - 1.5,
+        "trellis cost too much quality: {psnr_on:.2} dB vs {psnr_off:.2} dB \
+         (sizes {size_on} vs {size_off})"
+    );
+}
