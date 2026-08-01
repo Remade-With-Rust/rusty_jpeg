@@ -1,7 +1,7 @@
 mod immediate;
 mod multithreaded;
 #[cfg(all(
-    not(any(target_arch = "asmjs", target_arch = "wasm32")),
+    not(target_arch = "wasm32"),
     feature = "rayon"
 ))]
 mod rayon;
@@ -96,11 +96,11 @@ pub struct WorkerScope {
 
 enum WorkerScopeInner {
     #[cfg(all(
-        not(any(target_arch = "asmjs", target_arch = "wasm32")),
+        not(target_arch = "wasm32"),
         feature = "rayon"
     ))]
     Rayon(Box<rayon::Scoped>),
-    #[cfg(not(any(target_arch = "asmjs", target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     Multithreaded(multithreaded::MpscWorker),
     Immediate(immediate::ImmediateWorker),
 }
@@ -123,23 +123,23 @@ impl WorkerScope {
         }
         let inner = inner.get_or_insert_with(move || match prefer {
             #[cfg(all(
-                not(any(target_arch = "asmjs", target_arch = "wasm32")),
+                not(target_arch = "wasm32"),
                 feature = "rayon"
             ))]
             PreferWorkerKind::Multithreaded => WorkerScopeInner::Rayon(Default::default()),
             #[allow(unreachable_patterns)]
-            #[cfg(not(any(target_arch = "asmjs", target_arch = "wasm32")))]
+            #[cfg(not(target_arch = "wasm32"))]
             PreferWorkerKind::Multithreaded => WorkerScopeInner::Multithreaded(Default::default()),
             _ => WorkerScopeInner::Immediate(Default::default()),
         });
 
         f(match &mut *inner {
             #[cfg(all(
-                not(any(target_arch = "asmjs", target_arch = "wasm32")),
+                not(target_arch = "wasm32"),
                 feature = "rayon"
             ))]
             WorkerScopeInner::Rayon(worker) => worker.as_mut(),
-            #[cfg(not(any(target_arch = "asmjs", target_arch = "wasm32")))]
+            #[cfg(not(target_arch = "wasm32"))]
             WorkerScopeInner::Multithreaded(worker) => worker,
             WorkerScopeInner::Immediate(worker) => worker,
         })
@@ -153,7 +153,7 @@ pub fn compute_image_parallel(
     color_transform: ColorTransform,
 ) -> Result<Vec<u8>> {
     #[cfg(all(
-        not(any(target_arch = "asmjs", target_arch = "wasm32")),
+        not(target_arch = "wasm32"),
         feature = "rayon"
     ))]
     return rayon::compute_image_parallel(components, data, output_size, color_transform);

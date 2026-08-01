@@ -106,6 +106,8 @@ impl Stage {
             Stage::DecRowDispatch => "[i] DecRowDispatch",
         }
     }
+    // Only the `profile` build walks the stage table by index.
+    #[allow(dead_code)]
     fn from_index(i: usize) -> Stage {
         match i {
             0 => Stage::Total,

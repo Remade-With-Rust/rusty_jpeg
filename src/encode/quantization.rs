@@ -369,6 +369,11 @@ impl QuantizationTable {
     /// may change if the surrounding stages shrink or on a target whose compiler
     /// does not emit the conditional move.
     #[inline]
+    // Used only by `quantize_matches_branchy`. Retained deliberately: this is
+    // the branchless variant that measured SLOWER than the branchy one it was
+    // meant to replace, and keeping it with its equivalence proof is what stops
+    // the idea being re-litigated.
+    #[allow(dead_code)]
     pub(crate) fn quantize_branchless(&self, in_value: i16, index: usize) -> i16 {
         let value = in_value as i32;
         let reciprocal = self.reciprocals[index];
