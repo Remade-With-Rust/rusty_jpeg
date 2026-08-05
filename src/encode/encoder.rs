@@ -266,9 +266,20 @@ impl<W: JfifWrite> Encoder<W> {
             optimize_huffman_table: false,
             streaming_optimize: None,
             branchy_quantize: false,
-            // On by default: measured -3.14% BD-rate (photo -5.02%, diagonal
-            // -1.25%, no content showing a loss) for +3.1% encode time.
-            trellis: true,
+            // OFF by default. It shipped on in 0.1.7-0.2.2 on the strength of
+            // "-3.14% BD-rate for +3.1% encode time" — and that +3.1% was wrong
+            // by ~46x. It was calibrated on synthetic fBm at ~223 KB/frame,
+            // while trellis work is O(non-zero coefficients) per block in f64;
+            // on real 1080p footage at ~700 KB/frame it measures **+144%**
+            // (844 -> 2062 ms pinned CPU, 40 frames).
+            //
+            // That is a bad trade for a codec positioned as a fast drop-in, and
+            // it is the whole reason the crate's own "1.19x faster than FFmpeg"
+            // claim stopped holding. Opt in with `set_trellis(true)` or
+            // `-trellis 1` when smaller files are worth the time; the BD-rate
+            // benefit itself still needs re-measuring on real content, since the
+            // cost figure from that same corpus was so far off.
+            trellis: trellis_default(),
             push_blocks: false,
             app_segments: Vec::new(),
         }
@@ -373,9 +384,15 @@ impl<W: JfifWrite> Encoder<W> {
     /// transform work against peak memory.
     /// Enable rate-distortion optimization of the quantized coefficients.
     ///
-    /// Trades a little distortion for fewer bits by choosing where each block's
-    /// EOB falls, rather than keeping every coefficient rounding produced. Costs
-    /// encode time and changes the bitstream; off by default.
+    /// Chooses where each block's EOB falls, and lowers coefficient magnitudes
+    /// where the bits saved outweigh the distortion, instead of keeping whatever
+    /// rounding produced. Changes the bitstream.
+    ///
+    /// **Off by default, and expensive.** Measured on real 1080p footage it
+    /// costs **+144% encode time** — a figure that was originally published as
+    /// +3.1% because it had been calibrated on synthetic content with far fewer
+    /// non-zero coefficients than real material. Turn it on when smaller files
+    /// are worth roughly 2.4x the encode time.
     pub fn set_trellis(&mut self, enabled: bool) {
         self.trellis = enabled;
     }
@@ -1648,6 +1665,28 @@ const OPTIMIZE_BUFFER_BUDGET: usize = 256 * 1024 * 1024;
 
 /// `RUSTY_JPEG_ARM=pointsample` restores the old point-sampling downsampler,
 /// so the two can be compared in one binary. Resolved once, not per block.
+/// `RUSTY_JPEG_ARM=slowblock` forces the general clamped path — the A/B arm for
+/// the interior fast path, and the oracle it is gated against.
+fn trellis_default() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RUSTY_JPEG_TRELLIS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+fn slow_get_block() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("RUSTY_JPEG_ARM")
+            .map(|v| v == "slowblock")
+            .unwrap_or(false)
+    })
+}
+
 fn point_sample_chroma() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -1697,6 +1736,71 @@ fn get_block(
     let n = (col_stride * row_stride) as u32;
     let half = n / 2;
     let height = data.len() / width;
+
+    // Interior fast path.
+    //
+    // The clamps below are dead on EVERY block, not merely on interior ones:
+    // `encode_blocks` pads its row buffer to MCU boundaries, so a block's
+    // sampling window always fits. Counted on ragged geometries that ought to be
+    // the worst case — 127x65, 320x241, 1920x1080 — the clamped path is taken
+    // **0** times.
+    //
+    // Dead does not mean free. The clamps are what stop the compiler proving the
+    // index, so each of the 256 samples of a 4:2:0 chroma block paid a `min` AND
+    // a bounds check it could never need. Proving the window fits, once per
+    // block, replaces 256 bounds checks with two slice checks per row.
+    //
+    // The clamped path stays as the oracle and as cover should that padding
+    // invariant ever change.
+    //
+    // `RUSTY_JPEG_ARM=slowblock` forces the general path, so the two can be A/B'd
+    // in one binary, and the general path stays as the oracle.
+    let interior = start_x + 8 * col_stride <= width && start_y + 8 * row_stride <= height;
+    crate::prof::bump(
+        if interior {
+            crate::prof::Count::GetBlockInterior
+        } else {
+            crate::prof::Count::GetBlockEdge
+        },
+        1,
+    );
+    if !slow_get_block() && interior {
+        if col_stride == 2 && row_stride == 2 {
+            // 4:2:0 — the dominant case, worth its own straight-line body.
+            for y in 0..8 {
+                let iy = start_y + 2 * y;
+                let a = iy * width + start_x;
+                let b = a + width;
+                let r0 = &data[a..a + 16];
+                let r1 = &data[b..b + 16];
+                for x in 0..8 {
+                    let sum = r0[2 * x] as u32
+                        + r0[2 * x + 1] as u32
+                        + r1[2 * x] as u32
+                        + r1[2 * x + 1] as u32;
+                    block[y * 8 + x] = ((sum + 2) / 4) as i16 - 128;
+                }
+            }
+            return block;
+        }
+        for y in 0..8 {
+            let iy = start_y + y * row_stride;
+            for x in 0..8 {
+                let ix = start_x + x * col_stride;
+                let mut sum = 0u32;
+                for dy in 0..row_stride {
+                    let base = (iy + dy) * width + ix;
+                    let row = &data[base..base + col_stride];
+                    for &v in row {
+                        sum += v as u32;
+                    }
+                }
+                block[y * 8 + x] = ((sum + half) / n) as i16 - 128;
+            }
+        }
+        return block;
+    }
+
     for y in 0..8 {
         for x in 0..8 {
             let ix = start_x + (x * col_stride);
