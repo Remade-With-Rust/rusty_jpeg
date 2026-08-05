@@ -874,6 +874,17 @@ impl<W: JfifWrite> Encoder<W> {
                 for (i, component) in self.components.iter().enumerate() {
                     for v_offset in 0..component.vertical_sampling_factor as usize {
                         for h_offset in 0..component.horizontal_sampling_factor as usize {
+                            if double_stage("getblock") {
+                                let extra = get_block(
+                                    &row[i],
+                                    block_x * 8 * max_h_sampling + (h_offset * 8),
+                                    v_offset * 8,
+                                    max_h_sampling / component.horizontal_sampling_factor as usize,
+                                    max_v_sampling / component.vertical_sampling_factor as usize,
+                                    buffer_width,
+                                );
+                                core::hint::black_box(&extra);
+                            }
                             let mut block = {
                                 let _gb = crate::prof::scope(crate::prof::Stage::GetBlock);
                                 get_block(
@@ -886,14 +897,34 @@ impl<W: JfifWrite> Encoder<W> {
                                 )
                             };
 
-                            {
+                            // The `copy` arm is the null: it pays the scratch
+                            // duplication that doubling costs, and nothing else.
+                            if double_stage("copy") {
+                                let scratch = block;
+                                core::hint::black_box(&scratch);
+                            }
+                            if double_stage("fdct") {
+                                let mut scratch = block;
+                                OP::fdct(&mut scratch);
+                                core::hint::black_box(&scratch);
+                            }
+                            if !ablate_enc("fdct") {
                                 let _s = crate::prof::scope(crate::prof::Stage::Fdct);
                                 OP::fdct(&mut block);
                             }
 
                             let mut q_block = [0i16; 64];
 
-                            {
+                            if double_stage("quantize") {
+                                let mut scratch = [0i16; 64];
+                                OP::quantize_block(
+                                    &block,
+                                    &mut scratch,
+                                    &q_tables[component.quantization_table as usize],
+                                );
+                                core::hint::black_box(&scratch);
+                            }
+                            if !ablate_enc("quantize") {
                                 let _s = crate::prof::scope(crate::prof::Stage::Quantize);
                                 OP::quantize_block(
                                     &block,
@@ -915,6 +946,35 @@ impl<W: JfifWrite> Encoder<W> {
                                 );
                             }
 
+                            if double_stage("escan") {
+                                // The zero-run SCAN alone: walk all 63 AC
+                                // coefficients and find the non-zeros, without
+                                // encoding anything. Splits the loop's cost from
+                                // the symbol work `entropy` measures.
+                                let mut run = 0u32;
+                                let mut nz = 0u32;
+                                for &v in &q_block[1..64] {
+                                    if v == 0 {
+                                        run += 1;
+                                    } else {
+                                        nz += 1;
+                                        run = 0;
+                                    }
+                                }
+                                core::hint::black_box((run, nz));
+                            }
+                            if double_stage("entropy") {
+                                // `count_block` is the writer's own symbol walk
+                                // with the bit output removed, so this prices the
+                                // run-length/category work but NOT the bit
+                                // packing. Read it as a lower bound on entropy.
+                                let mut dcf = [0u32; 257];
+                                let mut acf = [0u32; 257];
+                                JfifWriter::<W>::count_block(
+                                    &q_block, prev_dc[i], &mut dcf, &mut acf,
+                                );
+                                core::hint::black_box((&dcf, &acf));
+                            }
                             match stats.as_deref_mut() {
                                 Some(st) => {
                                     let _s =
@@ -1075,43 +1135,56 @@ impl<W: JfifWrite> Encoder<W> {
         let mut prev_dc = [0i16; 4];
         let mut restarts = 0usize;
         let mut last_mcu = usize::MAX;
-        let mut pending: Vec<(usize, usize)> = Vec::new();
 
-        // Collect (mcu, component) order first so the writer borrow stays clear
-        // of the closure that walks `blocks`.
-        let mut order: Vec<(usize, usize, [i16; 64])> = Vec::new();
-        Self::for_each_block_interleaved(
-            &components,
-            blocks,
-            grid,
-            mcu_cols,
-            mcu_rows,
-            |mcu, i, b| {
-                order.push((mcu, i, *b));
-            },
-        );
-        pending.clear();
+        // Walk MCU order directly rather than materializing it.
+        //
+        // This used to collect `Vec<(usize, usize, [i16; 64])>` first, purely so
+        // the `self.writer` borrow stayed clear of a closure borrowing `blocks`
+        // — a borrow-checker workaround that copied every block a SECOND time:
+        // 48,960 x 144 B = **7.1 MB per 1080p frame**, on the path the CLI takes
+        // by default (`optimize_huffman` is on unless asked otherwise).
+        //
+        // The traversal is plain index arithmetic, so writing it out inline
+        // costs nothing and borrows only what it reads.
+        for my in 0..mcu_rows {
+            for mx in 0..mcu_cols {
+                let mcu = my * mcu_cols + mx;
+                if restart_interval > 0
+                    && mcu != last_mcu
+                    && mcu % restart_interval == 0
+                    && mcu != 0
+                {
+                    self.writer.finalize_bit_buffer()?;
+                    self.writer
+                        .write_marker(Marker::RST((restarts % 8) as u8))?;
+                    restarts += 1;
+                    prev_dc = [0i16; 4];
+                }
+                last_mcu = mcu;
 
-        for (mcu, i, block) in order {
-            if restart_interval > 0 && mcu != last_mcu && mcu % restart_interval == 0 && mcu != 0 {
-                self.writer.finalize_bit_buffer()?;
-                self.writer
-                    .write_marker(Marker::RST((restarts % 8) as u8))?;
-                restarts += 1;
-                prev_dc = [0i16; 4];
+                for (i, c) in components.iter().enumerate() {
+                    let ch = c.horizontal_sampling_factor as usize;
+                    let cv = c.vertical_sampling_factor as usize;
+                    let (cols_i, rows_i) = grid[i];
+                    for v in 0..cv {
+                        for h in 0..ch {
+                            let bx = (mx * ch + h).min(cols_i - 1);
+                            let by = (my * cv + v).min(rows_i - 1);
+                            let block = &blocks[i][by * cols_i + bx];
+                            {
+                                let _s = crate::prof::scope(crate::prof::Stage::Entropy);
+                                self.writer.write_block(
+                                    block,
+                                    prev_dc[i],
+                                    &self.huffman_tables[c.dc_huffman_table as usize].0,
+                                    &self.huffman_tables[c.ac_huffman_table as usize].1,
+                                )?;
+                            }
+                            prev_dc[i] = block[0];
+                        }
+                    }
+                }
             }
-            last_mcu = mcu;
-            let c = &components[i];
-            {
-                let _s = crate::prof::scope(crate::prof::Stage::Entropy);
-                self.writer.write_block(
-                    &block,
-                    prev_dc[i],
-                    &self.huffman_tables[c.dc_huffman_table as usize].0,
-                    &self.huffman_tables[c.ac_huffman_table as usize].1,
-                )?;
-            }
-            prev_dc[i] = block[0];
         }
         self.writer.finalize_bit_buffer()?;
         Ok(())
@@ -1663,10 +1736,121 @@ impl Default for HuffmanStats {
 /// this; 8K does not.
 const OPTIMIZE_BUFFER_BUDGET: usize = 256 * 1024 * 1024;
 
+/// Extract an 8x8 block with NO subsampling: 8 contiguous bytes per row, widened
+/// to i16 and level-shifted by -128.
+///
+/// This is the luma path, and on 4:2:0 it is **two thirds of all blocks**. The
+/// scalar form pays a multiply, an index computation and a bounds check per
+/// sample; here each row is one 8-byte load, one widen, one subtract, one store.
+///
+/// # Safety
+/// Caller guarantees `start_y + 8` rows and `start_x + 8` columns lie inside
+/// `data`, and that SSE4.1 is available.
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "sse4.1")]
+unsafe fn get_block_1x1_simd(
+    data: &[u8],
+    start_x: usize,
+    start_y: usize,
+    width: usize,
+) -> [i16; 64] {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let mut block = [0i16; 64];
+    let bias = _mm_set1_epi16(128);
+    for y in 0..8 {
+        let src = data.as_ptr().add((start_y + y) * width + start_x);
+        let v = _mm_loadl_epi64(src as *const __m128i);
+        let widened = _mm_cvtepu8_epi16(v);
+        let shifted = _mm_sub_epi16(widened, bias);
+        _mm_storeu_si128(block.as_mut_ptr().add(y * 8) as *mut __m128i, shifted);
+    }
+    block
+}
+
+/// Extract an 8x8 block with 2x2 box averaging — the 4:2:0 chroma path, a third
+/// of all blocks.
+///
+/// `maddubs` does the horizontal pairwise sum of 16 samples in one instruction,
+/// which is exactly the inner two adds of the box filter; the two source rows
+/// then add vertically. Rounding is `(sum + 2) >> 2`, matching the scalar form's
+/// `(sum + half) / n` for `n == 4` exactly.
+///
+/// # Safety
+/// Caller guarantees `start_y + 16` rows and `start_x + 16` columns lie inside
+/// `data`, and that SSSE3 is available.
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+#[target_feature(enable = "ssse3")]
+unsafe fn get_block_2x2_simd(
+    data: &[u8],
+    start_x: usize,
+    start_y: usize,
+    width: usize,
+) -> [i16; 64] {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let mut block = [0i16; 64];
+    let ones = _mm_set1_epi8(1);
+    let round = _mm_set1_epi16(2);
+    let bias = _mm_set1_epi16(128);
+    for y in 0..8 {
+        let r0 = data.as_ptr().add((start_y + 2 * y) * width + start_x);
+        let r1 = r0.add(width);
+        // Pairwise horizontal sums: 16 u8 -> 8 i16.
+        let a = _mm_maddubs_epi16(_mm_loadu_si128(r0 as *const __m128i), ones);
+        let b = _mm_maddubs_epi16(_mm_loadu_si128(r1 as *const __m128i), ones);
+        let sum = _mm_add_epi16(a, b);
+        let avg = _mm_srai_epi16::<2>(_mm_add_epi16(sum, round));
+        _mm_storeu_si128(
+            block.as_mut_ptr().add(y * 8) as *mut __m128i,
+            _mm_sub_epi16(avg, bias),
+        );
+    }
+    block
+}
+
 /// `RUSTY_JPEG_ARM=pointsample` restores the old point-sampling downsampler,
 /// so the two can be compared in one binary. Resolved once, not per block.
 /// `RUSTY_JPEG_ARM=slowblock` forces the general clamped path — the A/B arm for
 /// the interior fast path, and the oracle it is gated against.
+/// `RUSTY_JPEG_ABLATE=fdct,quantize,getblock,entropy` — price encoder stages on
+/// the UNINSTRUMENTED binary. The profiled build's per-block scopes carry a ~25%
+/// tax, which is the same order as the stages being measured.
+///
+/// Output is garbage under ablation; these arms exist to price stages, not to
+/// encode. Exit codes are still checked by the harness.
+/// `RUSTY_JPEG_DOUBLE=<stage>` — price an encoder stage by running it TWICE and
+/// taking the delta, instead of by removing it.
+///
+/// Removal cascades: with the FDCT ablated, quantize and entropy see different
+/// coefficients, so every downstream stage changes work and the peel is
+/// meaningless (it once priced quantize at 52% of encode). Doubling does not:
+/// the extra pass writes to scratch and is discarded, so **the output is
+/// byte-identical in every arm** — which makes work-parity provable rather than
+/// assumed, and is the first thing to check before reading any of these numbers.
+///
+/// `cost(stage) = t(double stage) - t(double `copy`)`, where the `copy` arm pays
+/// only the scratch duplication the doubling itself introduces.
+pub(crate) fn double_stage(what: &str) -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<alloc::string::String> = OnceLock::new();
+    let v = V.get_or_init(|| std::env::var("RUSTY_JPEG_DOUBLE").unwrap_or_default());
+    v.split(',').any(|t| t == what)
+}
+
+pub(crate) fn ablate_enc(what: &str) -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<alloc::string::String> = OnceLock::new();
+    let v = V.get_or_init(|| std::env::var("RUSTY_JPEG_ABLATE").unwrap_or_default());
+    v.split(',').any(|t| t == what)
+}
+
 fn trellis_default() -> bool {
     use std::sync::OnceLock;
     static V: OnceLock<bool> = OnceLock::new();
@@ -1720,6 +1904,41 @@ fn get_block(
     width: usize,
 ) -> [i16; 64] {
     let mut block = [0i16; 64];
+
+    // SIMD interior paths. Both require the whole sampling window inside the
+    // buffer, which `encode_blocks` guarantees by padding rows to MCU bounds —
+    // `getblock_EDGE` counts 0 on every geometry tried. `RUSTY_JPEG_ARM=slowblock`
+    // forces the scalar oracle.
+    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if !slow_get_block() && !point_sample_chroma() {
+            let h = data.len() / width;
+            if col_stride == 1
+                && row_stride == 1
+                && start_x + 8 <= width
+                && start_y + 8 <= h
+                && std::is_x86_feature_detected!("sse4.1")
+            {
+                // SAFETY: bounds proven above; SSE4.1 checked at runtime.
+                #[allow(unsafe_code)]
+                unsafe {
+                    return get_block_1x1_simd(data, start_x, start_y, width);
+                }
+            }
+            if col_stride == 2
+                && row_stride == 2
+                && start_x + 16 <= width
+                && start_y + 16 <= h
+                && std::is_x86_feature_detected!("ssse3")
+            {
+                // SAFETY: bounds proven above; SSSE3 checked at runtime.
+                #[allow(unsafe_code)]
+                unsafe {
+                    return get_block_2x2_simd(data, start_x, start_y, width);
+                }
+            }
+        }
+    }
 
     // Fast path: no subsampling, so there is nothing to average.
     if (col_stride == 1 && row_stride == 1) || point_sample_chroma() {

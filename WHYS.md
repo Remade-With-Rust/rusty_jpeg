@@ -1214,6 +1214,156 @@ bounds-check problem that needs `unsafe`.
 A backlog of `unsafe` opportunities is a list of HYPOTHESES about generated code.
 Reading the emitted assembly costs one command and refutes most of them.
 
+## D2b - the encoder residue, decomposed: it was ENTROPY all along
+
+The encoder profile had a **57-67% unnamed residue**, larger than every named
+stage combined, and two instruments failed to break it open:
+
+- **Ablation cascades.** Removing the FDCT changes the coefficients quantize and
+  entropy then see, so every downstream stage does different work. That peel
+  priced quantize at **52% of encode**, which is nonsense.
+- **The profiled build cannot resolve it either.** Its per-block scopes carry a
+  ~25% tax, and the probe correction over-subtracts exactly the high-call stages
+  being measured - Fdct and Quantize both read **0.00%**.
+
+### The instrument that worked: double-run, not remove
+
+`RUSTY_JPEG_DOUBLE=<stage>` runs a stage TWICE, the second time into scratch that
+is discarded. `cost(stage) = t(double stage) - t(double copy)`.
+
+Why it works where ablation does not: **the output is byte-identical in every
+arm**, so work parity is PROVABLE rather than assumed. Verified before reading a
+single timing - baseline / copy / getblock / fdct / quantize / entropy all emit
+`27,171,752` bytes, md5 `9e2feab0a197`, exit 0.
+
+Paired ABBA against the `copy` null (which pays only the scratch duplication the
+method itself introduces), N=15, 280-frame arms:
+
+| stage | median B/A | z | share |
+|---|---:|---:|---:|
+| **entropy** (symbol walk only) | **1.3365** | **3.87** | **>= 32.7%** |
+| getblock | 1.0680 | 1.81 | ~5.8% (no verdict) |
+| quantize | 1.0541 | 3.36 | ~4.4% |
+| fdct | 1.0375 | 2.84 | ~2.8% |
+| *copy (null)* | *1.0101* | *0.77* | *the floor* |
+
+**ANSWER: the residue is entropy coding.** The profiler had it at 4.85%
+probe-corrected - understated roughly **7x**. And 32.7% is a LOWER BOUND: the
+double calls `count_block`, which is the writer's symbol walk with the bit
+packing removed, so the true figure is higher.
+
+### Transferable
+
+Two instruments disagreed with a third, and the tie-break was not precision but
+**whether the arms did identical work**. Ablation cannot prove that - by
+construction it changes what happens downstream. Doubling can, and a byte-compare
+settles it in one run. When a peel produces a share that cannot be true, suspect
+the cascade before the stopwatch.
+
+Also: the first double-run peel, read as raw pinned medians, put `fdct` BELOW
+baseline - impossible, since doubling only adds work. That was the box, not the
+method; pairing each stage against the null recovered every verdict.
+
+## D4h - inside entropy: a third of it was FINDING the non-zeros
+
+With the residue identified as entropy (D2b), the next question is which part.
+Counts first, from one 1080p encode:
+
+| count | value | what it says |
+|---|---|---|
+| `write_bits` per symbol | **1.0** | no redundancy in the call structure |
+| bits per buffer flush | **64.0** | the 64-bit accumulator is used optimally |
+| flushes needing byte-stuffing | **3.5%** | 96.5% take the bulk 8-byte write |
+| AC coefficients non-zero | **~16%** (500k of 3.08M) | **the loop visits 6x more than it codes** |
+
+The bit writer is already the libjpeg-turbo shape - 64-bit accumulator, SWAR
+`0xFF` detection, bulk 8-byte flush, byte-wise only when stuffing. Nothing to
+win there. The last row is the target.
+
+**Split, by double-run paired against the `copy` null:**
+
+| arm | median B/A | z | share |
+|---|---:|---:|---:|
+| entropy total (scan + symbols) | 1.3699 | 3.36 | ~36% |
+| **zero-run SCAN alone** | 1.1343 | 1.81 | **~12-13%** |
+| => symbol encoding | - | - | ~23% |
+
+### The brick: find non-zeros with arithmetic, not branches
+
+`write_ac_block` walked all 63 AC positions with a data-dependent branch on each,
+to locate the ~16% that are non-zero. Replaced with an AVX2 compare producing a
+64-bit non-zero mask, then stepping set bits via `trailing_zeros` - so the loop
+runs `popcount` times instead of 63.
+
+- **GATE:** byte-identical across baseline / progressive / both Huffman modes,
+  including the progressive sub-range path where a mask-restriction bug would
+  show. The SIMD mask is separately gated against a scalar oracle over 3000
+  rounds, including a single coefficient walked across all 64 positions - the
+  case that catches `packs`'s lane interleaving, which would otherwise yield a
+  plausible mask with each 16-coefficient group's halves swapped.
+- **MEASURED: 14/15, z 3.36, median 1.2826 - 1.28x faster WHOLE ENCODE.**
+
+That exceeds the scan's measured 12-13%, and should: the `escan` probe timed a
+BRANCHY scan, so replacing it removes the mispredicts as well as the iterations.
+
+### Standing
+
+Interleaved rff vs `ffmpeg -threads 1` at matched output size (ours 3.1%
+smaller), N=15: **12/15, z 2.32, median 1.4510 - 1.45x faster**, up from 1.22x.
+
+Interleaving was necessary, not decorative: across this session the same ffmpeg
+command drifted 953 -> 1266 ms on the same box, more than the effect being
+measured. Sequential arms would have reported parity.
+
+## D5i - two wins, and a standing that was an artifact all along
+
+### Win 1 - mask-driven AC scan (already recorded in D4h): 1.28x, z 3.36
+
+### Win 2 - SIMD block extraction
+
+With the scan gone, `get_block` became the #2 stage and the first to reach a
+VERDICT: 1.1322, z 2.40, ~12% of encode. Two kernels replaced the scalar loops:
+
+- **1x1 (luma, two thirds of all 4:2:0 blocks):** each row is 8 contiguous
+  bytes, so one 8-byte load + widen + subtract replaces 8 indexed loads with
+  bounds checks.
+- **2x2 (4:2:0 chroma):** `maddubs` does the horizontal pairwise sum of 16
+  samples in one instruction - exactly the box filter's inner adds - then the
+  two rows add vertically. `(sum + 2) >> 2` matches the scalar `(sum + half) / n`
+  for `n == 4` exactly.
+
+- **GATE:** 81 encodes byte-for-byte vs the scalar oracle, 9 geometries
+  (incl. ragged) x 3 subsamplings x 3 qualities. 0 mismatches.
+- **MEASURED: 23/25, z 4.20, median 1.2540 - 1.25x faster whole encode.**
+- **CONFIRMED BY THE STAGE ITSELF:** `getblock`'s double-run share fell from
+  1.1322 (z 2.40, a verdict) to **1.0563 (z 0.65, inside noise)** - it is now at
+  the null floor. The stage was removed, not moved.
+
+### The standing was never what we published
+
+Same comparison, same clip, matched size, increasing N:
+
+| N | median (ffmpeg/ours) | z | reading |
+|---|---:|---:|---|
+| 15 | 1.4510 | 2.32 | "1.45x faster" |
+| 21 | 1.0286 | 0.65 | parity |
+| **41** | **0.9608** | **-3.59** | **~4% SLOWER, a verdict** |
+
+Decode, re-measured with both arms discarding output (the first attempt had both
+writing 933 MB of raw video and was measuring I/O): **15/31, z -0.18, median
+1.0157 - parity.** The published "1.04x faster" was N=15.
+
+**So: the codec got materially faster this session - two byte-identical,
+high-z, same-binary wins - and it is at PARITY with FFmpeg, not ahead of it.**
+Both statements are true, and only the second one belongs in a README.
+
+The rule this cost: **a cross-implementation ratio needs N >= 31 before it means
+anything**, because the estimator itself trends with N on this box. Same-binary
+A/Bs reached z 3.36 and 4.20 at N=15-25; the cross-binary one wandered from
++45% to -4% over the same range. `codec-measurement` §3 says N >= 20 for effects
+under 5%; for CROSS-IMPLEMENTATION comparisons on unlike binaries that is not
+enough.
+
 ---
 
 ## Standing rules for this descent
