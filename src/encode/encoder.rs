@@ -556,8 +556,9 @@ impl<W: JfifWrite> Encoder<W> {
                         .encode_image_internal::<_, AVX2Operations>(YcckImage(data, width, height)),
                     ColorType::Yuyv => {
                         // Length was checked above, so `None` can only mean a zero dimension.
-                        let image = YuyvImage::new(data, YuyvImage::row_bytes(width), width, height)
-                            .ok_or(EncodingError::ZeroImageDimensions { width, height })?;
+                        let image =
+                            YuyvImage::new(data, YuyvImage::row_bytes(width), width, height)
+                                .ok_or(EncodingError::ZeroImageDimensions { width, height })?;
                         self.encode_image_internal::<_, AVX2Operations>(image)
                     }
                 };

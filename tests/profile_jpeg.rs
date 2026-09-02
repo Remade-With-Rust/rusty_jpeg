@@ -870,7 +870,7 @@ fn decode_file() {
 fn chroma_downsampling_averages_rather_than_decimates() {
     use rusty_jpeg::decode::Decoder;
     use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
-    
+
     const W: usize = 128;
     const H: usize = 128;
     let mut rgb = vec![0u8; W * H * 3];
@@ -932,7 +932,7 @@ fn chroma_downsampling_averages_rather_than_decimates() {
 fn optimized_huffman_emits_one_interleaved_scan_that_round_trips() {
     use rusty_jpeg::decode::Decoder;
     use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
-    
+
     /// Components in the first SOS. >1 means interleaved.
     fn first_sos_components(d: &[u8]) -> usize {
         let mut i = 2;
@@ -1013,7 +1013,7 @@ fn optimized_huffman_emits_one_interleaved_scan_that_round_trips() {
 fn trellis_reduces_size_without_collapsing_quality() {
     use rusty_jpeg::decode::Decoder;
     use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
-    
+
     const W: usize = 128;
     const H: usize = 128;
     let mut rgb = vec![0u8; W * H * 3];

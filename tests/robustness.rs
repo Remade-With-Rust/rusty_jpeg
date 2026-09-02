@@ -170,11 +170,9 @@ fn our_encoder_output_always_decodes() {
         ] {
             for &(w, h) in &[(1usize, 1usize), (8, 8), (17, 9), (64, 64), (127, 65)] {
                 let jpg = seed_jpeg(w, h, sampling, optimize);
-                let out = Decoder::new(&jpg[..])
-                    .decode()
-                    .unwrap_or_else(|e| {
-                        panic!("{w}x{h} optimize={optimize} sampling={sampling:?}: {e}")
-                    });
+                let out = Decoder::new(&jpg[..]).decode().unwrap_or_else(|e| {
+                    panic!("{w}x{h} optimize={optimize} sampling={sampling:?}: {e}")
+                });
                 assert_eq!(
                     out.len(),
                     w * h * 3,
