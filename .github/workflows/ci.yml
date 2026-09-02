@@ -31,6 +31,31 @@ jobs:
       - name: Test (platform_independent)
         run: cargo test --release --no-default-features --features std,platform_independent
 
+  no-std:
+    name: no_std (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - riscv32imac-unknown-none-elf   # ESP32-C6 class: no std, no 64-bit atomics
+          - riscv32imafc-unknown-none-elf  # ESP32-P4 class
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: clippy
+      # The chip build: no std, no libm, no SIMD, no threads.
+      - run: cargo check --no-default-features --target ${{ matrix.target }}
+      - run: cargo clippy --no-default-features --target ${{ matrix.target }} -- -D warnings
+      # The whole suite on the no_std code paths, on the host: the decoder's
+      # slice source, the encoder's slice sinks, every knob at its default.
+      # `tests/no_std_surface.rs` pins a golden hash that the `std` job must
+      # reproduce — that is the host-equals-chip gate.
+      - run: cargo test --release --no-default-features
+      - run: cargo clippy --release --no-default-features --all-targets -- -D warnings
+
   aarch64:
     name: aarch64 (NEON kernels)
     runs-on: ubuntu-24.04-arm

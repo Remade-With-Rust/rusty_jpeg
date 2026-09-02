@@ -23,7 +23,7 @@ mod writer;
 
 pub use encoder::{ColorType, Encoder, JpegColorType, SamplingFactor};
 pub use error::EncodingError;
-pub use image_buffer::{cmyk_to_ycck, rgb_to_ycbcr, ImageBuffer, PlanarYcbcrImage};
+pub use image_buffer::{cmyk_to_ycck, rgb_to_ycbcr, ImageBuffer, PlanarYcbcrImage, YuyvImage};
 pub use quantization::QuantizationTableType;
 pub use writer::{JfifWrite, PixelDensity, PixelDensityUnit, SliceWriter};
 
