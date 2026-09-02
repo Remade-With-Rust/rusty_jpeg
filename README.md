@@ -8,7 +8,9 @@
 
 Pure-Rust JPEG / MJPEG **decoder + encoder**. No C, no FFI. Baseline and
 progressive DCT, planar YUV in and out, with real quality and
-chroma-subsampling control.
+chroma-subsampling control. **ESP32-compatible since 0.4.0:** `no_std` +
+`alloc`, no libm, a decoder that reads a slice and an encoder that writes
+into your buffer — see [Without `std` — on a chip](#without-std--on-a-chip).
 
 This crate is a vendored merge of two upstream pure-Rust projects, carried
 forward in-tree as one codec:
@@ -118,9 +120,12 @@ untouched.
 
 ## Without `std` — on a chip
 
-`default-features = false` makes the crate `no_std` + `alloc`, and it builds
-for `riscv32imac-unknown-none-elf` (ESP32-C6 class) and
-`riscv32imafc-unknown-none-elf` (ESP32-P4 class) in CI. What changes:
+`default-features = false` makes the crate `no_std` + `alloc`. It builds for
+`riscv32imac-unknown-none-elf` (ESP32-C6 class) and
+`riscv32imafc-unknown-none-elf` (ESP32-P4 class) in CI; the same code is what
+an ESP32-S3 (Xtensa, via `espup`) or an ESP-IDF `std` build gets. It is the
+JPEG half of the [Janus](https://github.com/Remade-With-Rust) camera pipeline
+(`rusty_esp_video`). What changes:
 
 - **The decoder reads a slice.** `Decoder::new(&bytes[..])` — any
   `decode::Source`, which with `std` is every `std::io::Read`. `scale()` is

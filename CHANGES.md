@@ -6,8 +6,10 @@ upstream possible.
 
 ## 0.4.0
 
-The chip release: `no_std` + `alloc`, and the input/output shapes a camera
-pipeline on an ESP32-class part needs. Coded bytes are unchanged for every
+The ESP32 release: `no_std` + `alloc`, and the input/output shapes a camera
+pipeline on an ESP32-class part needs — the crate now builds for the RISC-V
+ESP32 parts (C6, P4 classes, checked in CI) and, as the same `no_std` code,
+for the Xtensa ESP32-S3 with the esp toolchain. Coded bytes are unchanged for every
 build. What is new is that the SIMD/scalar difference is now pinned:
 `tests/no_std_surface.rs` carries one golden row for the scalar kernels (every
 `no_std` build, `platform_independent`, and `std` without `simd`) and one for
