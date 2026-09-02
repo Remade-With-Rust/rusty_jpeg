@@ -1568,11 +1568,21 @@ impl<W: JfifWrite> Encoder<W> {
                 if component.dc_huffman_table == table {
                     had_dc = true;
 
+                    // Mirror the scan writers: the DC predictor restarts at
+                    // every restart marker, i.e. before blocks R, 2R, 3R...
+                    // of the component. Counting without the reset never saw
+                    // the large "raw DC" categories a restart produces, so
+                    // those symbols had no code and the stream was corrupt
+                    // whenever optimized tables met a restart interval.
+                    let restart_interval = self.restart_interval.unwrap_or(0) as usize;
                     let mut prev_dc = 0;
 
                     debug_assert!(!blocks[i].is_empty());
 
-                    for block in &blocks[i] {
+                    for (n, block) in blocks[i].iter().enumerate() {
+                        if restart_interval > 0 && n > 0 && n % restart_interval == 0 {
+                            prev_dc = 0;
+                        }
                         let value = block[0];
                         let diff = value - prev_dc;
                         let num_bits = get_num_bits(diff);

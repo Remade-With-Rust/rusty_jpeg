@@ -35,6 +35,15 @@ and that is the build to use as its oracle.
 - **`encode::YuyvImage` and `ColorType::Yuyv`**: packed 4:2:2 `YUYV` input,
   encoded without an RGB conversion; byte-identical to the planar 4:2:2 path
   on the same samples. (Planar 4:2:0 was already `PlanarYcbcrImage`.)
+- **Fixed: optimized Huffman tables with a restart interval wrote a corrupt
+  stream** on the progressive path and on the per-component sequential path
+  (a sampling factor that cannot be interleaved). The statistics pass never
+  reset the DC predictor at restart markers, so the large "raw DC" categories
+  a restart produces had no code; in a release build that emitted zero-length
+  codes (the decoder fails with "failed to decode huffman code"), in a debug
+  build the `get_for_value` assert fired. Found by the golden test's
+  progressive + optimized + `DRI` row. The interleaved baseline path already
+  counted restarts correctly and is unchanged.
 - The `RUSTY_JPEG_TRELLIS_LAMBDA` / `RUSTY_JPEG_TRELLIS_MAG` knobs go through
   a `std`-only shim and read as their defaults without `std`.
 - The examples declare `required-features = ["std"]`; they are host tools.
