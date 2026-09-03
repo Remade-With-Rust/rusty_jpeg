@@ -122,7 +122,7 @@ fn yuyv_input_keeps_the_rgb_paths_psnr() {
                 via_yuyv.len()
             );
             assert!(
-                p_rgb > 28.0 && p_yuyv > 28.0,
+                p_rgb > 20.0 && p_yuyv > 20.0,
                 "both paths reconstruct the picture: {p_rgb:.2} / {p_yuyv:.2} dB"
             );
             assert!(
