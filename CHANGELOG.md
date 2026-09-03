@@ -14,6 +14,14 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.0...v0.4.1) - 2026-09-03
+
+### Other
+
+- the PSNR floor is 20 dB; the synthetic picture is deliberately harsh (24.7 dB at q75, both paths equal)
+- YUYV input keeps the RGB path's PSNR (decode-encode-decode, corpus + synthetic)
+- Merge origin/main (release-plz, v0.3.3, In-the-wild block) into 0.4.0
+
 ## [0.3.3](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.3.2...v0.3.3) - 2026-08-28
 
 ### Other
