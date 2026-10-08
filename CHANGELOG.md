@@ -18,6 +18,17 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ### Other
 
+- release v0.4.2 ([#5](https://github.com/Remade-With-Rust/rusty_jpeg/pull/5))
+- bump rusty_alloc-api to =2.2.5 ([#9](https://github.com/Remade-With-Rust/rusty_jpeg/pull/9))
+- 2,784 active installs
+- 1,439 active installs
+- 1,435 active installs
+- 1,168 active installs
+
+## [0.4.2](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.1...v0.4.2) - 2026-10-08
+
+### Other
+
 - bump rusty_alloc-api to =2.2.5 ([#9](https://github.com/Remade-With-Rust/rusty_jpeg/pull/9))
 - 2,784 active installs
 - 1,439 active installs
