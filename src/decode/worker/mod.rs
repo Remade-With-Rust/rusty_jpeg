@@ -164,6 +164,13 @@ impl WorkerScope {
     }
 }
 
+/// Whether `color_transform`'s converter reads exactly `output_width` samples
+/// per component, so a full-resolution plane row can be passed to it in place
+/// (see `Upsampler::upsample_and_interleave_rows`).
+pub(crate) fn reads_exact_width(color_transform: ColorTransform) -> bool {
+    matches!(color_transform, ColorTransform::YCbCr | ColorTransform::RGB)
+}
+
 pub fn compute_image_parallel(
     components: &[Component],
     data: Vec<Vec<u8>>,
@@ -178,17 +185,17 @@ pub fn compute_image_parallel(
         let color_convert_func = choose_color_convert_func(components.len(), color_transform)?;
         let upsampler = Upsampler::new(components, output_size.width, output_size.height)?;
         let line_size = output_size.width as usize * components.len();
-        let mut image = vec![0u8; line_size * output_size.height as usize];
+        let height = output_size.height as usize;
+        let mut image = vec![0u8; line_size * height];
 
-        for (row, line) in image.chunks_mut(line_size).enumerate() {
-            upsampler.upsample_and_interleave_row(
-                &data,
-                row,
-                output_size.width as usize,
-                line,
-                color_convert_func,
-            );
-        }
+        upsampler.upsample_and_interleave_rows(
+            &data,
+            0..height,
+            output_size.width as usize,
+            &mut image,
+            color_convert_func,
+            reads_exact_width(color_transform),
+        );
 
         Ok(image)
     }

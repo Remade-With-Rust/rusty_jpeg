@@ -1759,7 +1759,7 @@ fn compute_image(
 pub(crate) fn choose_color_convert_func(
     component_count: usize,
     color_transform: ColorTransform,
-) -> Result<fn(&[Vec<u8>], &mut [u8])> {
+) -> Result<crate::decode::upsampler::ColorConvertFn> {
     match component_count {
         3 => match color_transform {
             ColorTransform::None => Ok(color_no_convert),
@@ -1808,9 +1808,9 @@ pub(crate) fn choose_color_convert_func(
     }
 }
 
-fn color_convert_line_rgb(data: &[Vec<u8>], output: &mut [u8]) {
+fn color_convert_line_rgb(data: &[&[u8]], output: &mut [u8]) {
     assert!(data.len() == 3, "wrong number of components for rgb");
-    let [r, g, b]: &[Vec<u8>; 3] = data.try_into().unwrap();
+    let [r, g, b]: &[&[u8]; 3] = data.try_into().unwrap();
     for (((chunk, r), g), b) in output
         .chunks_exact_mut(3)
         .zip(r.iter())
@@ -1823,7 +1823,7 @@ fn color_convert_line_rgb(data: &[Vec<u8>], output: &mut [u8]) {
     }
 }
 
-fn color_convert_line_ycbcr(data: &[Vec<u8>], output: &mut [u8]) {
+fn color_convert_line_ycbcr(data: &[&[u8]], output: &mut [u8]) {
     assert!(data.len() == 3, "wrong number of components for ycbcr");
     let [y, cb, cr]: &[_; 3] = data.try_into().unwrap();
 
@@ -1856,9 +1856,9 @@ fn color_convert_line_ycbcr(data: &[Vec<u8>], output: &mut [u8]) {
     }
 }
 
-fn color_convert_line_ycck(data: &[Vec<u8>], output: &mut [u8]) {
+fn color_convert_line_ycck(data: &[&[u8]], output: &mut [u8]) {
     assert!(data.len() == 4, "wrong number of components for ycck");
-    let [c, m, y, k]: &[Vec<u8>; 4] = data.try_into().unwrap();
+    let [c, m, y, k]: &[&[u8]; 4] = data.try_into().unwrap();
 
     for ((((chunk, c), m), y), k) in output
         .chunks_exact_mut(4)
@@ -1875,9 +1875,9 @@ fn color_convert_line_ycck(data: &[Vec<u8>], output: &mut [u8]) {
     }
 }
 
-fn color_convert_line_cmyk(data: &[Vec<u8>], output: &mut [u8]) {
+fn color_convert_line_cmyk(data: &[&[u8]], output: &mut [u8]) {
     assert!(data.len() == 4, "wrong number of components for cmyk");
-    let [c, m, y, k]: &[Vec<u8>; 4] = data.try_into().unwrap();
+    let [c, m, y, k]: &[&[u8]; 4] = data.try_into().unwrap();
 
     for ((((chunk, c), m), y), k) in output
         .chunks_exact_mut(4)
@@ -1893,11 +1893,11 @@ fn color_convert_line_cmyk(data: &[Vec<u8>], output: &mut [u8]) {
     }
 }
 
-fn color_no_convert(data: &[Vec<u8>], output: &mut [u8]) {
+fn color_no_convert(data: &[&[u8]], output: &mut [u8]) {
     let mut output_iter = output.iter_mut();
 
     for pixel in data {
-        for d in pixel {
+        for d in pixel.iter() {
             *(output_iter.next().unwrap()) = *d;
         }
     }

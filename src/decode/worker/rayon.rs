@@ -201,17 +201,22 @@ pub fn compute_image_parallel(
     let line_size = output_size.width as usize * components.len();
     let mut image = vec![0u8; line_size * output_size.height as usize];
 
+    // Bands of rows, so each task allocates its line buffers once.
+    const BAND: usize = 16;
+    let direct = super::reads_exact_width(color_transform);
     image
-        .par_chunks_mut(line_size)
+        .par_chunks_mut(line_size * BAND)
         .with_max_len(1)
         .enumerate()
-        .for_each(|(row, line)| {
-            upsampler.upsample_and_interleave_row(
+        .for_each(|(band, lines)| {
+            let first = band * BAND;
+            upsampler.upsample_and_interleave_rows(
                 &data,
-                row,
+                first..first + lines.len() / line_size,
                 output_size.width as usize,
-                line,
+                lines,
                 color_convert_func,
+                direct,
             );
         });
 
