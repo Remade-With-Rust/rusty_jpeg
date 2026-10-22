@@ -20,6 +20,9 @@ pub fn get_color_convert_line_ycbcr() -> Option<unsafe fn(&[u8], &[u8], &[u8], &
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     #[allow(unsafe_code)]
     {
+        if is_x86_feature_detected!("avx2") {
+            return Some(avx2::color_convert_line_ycbcr);
+        }
         if is_x86_feature_detected!("ssse3") {
             return Some(ssse3::color_convert_line_ycbcr);
         }
