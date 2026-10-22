@@ -1,5 +1,5 @@
 use crate::decode::error::{Error, Result, UnsupportedFeature};
-use crate::decode::huffman::{fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable};
+use crate::decode::huffman::{fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable, AC_EOB};
 use crate::decode::marker::Marker;
 use crate::decode::parser::{
     parse_app, parse_com, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos,
@@ -370,9 +370,14 @@ impl<R: Source> Decoder<R> {
 
         match worker_preference {
             PreferWorkerKind::Immediate => PreferWorkerKind::Immediate,
+            // With one usable core, the worker thread only time-slices it
+            // (see `usable_cores`).
+            PreferWorkerKind::Multithreaded if crate::decode::worker::usable_cores() < 2 => {
+                PreferWorkerKind::Immediate
+            }
             PreferWorkerKind::Multithreaded => {
                 let width: u64 = frame.output_size.width.into();
-                let height: u64 = frame.output_size.width.into();
+                let height: u64 = frame.output_size.height.into();
                 if width * height > PARALLELISM_THRESHOLD {
                     PreferWorkerKind::Multithreaded
                 } else {
@@ -987,7 +992,13 @@ impl<R: Source> Decoder<R> {
             return Ok(Vec::new());
         }
 
-        compute_image(&components, planes, output_size, color_transform)
+        compute_image(
+            &components,
+            planes,
+            output_size,
+            color_transform,
+            !self.single_threaded,
+        )
     }
 
     fn determine_color_transform(&self) -> ColorTransform {
@@ -1298,7 +1309,7 @@ impl<R: Source> Decoder<R> {
                             if fused {
                                 // Stack-local, so it never leaves L1.
                                 let mut block = [0i16; 64];
-                                decode_block(
+                                let wrote_ac = decode_block(
                                     &mut self.reader,
                                     &mut block,
                                     &mut huffman,
@@ -1314,7 +1325,7 @@ impl<R: Source> Decoder<R> {
                                 fused_worker
                                     .as_mut()
                                     .unwrap()
-                                    .fused_block_inner(i, by, bx, &block);
+                                    .fused_block_inner(i, by, bx, &block, !wrote_ac);
                                 continue;
                             }
                             let coefficients = if is_progressive {
@@ -1466,8 +1477,13 @@ fn decode_block<R: Source>(
     successive_approximation_low: u8,
     eob_run: &mut u16,
     dc_predictor: &mut i16,
-) -> Result<()> {
+) -> Result<bool> {
     let _s = crate::prof::scope(crate::prof::Stage::DecEntropy);
+    // Whether any AC coefficient was written. A written coefficient is never
+    // zero (receive_extend of a non-zero magnitude, or an `ac_lut` value), so
+    // `false` means exactly "DC only" -- which the IDCT stage otherwise
+    // re-derives by scanning all 63 AC positions of every block.
+    let mut wrote_ac = false;
     debug_assert_eq!(coefficients.len(), 64);
 
     if spectral_selection.start == 0 {
@@ -1485,16 +1501,21 @@ fn decode_block<R: Source>(
                 ))
             }
         };
-        let value = huffman.decode(reader, dc_table)?;
-        let diff = match value {
-            0 => 0,
-            1..=11 => huffman.receive_extend(reader, value)?,
-            _ => {
-                // Section F.1.2.1.1
-                // Table F.1
-                return Err(Error::Format(
-                    "invalid DC difference magnitude category".to_owned(),
-                ));
+        let diff = match huffman.decode_fast_dc(reader, dc_table)? {
+            Some(diff) => diff,
+            None => {
+                let value = huffman.decode(reader, dc_table)?;
+                match value {
+                    0 => 0,
+                    1..=11 => huffman.receive_extend(reader, value)?,
+                    _ => {
+                        // Section F.1.2.1.1
+                        // Table F.1
+                        return Err(Error::Format(
+                            "invalid DC difference magnitude category".to_owned(),
+                        ));
+                    }
+                }
             }
         };
 
@@ -1508,7 +1529,7 @@ fn decode_block<R: Source>(
 
     if index < spectral_selection.end && *eob_run > 0 {
         *eob_run -= 1;
-        return Ok(());
+        return Ok(false);
     }
 
     // Section F.1.2.2.1
@@ -1535,6 +1556,11 @@ fn decode_block<R: Source>(
         };
         while index < spectral_selection.end {
             if let Some((value, run)) = huffman.decode_fast_ac(reader, ac_table)? {
+                if run == AC_EOB {
+                    // What the slow path does for r == 0, s == 0.
+                    *eob_run = 0;
+                    break;
+                }
                 index += run;
 
                 if index >= spectral_selection.end {
@@ -1543,6 +1569,7 @@ fn decode_block<R: Source>(
 
                 coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
                     value << successive_approximation_low;
+                wrote_ac = true;
                 index += 1;
             } else {
                 let byte = huffman.decode(reader, ac_table)?;
@@ -1571,13 +1598,14 @@ fn decode_block<R: Source>(
 
                     coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
                         huffman.receive_extend(reader, s)? << successive_approximation_low;
+                    wrote_ac = true;
                     index += 1;
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(wrote_ac)
 }
 
 fn decode_block_successive_approximation<R: Source>(
@@ -1722,6 +1750,7 @@ fn compute_image(
     mut data: Vec<Vec<u8>>,
     output_size: Dimensions,
     color_transform: ColorTransform,
+    parallel: bool,
 ) -> Result<Vec<u8>> {
     if data.is_empty() || data.iter().any(Vec::is_empty) {
         return Err(Error::Format("not all components have data".to_owned()));
@@ -1751,7 +1780,7 @@ fn compute_image(
         decoded.resize(size, 0);
         Ok(decoded)
     } else {
-        compute_image_parallel(components, data, output_size, color_transform)
+        compute_image_parallel(components, data, output_size, color_transform, parallel)
     }
 }
 
@@ -1759,7 +1788,7 @@ fn compute_image(
 pub(crate) fn choose_color_convert_func(
     component_count: usize,
     color_transform: ColorTransform,
-) -> Result<fn(&[Vec<u8>], &mut [u8])> {
+) -> Result<crate::decode::upsampler::ColorConvertFn> {
     match component_count {
         3 => match color_transform {
             ColorTransform::None => Ok(color_no_convert),
@@ -1808,9 +1837,9 @@ pub(crate) fn choose_color_convert_func(
     }
 }
 
-fn color_convert_line_rgb(data: &[Vec<u8>], output: &mut [u8]) {
+fn color_convert_line_rgb(data: &[&[u8]], output: &mut [u8]) {
     assert!(data.len() == 3, "wrong number of components for rgb");
-    let [r, g, b]: &[Vec<u8>; 3] = data.try_into().unwrap();
+    let [r, g, b]: &[&[u8]; 3] = data.try_into().unwrap();
     for (((chunk, r), g), b) in output
         .chunks_exact_mut(3)
         .zip(r.iter())
@@ -1823,7 +1852,7 @@ fn color_convert_line_rgb(data: &[Vec<u8>], output: &mut [u8]) {
     }
 }
 
-fn color_convert_line_ycbcr(data: &[Vec<u8>], output: &mut [u8]) {
+fn color_convert_line_ycbcr(data: &[&[u8]], output: &mut [u8]) {
     assert!(data.len() == 3, "wrong number of components for ycbcr");
     let [y, cb, cr]: &[_; 3] = data.try_into().unwrap();
 
@@ -1856,9 +1885,9 @@ fn color_convert_line_ycbcr(data: &[Vec<u8>], output: &mut [u8]) {
     }
 }
 
-fn color_convert_line_ycck(data: &[Vec<u8>], output: &mut [u8]) {
+fn color_convert_line_ycck(data: &[&[u8]], output: &mut [u8]) {
     assert!(data.len() == 4, "wrong number of components for ycck");
-    let [c, m, y, k]: &[Vec<u8>; 4] = data.try_into().unwrap();
+    let [c, m, y, k]: &[&[u8]; 4] = data.try_into().unwrap();
 
     for ((((chunk, c), m), y), k) in output
         .chunks_exact_mut(4)
@@ -1875,9 +1904,9 @@ fn color_convert_line_ycck(data: &[Vec<u8>], output: &mut [u8]) {
     }
 }
 
-fn color_convert_line_cmyk(data: &[Vec<u8>], output: &mut [u8]) {
+fn color_convert_line_cmyk(data: &[&[u8]], output: &mut [u8]) {
     assert!(data.len() == 4, "wrong number of components for cmyk");
-    let [c, m, y, k]: &[Vec<u8>; 4] = data.try_into().unwrap();
+    let [c, m, y, k]: &[&[u8]; 4] = data.try_into().unwrap();
 
     for ((((chunk, c), m), y), k) in output
         .chunks_exact_mut(4)
@@ -1893,11 +1922,11 @@ fn color_convert_line_cmyk(data: &[Vec<u8>], output: &mut [u8]) {
     }
 }
 
-fn color_no_convert(data: &[Vec<u8>], output: &mut [u8]) {
+fn color_no_convert(data: &[&[u8]], output: &mut [u8]) {
     let mut output_iter = output.iter_mut();
 
     for pixel in data {
-        for d in pixel {
+        for d in pixel.iter() {
             *(output_iter.next().unwrap()) = *d;
         }
     }

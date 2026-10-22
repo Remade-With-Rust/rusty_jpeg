@@ -201,13 +201,18 @@ impl ImmediateWorker {
         block_y: usize,
         block_x: usize,
         coeffs: &[i16; 64],
+        dc_only: bool,
     ) {
         let component = self.components[index].as_ref().unwrap();
         let scale = component.dct_scale;
         let line_stride = component.block_size.width as usize * scale;
 
         crate::prof::bump(crate::prof::Count::DecBlocks, 1);
-        let dc_only = crate::decode::idct::is_dc_only(coeffs);
+        // `dc_only` comes from the entropy decoder, which knows whether it
+        // wrote any AC coefficient; re-deriving it here was a 63-coefficient
+        // scan per block. Debug builds check the hint against that scan --
+        // against the coefficients, which the fast path does not produce.
+        debug_assert_eq!(dc_only, crate::decode::idct::is_dc_only(coeffs));
         if dc_only {
             crate::prof::bump(crate::prof::Count::DecDcOnlyBlocks, 1);
         }

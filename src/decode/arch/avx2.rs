@@ -210,3 +210,204 @@ pub unsafe fn dequantize_and_idct_block_8x8_pair(
         core::ptr::copy_nonoverlapping::<u8>(buf.as_ptr(), base.wrapping_add(output_offset_b), 8);
     }
 }
+
+/// `pshufb` masks that interleave 16 R, 16 G and 16 B bytes into 48 bytes of
+/// RGB: `RGB_MASKS[part][channel]` selects, for output bytes
+/// `16*part..16*part+16`, the source byte of `channel` (or zero, `0x80`).
+const RGB_MASKS: [[[i8; 16]; 3]; 3] = [
+    [rgb_mask(0, 0), rgb_mask(0, 1), rgb_mask(0, 2)],
+    [rgb_mask(1, 0), rgb_mask(1, 1), rgb_mask(1, 2)],
+    [rgb_mask(2, 0), rgb_mask(2, 1), rgb_mask(2, 2)],
+];
+
+const fn rgb_mask(part: usize, channel: usize) -> [i8; 16] {
+    let mut mask = [-128i8; 16];
+    let mut k = 0;
+    while k < 16 {
+        let byte = part * 16 + k;
+        if byte % 3 == channel {
+            mask[k] = (byte / 3) as i8;
+        }
+        k += 1;
+    }
+    mask
+}
+
+/// YCbCr -> RGB, 16 pixels per step: the SSSE3 kernel widened to 256 bits.
+///
+/// Converts **exactly the pixels the SSSE3 kernel converts** (all but the last
+/// 8-15, which stay with the scalar tail) and returns that count, because the
+/// scalar formula rounds differently: covering a different set of pixels would
+/// change the image. The arithmetic is the SSSE3 sequence per 16-bit lane
+/// (`slli`/`adds`/`subs`/`mulhrs`/`srai`/`packus`, same constants), so each
+/// pixel is bit-identical to what SSSE3 produced; only the RGB interleave
+/// differs, and that is pure byte movement. `color_convert_matches_ssse3`
+/// asserts both properties.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &mut [u8]) -> usize {
+    assert!(output.len() % 3 == 0);
+    let num = output.len() / 3;
+    assert!(num <= y.len());
+    assert!(num <= cb.len());
+    assert!(num <= cr.len());
+    // The SSSE3 kernel's coverage: it reads 16 bytes to use 8, so it stops one
+    // vector short of the end.
+    let covered = (num / 8).saturating_sub(1) * 8;
+
+    const SHIFT: i32 = 6;
+    let c128 = _mm256_set1_epi16(128 << SHIFT);
+    let half = _mm256_set1_epi16((1 << SHIFT) >> 1);
+    let k_cr_r = _mm256_set1_epi16(13173);
+    let k_cb_g = _mm256_set1_epi16(11276);
+    let k_cr_g = _mm256_set1_epi16(23401);
+    let k_cb_b = _mm256_set1_epi16(25297);
+    let mask = |part: usize, channel: usize| {
+        _mm_loadu_si128(RGB_MASKS[part][channel].as_ptr() as *const __m128i)
+    };
+    let masks = [
+        [mask(0, 0), mask(0, 1), mask(0, 2)],
+        [mask(1, 0), mask(1, 1), mask(1, 2)],
+        [mask(2, 0), mask(2, 1), mask(2, 2)],
+    ];
+
+    let mut i = 0;
+    while i + 16 <= covered {
+        let widen = |p: &[u8]| {
+            _mm256_slli_epi16(
+                _mm256_cvtepu8_epi16(_mm_loadu_si128(p.as_ptr().add(i) as *const _)),
+                SHIFT,
+            )
+        };
+        let yv = _mm256_adds_epi16(widen(y), half);
+        let cbv = _mm256_subs_epi16(widen(cb), c128);
+        let crv = _mm256_subs_epi16(widen(cr), c128);
+
+        let cr_140200 = _mm256_adds_epi16(_mm256_mulhrs_epi16(crv, k_cr_r), crv);
+        let cb_034414 = _mm256_mulhrs_epi16(cbv, k_cb_g);
+        let cr_071414 = _mm256_mulhrs_epi16(crv, k_cr_g);
+        let cb_177200 = _mm256_adds_epi16(_mm256_mulhrs_epi16(cbv, k_cb_b), cbv);
+
+        let r = _mm256_srai_epi16(_mm256_adds_epi16(yv, cr_140200), SHIFT);
+        let g = _mm256_srai_epi16(
+            _mm256_subs_epi16(yv, _mm256_adds_epi16(cb_034414, cr_071414)),
+            SHIFT,
+        );
+        let b = _mm256_srai_epi16(_mm256_adds_epi16(yv, cb_177200), SHIFT);
+
+        // packus works per 128-bit lane: [r0-7 g0-7 | r8-15 g8-15]. Reorder the
+        // quadwords to [r0-7 r8-15 | g0-7 g8-15].
+        let rg = _mm256_permute4x64_epi64(_mm256_packus_epi16(r, g), 0b11_01_10_00);
+        let bb = _mm256_permute4x64_epi64(_mm256_packus_epi16(b, b), 0b11_01_10_00);
+        let channels = [
+            _mm256_castsi256_si128(rg),
+            _mm256_extracti128_si256(rg, 1),
+            _mm256_castsi256_si128(bb),
+        ];
+
+        let out = output.as_mut_ptr().add(3 * i);
+        for (part, part_masks) in masks.iter().enumerate() {
+            let v = _mm_or_si128(
+                _mm_shuffle_epi8(channels[0], part_masks[0]),
+                _mm_or_si128(
+                    _mm_shuffle_epi8(channels[1], part_masks[1]),
+                    _mm_shuffle_epi8(channels[2], part_masks[2]),
+                ),
+            );
+            _mm_storeu_si128(out.add(16 * part) as *mut __m128i, v);
+        }
+        i += 16;
+    }
+
+    // An odd 8-pixel step remains when `covered` is not a multiple of 16. Give
+    // the tail to the SSSE3 kernel: its own coverage of the tail is exactly
+    // `covered - i` (both stop one vector short of the same end).
+    if i < covered {
+        let done = super::ssse3::color_convert_line_ycbcr(
+            &y[i..],
+            &cb[i..],
+            &cr[i..],
+            &mut output[3 * i..],
+        );
+        debug_assert_eq!(i + done, covered);
+    }
+    covered
+}
+
+/// The interior of a 4:2:0 "fancy" upsampled row, 16 sample pairs per step.
+///
+/// With column sums `t[i] = 3*near[i] + far[i]`, pair `k` writes
+/// `out[2k] = (3*t[k] + t[k+1] + 8) >> 4` and
+/// `out[2k+1] = (3*t[k+1] + t[k] + 8) >> 4` -- where `out` starts at output
+/// byte 1 of the row; bytes 0 and `2w-1` are the caller's. Integer maths in
+/// 16-bit lanes (at most 4088, no overflow), so the result is bit-identical
+/// to the scalar loop by construction; `h2v2_matches_reference` in the
+/// upsampler checks it. The two results of a pair are packed as
+/// `lo | hi << 8`, which in little-endian memory IS the interleaved byte
+/// order, so a pair costs no shuffle.
+///
+/// Returns how many pairs it wrote (a multiple of 16); the caller finishes the
+/// rest.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+pub unsafe fn upsample_h2v2_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
+    let width = near.len().min(far.len());
+    // Pairs k..k+16 read samples k..k+17.
+    let pairs = width.saturating_sub(1).min(out.len() / 2);
+    let eight = _mm256_set1_epi16(8);
+    let three = |a: __m256i| _mm256_add_epi16(a, _mm256_slli_epi16(a, 1));
+    let column = |n: *const u8, f: *const u8| {
+        let n = _mm256_cvtepu8_epi16(_mm_loadu_si128(n as *const __m128i));
+        let f = _mm256_cvtepu8_epi16(_mm_loadu_si128(f as *const __m128i));
+        _mm256_add_epi16(three(n), f)
+    };
+    let mut k = 0;
+    while k + 16 <= pairs {
+        let (np, fp) = (near.as_ptr().add(k), far.as_ptr().add(k));
+        let t0 = column(np, fp);
+        let t1 = column(np.add(1), fp.add(1));
+        let lo = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(three(t0), t1), eight), 4);
+        let hi = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(three(t1), t0), eight), 4);
+        let packed = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 8));
+        _mm256_storeu_si256(out.as_mut_ptr().add(2 * k) as *mut __m256i, packed);
+        k += 16;
+    }
+    k
+}
+
+#[cfg(test)]
+mod color_tests {
+    #[test]
+    fn color_convert_matches_ssse3() {
+        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("ssse3") {
+            return;
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut byte = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        };
+        for num in (0..80).chain([255, 256, 257, 959, 960, 961, 1920, 4097]) {
+            let y: Vec<u8> = (0..num).map(|_| byte()).collect();
+            let mut cb: Vec<u8> = (0..num).map(|_| byte()).collect();
+            let cr: Vec<u8> = (0..num).map(|_| byte()).collect();
+            // Saturation corners.
+            if num > 4 {
+                cb[0] = 0;
+                cb[1] = 255;
+            }
+            let mut want = vec![0xAAu8; 3 * num];
+            let mut got = vec![0x55u8; 3 * num];
+            let (nw, ng) = unsafe {
+                (
+                    super::super::ssse3::color_convert_line_ycbcr(&y, &cb, &cr, &mut want),
+                    super::color_convert_line_ycbcr(&y, &cb, &cr, &mut got),
+                )
+            };
+            assert_eq!(ng, nw, "coverage differs at num {num}");
+            assert_eq!(got[..3 * nw], want[..3 * nw], "pixels differ at num {num}");
+        }
+    }
+}

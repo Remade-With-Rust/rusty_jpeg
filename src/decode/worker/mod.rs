@@ -10,9 +10,11 @@ use crate::decode::parser::{Component, Dimensions};
 use crate::decode::upsampler::Upsampler;
 
 use alloc::sync::Arc;
+#[cfg(feature = "platform_independent")]
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::ops::Range;
 
 pub struct RowData {
     pub index: usize,
@@ -164,32 +166,196 @@ impl WorkerScope {
     }
 }
 
+/// Whether `color_transform`'s converter reads exactly `output_width` samples
+/// per component, so a full-resolution plane row can be passed to it in place
+/// (see `Upsampler::upsample_and_interleave_rows`).
+pub(crate) fn reads_exact_width(color_transform: ColorTransform) -> bool {
+    matches!(color_transform, ColorTransform::YCbCr | ColorTransform::RGB)
+}
+
+/// How many cores this process may actually run on.
+///
+/// `available_parallelism` honours the CPU affinity mask on Linux, but not on
+/// Windows, where it reports every logical processor even when the process
+/// is confined to one. Threading a decode then only time-slices that core:
+/// measured with the default (threaded) decoder pinned to one core, 1080p
+/// 4:2:0 ran 1.35-1.48x slower than the same decoder single-threaded. So on
+/// Windows the affinity mask is consulted too (per call: a process can be
+/// re-pinned while running).
+pub(crate) fn usable_cores() -> usize {
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        #[cfg(all(windows, not(feature = "platform_independent")))]
+        {
+            if let Some(allowed) = windows_affinity_cores() {
+                return cores.min(allowed).max(1);
+            }
+        }
+        cores
+    }
+    #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+    {
+        1
+    }
+}
+
+/// The number of processors in this process's affinity mask (within its
+/// processor group), or `None` if Windows will not say.
+#[cfg(all(windows, feature = "std", not(feature = "platform_independent")))]
+fn windows_affinity_cores() -> Option<usize> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetProcessAffinityMask(process: isize, mask: *mut usize, system: *mut usize) -> i32;
+    }
+    let (mut process_mask, mut system_mask) = (0usize, 0usize);
+    // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no closing;
+    // both out-pointers are valid for the duration of the call.
+    #[allow(unsafe_code)]
+    let ok =
+        unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask) };
+    (ok != 0 && process_mask != 0).then(|| process_mask.count_ones() as usize)
+}
+
+/// How many threads the RGB output stage (upsample + colour convert) uses.
+///
+/// One band per ~256K output pixels -- a 1080p frame's output stage is ~1 ms
+/// serial, while spawning a scoped thread costs tens of microseconds -- capped
+/// by the machine and by `MAX_OUTPUT_THREADS`, past which the stage is bound
+/// by memory bandwidth rather than cores.
+fn output_bands(width: usize, height: usize) -> usize {
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    {
+        const PIXELS_PER_BAND: usize = 256 * 1024;
+        let max = crate::cached_knob!(usize, {
+            crate::knob("RUSTY_JPEG_OUTPUT_THREADS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MAX_OUTPUT_THREADS)
+        });
+        (width * height / PIXELS_PER_BAND).clamp(1, usable_cores().min(max).max(1))
+    }
+    #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+    {
+        let _ = (width, height);
+        1
+    }
+}
+
+/// Measured on 1080p and 2000x1250 (24-thread laptop): 4 threads beat 8 on
+/// both, min and median. Override with `RUSTY_JPEG_OUTPUT_THREADS`.
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+const MAX_OUTPUT_THREADS: usize = 4;
+
 pub fn compute_image_parallel(
     components: &[Component],
     data: Vec<Vec<u8>>,
     output_size: Dimensions,
     color_transform: ColorTransform,
+    parallel: bool,
 ) -> Result<Vec<u8>> {
     #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
-    return rayon::compute_image_parallel(components, data, output_size, color_transform);
+    {
+        let _ = parallel;
+        return rayon::compute_image_parallel(components, data, output_size, color_transform);
+    }
 
     #[allow(unreachable_code)]
     {
         let color_convert_func = choose_color_convert_func(components.len(), color_transform)?;
         let upsampler = Upsampler::new(components, output_size.width, output_size.height)?;
         let line_size = output_size.width as usize * components.len();
-        let mut image = vec![0u8; line_size * output_size.height as usize];
+        let height = output_size.height as usize;
+        let len = line_size * height;
+        let width = output_size.width as usize;
+        let direct = reads_exact_width(color_transform);
+        let bands = if parallel {
+            output_bands(width, height)
+        } else {
+            1
+        };
 
-        for (row, line) in image.chunks_mut(line_size).enumerate() {
-            upsampler.upsample_and_interleave_row(
-                &data,
-                row,
-                output_size.width as usize,
-                line,
-                color_convert_func,
+        // Not zero-filled: every byte is written below (see
+        // `upsample_and_interleave_rows_uninit`).
+        #[cfg(not(feature = "platform_independent"))]
+        {
+            let mut image: Vec<u8> = Vec::with_capacity(len);
+            in_bands(
+                &mut image.spare_capacity_mut()[..len],
+                line_size,
+                bands,
+                |rows, lines| {
+                    upsampler.upsample_and_interleave_rows_uninit(
+                        &data,
+                        rows,
+                        width,
+                        lines,
+                        color_convert_func,
+                        direct,
+                    )
+                },
             );
+            // SAFETY: the spare capacity passed to `in_bands` is exactly
+            // `height` rows of `line_size` bytes; `in_bands` hands every row to
+            // exactly one call, and `upsample_and_interleave_rows_uninit`
+            // writes every byte of every row it is given (each row is rendered
+            // to a buffer of `line_size` bytes and copied out whole). So all
+            // `len` bytes are initialised.
+            #[allow(unsafe_code)]
+            unsafe {
+                image.set_len(len)
+            };
+            Ok(image)
         }
 
-        Ok(image)
+        // `platform_independent` forbids `unsafe`, so it pays for the zeroing.
+        #[cfg(feature = "platform_independent")]
+        {
+            let mut image = vec![0u8; len];
+            in_bands(&mut image, line_size, bands, |rows, lines| {
+                upsampler.upsample_and_interleave_rows(
+                    &data,
+                    rows,
+                    width,
+                    lines,
+                    color_convert_func,
+                    direct,
+                )
+            });
+            Ok(image)
+        }
     }
+}
+
+/// Render an image of `line_size`-byte rows into `out` in `bands` row bands,
+/// one thread each (the calling thread takes the first); `render` is given a
+/// row range and exactly the slice of `out` those rows occupy. Every row is
+/// rendered exactly once whatever the band count, and each output row
+/// depends only on the finished planes, so the bytes cannot depend on it.
+fn in_bands<T: Send>(
+    out: &mut [T],
+    line_size: usize,
+    bands: usize,
+    render: impl Fn(Range<usize>, &mut [T]) + Sync,
+) {
+    let height = out.len().checked_div(line_size).unwrap_or(0);
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    if bands > 1 {
+        let rows_per_band = height.div_ceil(bands);
+        let render = &render;
+        std::thread::scope(|scope| {
+            let mut chunks = out.chunks_mut(line_size * rows_per_band).enumerate();
+            let first = chunks.next();
+            for (band, lines) in chunks {
+                let start = band * rows_per_band;
+                scope.spawn(move || render(start..start + lines.len() / line_size, lines));
+            }
+            if let Some((_, lines)) = first {
+                render(0..lines.len() / line_size, lines);
+            }
+        });
+        return;
+    }
+    let _ = bands;
+    render(0..height, out);
 }
