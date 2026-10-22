@@ -171,11 +171,42 @@ pub(crate) fn reads_exact_width(color_transform: ColorTransform) -> bool {
     matches!(color_transform, ColorTransform::YCbCr | ColorTransform::RGB)
 }
 
+/// How many threads the RGB output stage (upsample + colour convert) uses.
+///
+/// One band per ~256K output pixels -- a 1080p frame's output stage is ~1 ms
+/// serial, while spawning a scoped thread costs tens of microseconds -- capped
+/// by the machine and by `MAX_OUTPUT_THREADS`, past which the stage is bound
+/// by memory bandwidth rather than cores.
+fn output_bands(width: usize, height: usize) -> usize {
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    {
+        const PIXELS_PER_BAND: usize = 256 * 1024;
+        let max = crate::cached_knob!(usize, {
+            crate::knob("RUSTY_JPEG_OUTPUT_THREADS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MAX_OUTPUT_THREADS)
+        });
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        (width * height / PIXELS_PER_BAND).clamp(1, cores.min(max).max(1))
+    }
+    #[cfg(not(all(feature = "std", not(target_arch = "wasm32"))))]
+    {
+        let _ = (width, height);
+        1
+    }
+}
+
+/// Measured on 1080p and 2000x1250 (24-thread laptop): 4 threads beat 8 on
+/// both, min and median. Override with `RUSTY_JPEG_OUTPUT_THREADS`.
+#[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+const MAX_OUTPUT_THREADS: usize = 4;
+
 pub fn compute_image_parallel(
     components: &[Component],
     data: Vec<Vec<u8>>,
     output_size: Dimensions,
     color_transform: ColorTransform,
+    parallel: bool,
 ) -> Result<Vec<u8>> {
     #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
     return rayon::compute_image_parallel(components, data, output_size, color_transform);
@@ -187,16 +218,61 @@ pub fn compute_image_parallel(
         let line_size = output_size.width as usize * components.len();
         let height = output_size.height as usize;
         let mut image = vec![0u8; line_size * height];
+        let width = output_size.width as usize;
+        let direct = reads_exact_width(color_transform);
 
-        upsampler.upsample_and_interleave_rows(
-            &data,
-            0..height,
-            output_size.width as usize,
-            &mut image,
-            color_convert_func,
-            reads_exact_width(color_transform),
-        );
+        let bands = if parallel {
+            output_bands(width, height)
+        } else {
+            1
+        };
+        if bands <= 1 {
+            upsampler.upsample_and_interleave_rows(
+                &data,
+                0..height,
+                width,
+                &mut image,
+                color_convert_func,
+                direct,
+            );
+            return Ok(image);
+        }
 
+        // Every output row depends only on the finished planes, so bands of
+        // rows are independent: same per-row code, same bytes, any split.
+        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        {
+            let rows_per_band = height.div_ceil(bands);
+            let (upsampler, data) = (&upsampler, &data);
+            std::thread::scope(|scope| {
+                let mut chunks = image.chunks_mut(line_size * rows_per_band).enumerate();
+                // The calling thread takes the first band rather than idling.
+                let first = chunks.next();
+                for (band, lines) in chunks {
+                    let start = band * rows_per_band;
+                    scope.spawn(move || {
+                        upsampler.upsample_and_interleave_rows(
+                            data,
+                            start..start + lines.len() / line_size,
+                            width,
+                            lines,
+                            color_convert_func,
+                            direct,
+                        )
+                    });
+                }
+                if let Some((_, lines)) = first {
+                    upsampler.upsample_and_interleave_rows(
+                        data,
+                        0..lines.len() / line_size,
+                        width,
+                        lines,
+                        color_convert_func,
+                        direct,
+                    );
+                }
+            });
+        }
         Ok(image)
     }
 }

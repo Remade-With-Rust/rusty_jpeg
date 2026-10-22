@@ -987,7 +987,13 @@ impl<R: Source> Decoder<R> {
             return Ok(Vec::new());
         }
 
-        compute_image(&components, planes, output_size, color_transform)
+        compute_image(
+            &components,
+            planes,
+            output_size,
+            color_transform,
+            !self.single_threaded,
+        )
     }
 
     fn determine_color_transform(&self) -> ColorTransform {
@@ -1722,6 +1728,7 @@ fn compute_image(
     mut data: Vec<Vec<u8>>,
     output_size: Dimensions,
     color_transform: ColorTransform,
+    parallel: bool,
 ) -> Result<Vec<u8>> {
     if data.is_empty() || data.iter().any(Vec::is_empty) {
         return Err(Error::Format("not all components have data".to_owned()));
@@ -1751,7 +1758,7 @@ fn compute_image(
         decoded.resize(size, 0);
         Ok(decoded)
     } else {
-        compute_image_parallel(components, data, output_size, color_transform)
+        compute_image_parallel(components, data, output_size, color_transform, parallel)
     }
 }
 
