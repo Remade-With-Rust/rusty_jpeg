@@ -14,6 +14,26 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ## [Unreleased]
 
+## [0.4.4](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.3...v0.4.4) - 2026-10-22
+
+### Fixed
+
+- *(decode)* select_worker compared width x width, not width x height
+
+### Other
+
+- *(decode)* don't thread a decode the process can only run on one core
+- *(decode)* one-lookup DC differences
+- *(decode)* render the RGB image into uninitialised capacity instead of zero-filling it first
+- *(decode)* 9-bit first-level Huffman lookup (was 8)
+- *(decode)* end-of-block in the fast AC table, and carry "DC only" from the entropy decoder
+- *(decode)* AVX2 4:2:0 fancy upsampling, 16 sample pairs per step
+- *(decode)* run the RGB output stage in row bands across threads in the default (threaded) mode
+- *(decode)* AVX2 YCbCr->RGB, 16 pixels per step, bit-identical to SSSE3
+- *(decode)* row-band RGB output stage — static upsampler dispatch, one set of line buffers, luma read in place, vectorizable H2V2/H2V1
+- satisfy clippy 1.99 (div_ceil, single-element loop)
+- 3,686 active installs
+
 ## [0.4.3](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.2...v0.4.3) - 2026-10-17
 
 ### Other
