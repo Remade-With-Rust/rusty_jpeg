@@ -41,7 +41,7 @@ fn rgb_to_yuyv(rgb: &[u8], w: u16, h: u16) -> Vec<u8> {
             };
             let (y0, cb0, cr0) = px(2 * c);
             let (y1, cb1, cr1) = px(2 * c + 1);
-            let avg = |a: u8, b: u8| ((u16::from(a) + u16::from(b) + 1) / 2) as u8;
+            let avg = |a: u8, b: u8| (u16::from(a) + u16::from(b)).div_ceil(2) as u8;
             out.extend_from_slice(&[y0, avg(cb0, cb1), y1, avg(cr0, cr1)]);
         }
     }

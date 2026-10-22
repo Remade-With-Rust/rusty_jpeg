@@ -197,7 +197,8 @@ fn profile_encode() {
     //
     // Timings here are only meaningful in a profiler-OFF build; with `profile`
     // on, read the SHARES and ignore the milliseconds.
-    for (w, h) in [(3840usize, 2160usize)] {
+    {
+        let (w, h) = (3840usize, 2160usize);
         for density in [Density::Photo, Density::Noise] {
             let (y, cb, cr) = planar_source_at(w, h, density);
             let mpx = (w * h) as f64 / 1e6;
@@ -648,7 +649,8 @@ fn ab_chunked_chroma_fill() {
         "{:<26} {:>10} {:>8} {:>10} {:>20}",
         "arm B", "wins(A)", "z", "med B/A", "verdict"
     );
-    for (w, h) in [(3840usize, 2160usize)] {
+    {
+        let (w, h) = (3840usize, 2160usize);
         {
             let density = Density::Photo;
             let (y, cb, cr) = planar_source_at(w, h, density);
