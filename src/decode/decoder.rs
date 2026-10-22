@@ -1496,16 +1496,21 @@ fn decode_block<R: Source>(
                 ))
             }
         };
-        let value = huffman.decode(reader, dc_table)?;
-        let diff = match value {
-            0 => 0,
-            1..=11 => huffman.receive_extend(reader, value)?,
-            _ => {
-                // Section F.1.2.1.1
-                // Table F.1
-                return Err(Error::Format(
-                    "invalid DC difference magnitude category".to_owned(),
-                ));
+        let diff = match huffman.decode_fast_dc(reader, dc_table)? {
+            Some(diff) => diff,
+            None => {
+                let value = huffman.decode(reader, dc_table)?;
+                match value {
+                    0 => 0,
+                    1..=11 => huffman.receive_extend(reader, value)?,
+                    _ => {
+                        // Section F.1.2.1.1
+                        // Table F.1
+                        return Err(Error::Format(
+                            "invalid DC difference magnitude category".to_owned(),
+                        ));
+                    }
+                }
             }
         };
 

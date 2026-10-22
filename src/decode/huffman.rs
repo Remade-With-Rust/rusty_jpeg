@@ -108,6 +108,28 @@ impl HuffmanDecoder {
         Ok(None)
     }
 
+    /// A DC difference in one lookup: the symbol and its magnitude bits
+    /// together, already extended (see `HuffmanTable::ac_lut`). `None` when
+    /// they do not fit the table; the caller then takes `decode` +
+    /// `receive_extend`, which read exactly the same bits.
+    #[inline]
+    pub fn decode_fast_dc<R: Source>(
+        &mut self,
+        reader: &mut crate::decode::Buffered<R>,
+        table: &HuffmanTable,
+    ) -> Result<Option<i16>> {
+        if self.num_bits < LUT_BITS {
+            self.read_bits(reader)?;
+        }
+        let (diff, size) = table.ac_lut[self.peek_bits(LUT_BITS) as usize & ((1 << LUT_BITS) - 1)];
+        if size == 0 {
+            return Ok(None);
+        }
+        crate::prof::bump(crate::prof::Count::DecSymbols, 1);
+        self.consume_bits(size);
+        Ok(Some(diff))
+    }
+
     #[inline]
     pub fn get_bits<R: Source>(
         &mut self,
@@ -264,7 +286,12 @@ pub struct HuffmanTable {
     /// separate small array on purpose: folding both into one 8-byte-padded
     /// entry removed a redundant peek but quadrupled the primary table to 2 KB,
     /// and measured 1703 -> 1969 ms. The redundancy was worth less than the
-    /// cache footprint. A DC table leaves this all-zero.
+    /// cache footprint.
+    ///
+    /// A DC table fills it the same way with run 0: the DC difference already
+    /// extended, so `decode_fast_dc` replaces a symbol decode plus a separate
+    /// `receive_extend` (refill check, read, extend) with one lookup whenever
+    /// the code and its magnitude bits fit.
     ac_lut: [(i16, u8); 1 << LUT_BITS],
 }
 
@@ -307,6 +334,23 @@ impl HuffmanTable {
         // Build a lookup table for small AC coefficients which both decodes the value and does the
         // equivalent of receive_extend.
         let mut ac_lut = [(0i16, 0u8); 1 << LUT_BITS];
+        if matches!(class, HuffmanTableClass::DC) {
+            for (i, &(value, size)) in lut.iter().enumerate() {
+                // `size > 0`: a real code (an empty slot also reads value 0).
+                // Categories above 11 are invalid and stay on the slow path,
+                // which reports them.
+                if size > 0 && value <= 11 && size + value <= LUT_BITS {
+                    let diff = if value == 0 {
+                        0
+                    } else {
+                        let bits =
+                            (((i << size) & ((1 << LUT_BITS) - 1)) >> (LUT_BITS - value)) as u16;
+                        extend(bits, value)
+                    };
+                    ac_lut[i] = (diff, size + value);
+                }
+            }
+        }
         if matches!(class, HuffmanTableClass::AC) {
             for (i, &(value, size)) in lut.iter().enumerate() {
                 let run_length = value >> 4;
