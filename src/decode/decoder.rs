@@ -377,7 +377,7 @@ impl<R: Source> Decoder<R> {
             }
             PreferWorkerKind::Multithreaded => {
                 let width: u64 = frame.output_size.width.into();
-                let height: u64 = frame.output_size.width.into();
+                let height: u64 = frame.output_size.height.into();
                 if width * height > PARALLELISM_THRESHOLD {
                     PreferWorkerKind::Multithreaded
                 } else {
