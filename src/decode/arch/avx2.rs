@@ -334,6 +334,47 @@ pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &
     covered
 }
 
+/// The interior of a 4:2:0 "fancy" upsampled row, 16 sample pairs per step.
+///
+/// With column sums `t[i] = 3*near[i] + far[i]`, pair `k` writes
+/// `out[2k] = (3*t[k] + t[k+1] + 8) >> 4` and
+/// `out[2k+1] = (3*t[k+1] + t[k] + 8) >> 4` -- where `out` starts at output
+/// byte 1 of the row; bytes 0 and `2w-1` are the caller's. Integer maths in
+/// 16-bit lanes (at most 4088, no overflow), so the result is bit-identical
+/// to the scalar loop by construction; `h2v2_matches_reference` in the
+/// upsampler checks it. The two results of a pair are packed as
+/// `lo | hi << 8`, which in little-endian memory IS the interleaved byte
+/// order, so a pair costs no shuffle.
+///
+/// Returns how many pairs it wrote (a multiple of 16); the caller finishes the
+/// rest.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+pub unsafe fn upsample_h2v2_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> usize {
+    let width = near.len().min(far.len());
+    // Pairs k..k+16 read samples k..k+17.
+    let pairs = width.saturating_sub(1).min(out.len() / 2);
+    let eight = _mm256_set1_epi16(8);
+    let three = |a: __m256i| _mm256_add_epi16(a, _mm256_slli_epi16(a, 1));
+    let column = |n: *const u8, f: *const u8| {
+        let n = _mm256_cvtepu8_epi16(_mm_loadu_si128(n as *const __m128i));
+        let f = _mm256_cvtepu8_epi16(_mm_loadu_si128(f as *const __m128i));
+        _mm256_add_epi16(three(n), f)
+    };
+    let mut k = 0;
+    while k + 16 <= pairs {
+        let (np, fp) = (near.as_ptr().add(k), far.as_ptr().add(k));
+        let t0 = column(np, fp);
+        let t1 = column(np.add(1), fp.add(1));
+        let lo = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(three(t0), t1), eight), 4);
+        let hi = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(three(t1), t0), eight), 4);
+        let packed = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 8));
+        _mm256_storeu_si256(out.as_mut_ptr().add(2 * k) as *mut __m256i, packed);
+        k += 16;
+    }
+    k
+}
+
 #[cfg(test)]
 mod color_tests {
     #[test]

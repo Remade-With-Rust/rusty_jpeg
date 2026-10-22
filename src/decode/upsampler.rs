@@ -10,7 +10,12 @@ pub type ColorConvertFn = fn(&[&[u8]], &mut [u8]);
 pub struct Upsampler {
     components: Vec<UpsamplerComponent>,
     line_buffer_size: usize,
+    /// The vectorized H2V2 interior, resolved once per image.
+    h2v2_pairs: Option<H2v2Pairs>,
 }
+
+/// See `arch::get_upsample_h2v2_pairs`.
+type H2v2Pairs = unsafe fn(&[u8], &[u8], &mut [u8]) -> usize;
 
 struct UpsamplerComponent {
     kind: Kind,
@@ -83,9 +88,15 @@ impl Upsampler {
         let buffer_size =
             components.iter().map(|c| c.size.width).max().unwrap() as usize * h_max as usize;
 
+        #[cfg(not(feature = "platform_independent"))]
+        let h2v2_pairs = crate::decode::arch::get_upsample_h2v2_pairs();
+        #[cfg(feature = "platform_independent")]
+        let h2v2_pairs = None;
+
         Ok(Upsampler {
             components: upsampler_components,
             line_buffer_size: buffer_size,
+            h2v2_pairs,
         })
     }
 
@@ -133,6 +144,7 @@ impl Upsampler {
                     output_width,
                     line_buffer,
                     &mut scratch.sums,
+                    self.h2v2_pairs,
                 );
             }
 
@@ -193,6 +205,7 @@ fn upsample_row(
     output_width: usize,
     output: &mut [u8],
     sums: &mut Vec<u16>,
+    h2v2_pairs: Option<H2v2Pairs>,
 ) {
     match c.kind {
         Kind::H1V1 => {
@@ -201,7 +214,16 @@ fn upsample_row(
         }
         Kind::H2V1 => h2v1(&input[row * c.row_stride..], c.width, output),
         Kind::H1V2 => h1v2(input, c.height, c.row_stride, row, output_width, output),
-        Kind::H2V2 => h2v2(input, c.width, c.height, c.row_stride, row, output, sums),
+        Kind::H2V2 => h2v2(
+            input,
+            c.width,
+            c.height,
+            c.row_stride,
+            row,
+            output,
+            sums,
+            h2v2_pairs,
+        ),
         Kind::Generic {
             horizontal_scaling_factor,
             vertical_scaling_factor,
@@ -290,11 +312,13 @@ fn h1v2(
 /// 4:2:0 chroma: triangle filter in both directions, libjpeg's "fancy"
 /// upsampling, bit for bit what this function always produced.
 ///
-/// Two passes instead of one fused bounds-checked loop: first the vertical
-/// sums `t = 3*near + far` for the whole row (one contiguous zip), then the
-/// horizontal pass over adjacent sum pairs. Both vectorize; the old single
-/// loop carried `t` through a scalar recurrence and wrote two interleaved
-/// outputs per step through checked indices, and did not.
+/// The interior goes to the AVX2 kernel when there is one; the rest is two
+/// passes instead of the old fused bounds-checked loop: first the vertical
+/// sums `t = 3*near + far` (one contiguous zip), then the horizontal pass over
+/// adjacent sum pairs. The old single loop carried `t` through a scalar
+/// recurrence and wrote two interleaved outputs per step through checked
+/// indices, and did not vectorize.
+#[allow(clippy::too_many_arguments)]
 fn h2v2(
     input: &[u8],
     input_width: usize,
@@ -303,6 +327,7 @@ fn h2v2(
     row: usize,
     output: &mut [u8],
     sums: &mut Vec<u16>,
+    pairs_kernel: Option<H2v2Pairs>,
 ) {
     let near = row / 2;
     let far = far_row(row, input_height);
@@ -315,27 +340,43 @@ fn h2v2(
         output[1] = value;
         return;
     }
+    let output = &mut output[..input_width * 2];
+    let column = |i: usize| 3 * input_near[i] as u16 + input_far[i] as u16;
+    output[0] = ((column(0) + 2) >> 2) as u8;
+    output[input_width * 2 - 1] = ((column(input_width - 1) + 2) >> 2) as u8;
+
+    // Pair k (samples k and k+1) writes interior bytes 2k and 2k+1.
+    let interior = &mut output[1..input_width * 2 - 1];
+    #[allow(unused_mut)]
+    let mut done = 0;
+    #[cfg(not(feature = "platform_independent"))]
+    if let Some(kernel) = pairs_kernel {
+        // SAFETY: the kernel was chosen by runtime feature detection, and it
+        // reads only within `input_near`/`input_far` and writes only within
+        // `interior`.
+        #[allow(unsafe_code)]
+        {
+            done = unsafe { kernel(input_near, input_far, interior) };
+        }
+    }
+    #[cfg(feature = "platform_independent")]
+    let _ = pairs_kernel;
 
     sums.clear();
     sums.extend(
-        input_near
+        input_near[done..]
             .iter()
-            .zip(input_far)
+            .zip(&input_far[done..])
             .map(|(&n, &f)| 3 * n as u16 + f as u16),
     );
-    let t = &sums[..input_width];
-    let output = &mut output[..input_width * 2];
-
-    output[0] = ((t[0] + 2) >> 2) as u8;
-    for (o, p) in output[1..input_width * 2 - 1]
+    for (o, p) in interior[2 * done..]
         .chunks_exact_mut(2)
-        .zip(t.windows(2))
+        .zip(sums.windows(2))
     {
         let (t0, t1) = (p[0], p[1]);
         o[0] = ((3 * t0 + t1 + 8) >> 4) as u8;
         o[1] = ((3 * t1 + t0 + 8) >> 4) as u8;
     }
-    output[input_width * 2 - 1] = ((t[input_width - 1] + 2) >> 2) as u8;
 }
 
 #[cfg(test)]
@@ -430,8 +471,12 @@ mod tests {
             (2, 1),
             (2, 2),
             (3, 7),
+            (16, 3),
             (17, 9),
+            (18, 2),
+            (33, 3),
             (64, 33),
+            (960, 2),
             (961, 4),
         ] {
             let stride = w + 7;
@@ -440,8 +485,14 @@ mod tests {
                 let mut want = vec![0u8; 2 * w];
                 let mut got = vec![0u8; 2 * w];
                 h2v2_reference(&input, w, h, stride, row, &mut want);
-                h2v2(&input, w, h, stride, row, &mut got, &mut sums);
-                assert_eq!(got, want, "w {w} h {h} row {row}");
+                h2v2(&input, w, h, stride, row, &mut got, &mut sums, None);
+                assert_eq!(got, want, "scalar: w {w} h {h} row {row}");
+                #[cfg(not(feature = "platform_independent"))]
+                if let Some(kernel) = crate::decode::arch::get_upsample_h2v2_pairs() {
+                    got.fill(0);
+                    h2v2(&input, w, h, stride, row, &mut got, &mut sums, Some(kernel));
+                    assert_eq!(got, want, "simd: w {w} h {h} row {row}");
+                }
             }
         }
     }
