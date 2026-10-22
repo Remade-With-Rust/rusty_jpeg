@@ -370,6 +370,11 @@ impl<R: Source> Decoder<R> {
 
         match worker_preference {
             PreferWorkerKind::Immediate => PreferWorkerKind::Immediate,
+            // With one usable core, the worker thread only time-slices it
+            // (see `usable_cores`).
+            PreferWorkerKind::Multithreaded if crate::decode::worker::usable_cores() < 2 => {
+                PreferWorkerKind::Immediate
+            }
             PreferWorkerKind::Multithreaded => {
                 let width: u64 = frame.output_size.width.into();
                 let height: u64 = frame.output_size.width.into();
