@@ -2,6 +2,8 @@ use crate::decode::error::{Error, Result, UnsupportedFeature};
 use crate::decode::parser::Component;
 use alloc::vec;
 use alloc::vec::Vec;
+#[cfg(not(feature = "platform_independent"))]
+use core::mem::MaybeUninit;
 use core::ops::Range;
 
 /// A colour converter: one output row from one row per component.
@@ -108,6 +110,10 @@ impl Upsampler {
     /// line buffer first. Only valid for converters that read exactly
     /// `output_width` samples per component (the zip-based ones); the others
     /// keep the line-buffer contract they always had.
+    #[cfg(any(
+        feature = "platform_independent",
+        all(not(target_arch = "wasm32"), feature = "rayon")
+    ))]
     pub fn upsample_and_interleave_rows(
         &self,
         component_data: &[Vec<u8>],
@@ -117,50 +123,115 @@ impl Upsampler {
         color_convert: ColorConvertFn,
         direct_full_res: bool,
     ) {
-        let component_count = component_data.len();
-        debug_assert_eq!(component_count, self.components.len());
         if rows.is_empty() {
             return;
         }
         let line_size = output.len() / rows.len();
+        let mut scratch = self.scratch(component_data.len());
+        for (row, line) in rows.zip(output.chunks_exact_mut(line_size)) {
+            self.render_row(
+                component_data,
+                row,
+                output_width,
+                line,
+                color_convert,
+                direct_full_res,
+                &mut scratch,
+            );
+        }
+    }
 
-        let mut scratch = Scratch {
+    /// [`upsample_and_interleave_rows`](Self::upsample_and_interleave_rows)
+    /// into memory that has not been initialised, writing every byte of it.
+    ///
+    /// Each row is rendered into a small row buffer (it stays in L1) and copied
+    /// out. That is one extra L1-speed copy per row, and it is what lets the
+    /// caller skip zero-filling the whole image first: for 1080p RGB the
+    /// `vec![0; n]` was 6.2 MB of memset, every byte of which was overwritten.
+    #[cfg(not(feature = "platform_independent"))]
+    pub fn upsample_and_interleave_rows_uninit(
+        &self,
+        component_data: &[Vec<u8>],
+        rows: Range<usize>,
+        output_width: usize,
+        output: &mut [MaybeUninit<u8>],
+        color_convert: ColorConvertFn,
+        direct_full_res: bool,
+    ) {
+        if rows.is_empty() {
+            return;
+        }
+        let line_size = output.len() / rows.len();
+        debug_assert_eq!(line_size * rows.len(), output.len());
+        let mut scratch = self.scratch(component_data.len());
+        let mut line = vec![0u8; line_size];
+        for (row, dst) in rows.zip(output.chunks_exact_mut(line_size)) {
+            self.render_row(
+                component_data,
+                row,
+                output_width,
+                &mut line,
+                color_convert,
+                direct_full_res,
+                &mut scratch,
+            );
+            for (d, &s) in dst.iter_mut().zip(line.iter()) {
+                *d = MaybeUninit::new(s);
+            }
+        }
+    }
+
+    fn scratch(&self, component_count: usize) -> Scratch {
+        debug_assert_eq!(component_count, self.components.len());
+        Scratch {
             lines: vec![vec![0u8; self.line_buffer_size]; component_count],
             sums: Vec::new(),
-        };
-
-        for (row, line) in rows.zip(output.chunks_exact_mut(line_size)) {
-            for (i, (component, line_buffer)) in
-                self.components.iter().zip(&mut scratch.lines).enumerate()
-            {
-                let input = &component_data[i];
-                if direct_full_res && matches!(component.kind, Kind::H1V1) {
-                    continue;
-                }
-                upsample_row(
-                    component,
-                    input,
-                    row,
-                    output_width,
-                    line_buffer,
-                    &mut scratch.sums,
-                    self.h2v2_pairs,
-                );
-            }
-
-            // The colour converters take 3 or 4 components (anything else is
-            // rejected when they are chosen), so a fixed array suffices.
-            let mut views: [&[u8]; 4] = [&[]; 4];
-            for (i, component) in self.components.iter().enumerate() {
-                views[i] = if direct_full_res && matches!(component.kind, Kind::H1V1) {
-                    let start = row * component.row_stride;
-                    &component_data[i][start..start + output_width]
-                } else {
-                    &scratch.lines[i]
-                };
-            }
-            color_convert(&views[..component_count], line);
         }
+    }
+
+    /// One output row: upsample each component, then colour-convert.
+    #[allow(clippy::too_many_arguments)]
+    #[inline]
+    fn render_row(
+        &self,
+        component_data: &[Vec<u8>],
+        row: usize,
+        output_width: usize,
+        line: &mut [u8],
+        color_convert: ColorConvertFn,
+        direct_full_res: bool,
+        scratch: &mut Scratch,
+    ) {
+        let component_count = component_data.len();
+        for (i, (component, line_buffer)) in
+            self.components.iter().zip(&mut scratch.lines).enumerate()
+        {
+            if direct_full_res && matches!(component.kind, Kind::H1V1) {
+                continue;
+            }
+            upsample_row(
+                component,
+                &component_data[i],
+                row,
+                output_width,
+                line_buffer,
+                &mut scratch.sums,
+                self.h2v2_pairs,
+            );
+        }
+
+        // The colour converters take 3 or 4 components (anything else is
+        // rejected when they are chosen), so a fixed array suffices.
+        let mut views: [&[u8]; 4] = [&[]; 4];
+        for (i, component) in self.components.iter().enumerate() {
+            views[i] = if direct_full_res && matches!(component.kind, Kind::H1V1) {
+                let start = row * component.row_stride;
+                &component_data[i][start..start + output_width]
+            } else {
+                &scratch.lines[i]
+            };
+        }
+        color_convert(&views[..component_count], line);
     }
 }
 

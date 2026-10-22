@@ -10,9 +10,11 @@ use crate::decode::parser::{Component, Dimensions};
 use crate::decode::upsampler::Upsampler;
 
 use alloc::sync::Arc;
+#[cfg(feature = "platform_independent")]
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::ops::Range;
 
 pub struct RowData {
     pub index: usize,
@@ -209,7 +211,10 @@ pub fn compute_image_parallel(
     parallel: bool,
 ) -> Result<Vec<u8>> {
     #[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
-    return rayon::compute_image_parallel(components, data, output_size, color_transform);
+    {
+        let _ = parallel;
+        return rayon::compute_image_parallel(components, data, output_size, color_transform);
+    }
 
     #[allow(unreachable_code)]
     {
@@ -217,62 +222,96 @@ pub fn compute_image_parallel(
         let upsampler = Upsampler::new(components, output_size.width, output_size.height)?;
         let line_size = output_size.width as usize * components.len();
         let height = output_size.height as usize;
-        let mut image = vec![0u8; line_size * height];
+        let len = line_size * height;
         let width = output_size.width as usize;
         let direct = reads_exact_width(color_transform);
-
         let bands = if parallel {
             output_bands(width, height)
         } else {
             1
         };
-        if bands <= 1 {
-            upsampler.upsample_and_interleave_rows(
-                &data,
-                0..height,
-                width,
-                &mut image,
-                color_convert_func,
-                direct,
-            );
-            return Ok(image);
-        }
 
-        // Every output row depends only on the finished planes, so bands of
-        // rows are independent: same per-row code, same bytes, any split.
-        #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+        // Not zero-filled: every byte is written below (see
+        // `upsample_and_interleave_rows_uninit`).
+        #[cfg(not(feature = "platform_independent"))]
         {
-            let rows_per_band = height.div_ceil(bands);
-            let (upsampler, data) = (&upsampler, &data);
-            std::thread::scope(|scope| {
-                let mut chunks = image.chunks_mut(line_size * rows_per_band).enumerate();
-                // The calling thread takes the first band rather than idling.
-                let first = chunks.next();
-                for (band, lines) in chunks {
-                    let start = band * rows_per_band;
-                    scope.spawn(move || {
-                        upsampler.upsample_and_interleave_rows(
-                            data,
-                            start..start + lines.len() / line_size,
-                            width,
-                            lines,
-                            color_convert_func,
-                            direct,
-                        )
-                    });
-                }
-                if let Some((_, lines)) = first {
-                    upsampler.upsample_and_interleave_rows(
-                        data,
-                        0..lines.len() / line_size,
+            let mut image: Vec<u8> = Vec::with_capacity(len);
+            in_bands(
+                &mut image.spare_capacity_mut()[..len],
+                line_size,
+                bands,
+                |rows, lines| {
+                    upsampler.upsample_and_interleave_rows_uninit(
+                        &data,
+                        rows,
                         width,
                         lines,
                         color_convert_func,
                         direct,
-                    );
-                }
-            });
+                    )
+                },
+            );
+            // SAFETY: the spare capacity passed to `in_bands` is exactly
+            // `height` rows of `line_size` bytes; `in_bands` hands every row to
+            // exactly one call, and `upsample_and_interleave_rows_uninit`
+            // writes every byte of every row it is given (each row is rendered
+            // to a buffer of `line_size` bytes and copied out whole). So all
+            // `len` bytes are initialised.
+            #[allow(unsafe_code)]
+            unsafe {
+                image.set_len(len)
+            };
+            Ok(image)
         }
-        Ok(image)
+
+        // `platform_independent` forbids `unsafe`, so it pays for the zeroing.
+        #[cfg(feature = "platform_independent")]
+        {
+            let mut image = vec![0u8; len];
+            in_bands(&mut image, line_size, bands, |rows, lines| {
+                upsampler.upsample_and_interleave_rows(
+                    &data,
+                    rows,
+                    width,
+                    lines,
+                    color_convert_func,
+                    direct,
+                )
+            });
+            Ok(image)
+        }
     }
+}
+
+/// Render an image of `line_size`-byte rows into `out` in `bands` row bands,
+/// one thread each (the calling thread takes the first); `render` is given a
+/// row range and exactly the slice of `out` those rows occupy. Every row is
+/// rendered exactly once whatever the band count, and each output row
+/// depends only on the finished planes, so the bytes cannot depend on it.
+fn in_bands<T: Send>(
+    out: &mut [T],
+    line_size: usize,
+    bands: usize,
+    render: impl Fn(Range<usize>, &mut [T]) + Sync,
+) {
+    let height = out.len().checked_div(line_size).unwrap_or(0);
+    #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
+    if bands > 1 {
+        let rows_per_band = height.div_ceil(bands);
+        let render = &render;
+        std::thread::scope(|scope| {
+            let mut chunks = out.chunks_mut(line_size * rows_per_band).enumerate();
+            let first = chunks.next();
+            for (band, lines) in chunks {
+                let start = band * rows_per_band;
+                scope.spawn(move || render(start..start + lines.len() / line_size, lines));
+            }
+            if let Some((_, lines)) = first {
+                render(0..lines.len() / line_size, lines);
+            }
+        });
+        return;
+    }
+    let _ = bands;
+    render(0..height, out);
 }
