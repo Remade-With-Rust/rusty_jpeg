@@ -8,6 +8,14 @@ use alloc::vec::Vec;
 
 const LUT_BITS: u8 = 8;
 
+/// The run `decode_fast_ac` reports for an end-of-block code. A real entry's
+/// run is at most 15, so this cannot collide with one.
+pub const AC_EOB: u8 = 0xFF;
+/// The `run_size` marking an EOB entry in `ac_lut`. Real entries pack
+/// `run << 4 | (code size + magnitude)` with the size at most 8, so their low
+/// nibble never reaches 0xF.
+const AC_LUT_EOB: u8 = 0xFF;
+
 #[derive(Debug)]
 pub struct HuffmanDecoder {
     bits: u64,
@@ -72,6 +80,16 @@ impl HuffmanDecoder {
 
         let (value, run_size) =
             table.ac_lut[self.peek_bits(LUT_BITS) as usize & ((1 << LUT_BITS) - 1)];
+
+        if run_size == AC_LUT_EOB {
+            // End of block: every block that does not fill all 63 AC
+            // positions ends with one, and it used to miss this table and pay
+            // a second lookup through `decode` (one per block -- 49k on a
+            // 1080p frame).
+            crate::prof::bump(crate::prof::Count::DecFastAcHit, 1);
+            self.consume_bits(value as u8);
+            return Ok(Some((0, AC_EOB)));
+        }
 
         if run_size != 0 {
             crate::prof::bump(crate::prof::Count::DecFastAcHit, 1);
@@ -289,6 +307,14 @@ impl HuffmanTable {
             for (i, &(value, size)) in lut.iter().enumerate() {
                 let run_length = value >> 4;
                 let magnitude_category = value & 0x0f;
+
+                // EOB (0x00): store the code size to consume. `size > 0`
+                // distinguishes a real code from an empty slot, which also
+                // reads value 0.
+                if value == 0x00 && size > 0 {
+                    ac_lut[i] = (size as i16, AC_LUT_EOB);
+                    continue;
+                }
 
                 if magnitude_category > 0 && size + magnitude_category <= LUT_BITS {
                     let unextended_ac_value = (((i << size) & ((1 << LUT_BITS) - 1))

@@ -1,5 +1,5 @@
 use crate::decode::error::{Error, Result, UnsupportedFeature};
-use crate::decode::huffman::{fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable};
+use crate::decode::huffman::{fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable, AC_EOB};
 use crate::decode::marker::Marker;
 use crate::decode::parser::{
     parse_app, parse_com, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos,
@@ -1304,7 +1304,7 @@ impl<R: Source> Decoder<R> {
                             if fused {
                                 // Stack-local, so it never leaves L1.
                                 let mut block = [0i16; 64];
-                                decode_block(
+                                let wrote_ac = decode_block(
                                     &mut self.reader,
                                     &mut block,
                                     &mut huffman,
@@ -1320,7 +1320,7 @@ impl<R: Source> Decoder<R> {
                                 fused_worker
                                     .as_mut()
                                     .unwrap()
-                                    .fused_block_inner(i, by, bx, &block);
+                                    .fused_block_inner(i, by, bx, &block, !wrote_ac);
                                 continue;
                             }
                             let coefficients = if is_progressive {
@@ -1472,8 +1472,13 @@ fn decode_block<R: Source>(
     successive_approximation_low: u8,
     eob_run: &mut u16,
     dc_predictor: &mut i16,
-) -> Result<()> {
+) -> Result<bool> {
     let _s = crate::prof::scope(crate::prof::Stage::DecEntropy);
+    // Whether any AC coefficient was written. A written coefficient is never
+    // zero (receive_extend of a non-zero magnitude, or an `ac_lut` value), so
+    // `false` means exactly "DC only" -- which the IDCT stage otherwise
+    // re-derives by scanning all 63 AC positions of every block.
+    let mut wrote_ac = false;
     debug_assert_eq!(coefficients.len(), 64);
 
     if spectral_selection.start == 0 {
@@ -1514,7 +1519,7 @@ fn decode_block<R: Source>(
 
     if index < spectral_selection.end && *eob_run > 0 {
         *eob_run -= 1;
-        return Ok(());
+        return Ok(false);
     }
 
     // Section F.1.2.2.1
@@ -1541,6 +1546,11 @@ fn decode_block<R: Source>(
         };
         while index < spectral_selection.end {
             if let Some((value, run)) = huffman.decode_fast_ac(reader, ac_table)? {
+                if run == AC_EOB {
+                    // What the slow path does for r == 0, s == 0.
+                    *eob_run = 0;
+                    break;
+                }
                 index += run;
 
                 if index >= spectral_selection.end {
@@ -1549,6 +1559,7 @@ fn decode_block<R: Source>(
 
                 coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
                     value << successive_approximation_low;
+                wrote_ac = true;
                 index += 1;
             } else {
                 let byte = huffman.decode(reader, ac_table)?;
@@ -1577,13 +1588,14 @@ fn decode_block<R: Source>(
 
                     coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
                         huffman.receive_extend(reader, s)? << successive_approximation_low;
+                    wrote_ac = true;
                     index += 1;
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(wrote_ac)
 }
 
 fn decode_block_successive_approximation<R: Source>(
