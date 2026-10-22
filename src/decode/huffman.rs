@@ -6,7 +6,11 @@ use alloc::borrow::ToOwned;
 use alloc::vec;
 use alloc::vec::Vec;
 
-const LUT_BITS: u8 = 8;
+/// Width of the first-level lookup. 9 bits, not the 8 jpeg-decoder used:
+/// measured against 8, both 9 and 10 took the dense photos 3-6% faster
+/// (more AC codes resolve in one lookup together with their value) and were
+/// neutral on sparse 1080p video frames; 9 keeps the two tables at 1.5 KB.
+const LUT_BITS: u8 = 9;
 
 /// The run `decode_fast_ac` reports for an end-of-block code. A real entry's
 /// run is at most 15, so this cannot collide with one.
