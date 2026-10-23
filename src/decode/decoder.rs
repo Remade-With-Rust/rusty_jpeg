@@ -947,7 +947,7 @@ impl<R: Source> Decoder<R> {
                 // Get the worker prepared
                 let row_data = RowData {
                     index: i,
-                    recycled: self.plane_pool.pop(),
+                    recycled: Self::take_plane(&mut self.plane_pool, component),
                     component: component.clone(),
                     quantization_table,
                 };
@@ -999,6 +999,19 @@ impl<R: Source> Decoder<R> {
             color_transform,
             !self.single_threaded,
         )
+    }
+
+    /// A plane to refill for `component`: the caller's (`recycle_planes`)
+    /// first, else one from this thread's pool (see `plane_pool`).
+    fn take_plane(pool: &mut Vec<Vec<u8>>, component: &Component) -> Option<Vec<u8>> {
+        if let Some(plane) = pool.pop() {
+            return Some(plane);
+        }
+        let needed = component.block_size.width as usize
+            * component.block_size.height as usize
+            * component.dct_scale
+            * component.dct_scale;
+        crate::decode::plane_pool::take(needed)
     }
 
     fn determine_color_transform(&self) -> ColorTransform {
@@ -1157,7 +1170,7 @@ impl<R: Source> Decoder<R> {
             if finished[i] {
                 let row_data = RowData {
                     index: i,
-                    recycled: self.plane_pool.pop(),
+                    recycled: Self::take_plane(&mut self.plane_pool, component),
                     component: component.clone(),
                     quantization_table: self.quantization_tables
                         [component.quantization_table_index]
@@ -1780,7 +1793,10 @@ fn compute_image(
         decoded.resize(size, 0);
         Ok(decoded)
     } else {
-        compute_image_parallel(components, data, output_size, color_transform, parallel)
+        let image =
+            compute_image_parallel(components, &data, output_size, color_transform, parallel)?;
+        crate::decode::plane_pool::give_back(data);
+        Ok(image)
     }
 }
 
