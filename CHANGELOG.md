@@ -14,6 +14,12 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ## [Unreleased]
 
+## [0.4.5](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.4...v0.4.5) - 2026-10-23
+
+### Other
+
+- *(decode)* reuse component planes across decodes on the same thread
+
 ## [0.4.4](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.3...v0.4.4) - 2026-10-22
 
 ### Fixed
