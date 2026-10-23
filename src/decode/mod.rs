@@ -20,6 +20,7 @@ mod huffman;
 pub(crate) mod idct;
 mod marker;
 mod parser;
+mod plane_pool;
 mod upsampler;
 mod worker;
 

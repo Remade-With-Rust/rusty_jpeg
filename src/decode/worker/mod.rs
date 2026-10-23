@@ -249,7 +249,7 @@ const MAX_OUTPUT_THREADS: usize = 4;
 
 pub fn compute_image_parallel(
     components: &[Component],
-    data: Vec<Vec<u8>>,
+    data: &[Vec<u8>],
     output_size: Dimensions,
     color_transform: ColorTransform,
     parallel: bool,
@@ -286,7 +286,7 @@ pub fn compute_image_parallel(
                 bands,
                 |rows, lines| {
                     upsampler.upsample_and_interleave_rows_uninit(
-                        &data,
+                        data,
                         rows,
                         width,
                         lines,
@@ -314,7 +314,7 @@ pub fn compute_image_parallel(
             let mut image = vec![0u8; len];
             in_bands(&mut image, line_size, bands, |rows, lines| {
                 upsampler.upsample_and_interleave_rows(
-                    &data,
+                    data,
                     rows,
                     width,
                     lines,

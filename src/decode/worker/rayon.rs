@@ -192,7 +192,7 @@ impl ComponentMetadata {
 
 pub fn compute_image_parallel(
     components: &[Component],
-    data: Vec<Vec<u8>>,
+    data: &[Vec<u8>],
     output_size: Dimensions,
     color_transform: ColorTransform,
 ) -> Result<Vec<u8>> {
@@ -211,7 +211,7 @@ pub fn compute_image_parallel(
         .for_each(|(band, lines)| {
             let first = band * BAND;
             upsampler.upsample_and_interleave_rows(
-                &data,
+                data,
                 first..first + lines.len() / line_size,
                 output_size.width as usize,
                 lines,
