@@ -110,10 +110,6 @@ impl Upsampler {
     /// line buffer first. Only valid for converters that read exactly
     /// `output_width` samples per component (the zip-based ones); the others
     /// keep the line-buffer contract they always had.
-    #[cfg(any(
-        feature = "platform_independent",
-        all(not(target_arch = "wasm32"), feature = "rayon")
-    ))]
     pub fn upsample_and_interleave_rows(
         &self,
         component_data: &[Vec<u8>],

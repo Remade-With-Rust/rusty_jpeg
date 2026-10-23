@@ -10,7 +10,6 @@ use crate::decode::parser::{Component, Dimensions};
 use crate::decode::upsampler::Upsampler;
 
 use alloc::sync::Arc;
-#[cfg(feature = "platform_independent")]
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::RefCell;
@@ -275,7 +274,29 @@ pub fn compute_image_parallel(
             1
         };
 
-        // Not zero-filled: every byte is written below (see
+        // One band (single-threaded, or one usable core): zero-fill and render
+        // rows straight into the image. A zeroed allocation this size comes
+        // from fresh pages under most allocators (the Windows heap, glibc), so
+        // the zeroing is free and only the row copy below would be extra --
+        // measured on the system heap, pinned to one core, that copy was the
+        // difference between trailing zune-jpeg and not. Under a recycling
+        // allocator the memset costs about what the copy did.
+        if bands <= 1 {
+            let mut image = vec![0u8; len];
+            upsampler.upsample_and_interleave_rows(
+                data,
+                0..height,
+                width,
+                &mut image,
+                color_convert_func,
+                direct,
+            );
+            return Ok(image);
+        }
+
+        // Several bands: not zero-filled. The memset would run serially on
+        // the calling thread before the bands start, so each band renders its
+        // rows into uninitialised capacity instead (see
         // `upsample_and_interleave_rows_uninit`).
         #[cfg(not(feature = "platform_independent"))]
         {
