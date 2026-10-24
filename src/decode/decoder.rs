@@ -1938,12 +1938,23 @@ fn color_convert_line_cmyk(data: &[&[u8]], output: &mut [u8]) {
     }
 }
 
+/// `ColorTransform::None`: the components as stored, interleaved
+/// (`C M Y K C M Y K ...` for four components).
+///
+/// Inherited from jpeg-decoder, this used to copy each component's whole line
+/// buffer one after another, so every output row came out as planes
+/// (`C..C M..M Y..Y K..K`) in a buffer sized and typed as interleaved -- and
+/// it panicked when the line buffers were wider than the row (subsampled
+/// components). The line buffers can be longer than the row; only the row's
+/// `output.len() / components` pixels are read.
 fn color_no_convert(data: &[&[u8]], output: &mut [u8]) {
-    let mut output_iter = output.iter_mut();
-
-    for pixel in data {
-        for d in pixel.iter() {
-            *(output_iter.next().unwrap()) = *d;
+    let components = data.len();
+    if components == 0 {
+        return;
+    }
+    for (i, pixel) in output.chunks_exact_mut(components).enumerate() {
+        for (sample, plane) in pixel.iter_mut().zip(data) {
+            *sample = plane[i];
         }
     }
 }
@@ -1970,4 +1981,24 @@ fn stbi_f2f(x: f32) -> i32 {
 
 fn clamp_fixed_point(value: i32) -> u8 {
     (value >> FIXED_POINT_OFFSET).clamp(0, 255) as u8
+}
+
+#[cfg(test)]
+mod color_no_convert_tests {
+    #[test]
+    fn no_convert_interleaves_components() {
+        let (c, m, y, k) = (
+            [1u8, 2, 3, 0, 0],
+            [4u8, 5, 6, 0, 0],
+            [7u8, 8, 9, 0, 0],
+            [10u8, 11, 12, 0, 0],
+        );
+        // Line buffers longer than the row (as with subsampled components).
+        let mut out = [0u8; 12];
+        super::color_no_convert(&[&c, &m, &y, &k], &mut out);
+        assert_eq!(out, [1, 4, 7, 10, 2, 5, 8, 11, 3, 6, 9, 12]);
+        let mut out3 = [0u8; 6];
+        super::color_no_convert(&[&c, &m, &y], &mut out3);
+        assert_eq!(out3, [1, 4, 7, 2, 5, 8]);
+    }
 }
