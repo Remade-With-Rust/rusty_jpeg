@@ -14,6 +14,12 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ## [Unreleased]
 
+## [0.4.7](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.6...v0.4.7) - 2026-10-24
+
+### Fixed
+
+- *(decode)* ColorTransform::None returns components interleaved, not per-row planes
+
 ## [0.4.6](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.5...v0.4.6) - 2026-10-23
 
 ### Other
