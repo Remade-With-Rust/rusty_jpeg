@@ -1,4 +1,4 @@
-### In The Wild with 3,686 Active Installs (6 hour Issue response, 72 hour Issue closure)
+### In The Wild with 4,454 Active Installs (6 hour Issue response, 72 hour Issue closure)
 > **In the wild** — [RAG Converter](https://ragconverter.com) uses `rusty_jpeg` to decode the images.
 > It makes personal and work files AI-readable without them leaving the machine:
 > the whole conversion runs as WebAssembly in the browser tab, with nothing
