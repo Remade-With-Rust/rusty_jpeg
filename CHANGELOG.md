@@ -14,6 +14,16 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ## [Unreleased]
 
+## [0.4.8](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.7...v0.4.8) - 2026-10-28
+
+### Other
+
+- no_std builds also decode with the scalar colour converter
+- *(changes)* fixture provenance, and which host build is a chip's decode oracle
+- regenerate progressive_libjpeg.jpg from a committed generator ([#6](https://github.com/Remade-With-Rust/rusty_jpeg/pull/6))
+- 4,454 active installs
+- Update README.md
+
 ## [0.4.7](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.6...v0.4.7) - 2026-10-24
 
 ### Fixed
