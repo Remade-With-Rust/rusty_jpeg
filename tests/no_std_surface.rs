@@ -324,20 +324,30 @@ fn golden_bytes_are_identical_across_build_arms() {
         fnv1a(&trellis),
         fnv1a(&decoded),
     ];
+    // The decoded row depends on the colour converter, not on `simd`: x86
+    // builds dispatch to the arch YCbCr->RGB kernel even without that feature,
+    // and its fixed-point rounding differs from the scalar `ycbcr_to_rgb` by up
+    // to 2 on some pixels of this fixture (the IDCT and grayscale output match
+    // bit-for-bit). Only `platform_independent` takes the scalar converter.
+    const DECODED: u64 = if cfg!(feature = "platform_independent") {
+        6502156977454947973
+    } else {
+        12704027672138690595
+    };
     // (baseline q75, progressive+optimized+DRI q92, trellis q60, decoded fixture)
     #[cfg(not(feature = "simd"))]
     const SCALAR: [u64; 4] = [
         12050974125811034566,
         6676770829851380247,
         3819004929965713182,
-        1368567530356461428,
+        DECODED,
     ];
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     const SIMD_X86_64: [u64; 4] = [
         14979219519507235267,
         9529290799696629874,
         9013122496169227150,
-        11562011784721235997,
+        DECODED,
     ];
     #[cfg(not(feature = "simd"))]
     assert_eq!(got, SCALAR, "scalar kernels: coded bytes changed");

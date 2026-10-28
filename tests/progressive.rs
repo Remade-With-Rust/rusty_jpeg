@@ -9,7 +9,8 @@
 //! references an AC table even on DC-only scans. So a fixture produced by this
 //! crate could never expose the defect, and none did. The fixture below comes
 //! from libjpeg (via Pillow) precisely because it has the layout our encoder
-//! cannot produce.
+//! cannot produce. Its pixels are a synthetic gradient, and
+//! `tools/generate_progressive_libjpeg.py` regenerates it.
 //!
 //! The regression: an optimization hoisted `ac_table.unwrap()` out of the AC
 //! loop. For a DC-only scan the loop never runs, so the unwrap had never been
