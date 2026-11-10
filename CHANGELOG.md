@@ -14,6 +14,12 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ## [Unreleased]
 
+## [0.4.9](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.8...v0.4.9) - 2026-11-10
+
+### Other
+
+- 5,179 active installs
+
 ## [0.4.8](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.7...v0.4.8) - 2026-10-28
 
 ### Other
