@@ -25,6 +25,18 @@ fn xorshift(s: &mut u64) -> u64 {
 }
 
 fn seed_jpeg(w: usize, h: usize, sampling: SamplingFactor, optimize: bool) -> Vec<u8> {
+    seed_jpeg_rst(w, h, sampling, optimize, 0)
+}
+
+/// `restart` > 0 sets a restart interval of that many MCUs, so mutations reach
+/// the restart-marker resynchronisation (`process_restart`).
+fn seed_jpeg_rst(
+    w: usize,
+    h: usize,
+    sampling: SamplingFactor,
+    optimize: bool,
+    restart: u16,
+) -> Vec<u8> {
     let mut rgb = vec![0u8; w * h * 3];
     for y in 0..h {
         for x in 0..w {
@@ -38,6 +50,9 @@ fn seed_jpeg(w: usize, h: usize, sampling: SamplingFactor, optimize: bool) -> Ve
     let mut enc = Encoder::new(&mut out, 85);
     enc.set_sampling_factor(sampling);
     enc.set_optimized_huffman_tables(optimize);
+    if restart > 0 {
+        enc.set_restart_interval(restart);
+    }
     enc.encode(&rgb, w as u16, h as u16, ColorType::Rgb)
         .expect("seed encode");
     out
@@ -108,6 +123,9 @@ fn malformed_input_never_panics() {
         seed_jpeg(37, 23, SamplingFactor::R_4_2_2, true),
         // Progressive, with a scan layout our own encoder never emits.
         LIBJPEG_PROGRESSIVE.to_vec(),
+        // Restart markers every 2 MCUs: mutated RSTs, dropped segments and
+        // bogus markers drive the libjpeg-style resynchronisation.
+        seed_jpeg_rst(48, 40, SamplingFactor::R_4_2_0, false, 2),
     ];
 
     // Small images and a modest count so this stays a CI test, not a fuzz run.

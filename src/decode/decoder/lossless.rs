@@ -1,4 +1,4 @@
-use crate::decode::decoder::{Decoder, MAX_COMPONENTS};
+use crate::decode::decoder::{process_restart, Decoder, MAX_COMPONENTS};
 use crate::decode::error::{Error, Result};
 use crate::decode::huffman::HuffmanDecoder;
 use crate::decode::marker::Marker;
@@ -6,8 +6,8 @@ use crate::decode::parser::Predictor;
 use crate::decode::parser::{Component, FrameInfo, ScanInfo};
 use crate::decode::Source;
 use alloc::borrow::ToOwned;
+use alloc::vec;
 use alloc::vec::Vec;
-use alloc::{format, vec};
 
 impl<R: Source> Decoder<R> {
     /// decode_scan_lossless
@@ -54,33 +54,14 @@ impl<R: Source> Decoder<R> {
             for _mcu_x in 0..width {
                 if self.restart_interval > 0 {
                     if mcus_left_until_restart == 0 {
-                        match huffman.take_marker(reader)? {
-                            Some(Marker::RST(n)) => {
-                                if n != expected_rst_num {
-                                    return Err(Error::Format(format!(
-                                        "found RST{} where RST{} was expected",
-                                        n, expected_rst_num
-                                    )));
-                                }
+                        // Out-of-step restart markers resynchronise as in the
+                        // DCT path (see `process_restart`). The lossless path
+                        // keeps decoding an emptied segment from the inserted
+                        // zero bits rather than zero-filling it.
+                        process_restart(reader, &mut huffman, expected_rst_num)?;
 
-                                huffman.reset();
-
-                                expected_rst_num = (expected_rst_num + 1) % 8;
-                                mcus_left_until_restart = self.restart_interval;
-                            }
-                            Some(marker) => {
-                                return Err(Error::Format(format!(
-                                    "found marker {:?} inside scan where RST{} was expected",
-                                    marker, expected_rst_num
-                                )))
-                            }
-                            None => {
-                                return Err(Error::Format(format!(
-                                    "no marker found where RST{} was expected",
-                                    expected_rst_num
-                                )))
-                            }
-                        }
+                        expected_rst_num = (expected_rst_num + 1) % 8;
+                        mcus_left_until_restart = self.restart_interval;
                     }
 
                     mcus_left_until_restart -= 1;
@@ -180,7 +161,9 @@ impl<R: Source> Decoder<R> {
         }
 
         let mut marker = huffman.take_marker(&mut self.reader)?;
-        while let Some(Marker::RST(_)) = marker {
+        // A trailing RST, or a TEM/RES code that is corrupt data posing as a
+        // marker: skip to the next real marker (as `decode_scan` does).
+        while let Some(Marker::RST(_) | Marker::TEM | Marker::RES) = marker {
             marker = self.read_marker().ok();
         }
         Ok((marker, results))

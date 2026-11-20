@@ -246,7 +246,7 @@ const fn rgb_mask(part: usize, channel: usize) -> [i8; 16] {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &mut [u8]) -> usize {
-    assert!(output.len() % 3 == 0);
+    assert!(output.len().is_multiple_of(3));
     let num = output.len() / 3;
     assert!(num <= y.len());
     assert!(num <= cb.len());
