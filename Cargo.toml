@@ -10,7 +10,12 @@ description = "Pure-Rust JPEG/MJPEG decoder and encoder: baseline + progressive,
 readme = "README.md"
 keywords = ["jpeg", "mjpeg", "decoder", "encoder", "no-std"]
 categories = ["multimedia::images", "multimedia::encoding", "no-std", "embedded"]
-rust-version = "1.85"
+# 1.87, not 1.85: the x86 AVX2 kernels call `core::arch` intrinsics as safe
+# functions inside `#[target_feature]` functions, which needs 1.87. Measured:
+# `cargo +1.86.0 check --lib` fails (E0133, 241 errors), `+1.87.0` passes, with
+# default features on x86_64; the no_std and aarch64 builds pass on 1.86. The
+# dev-dependency `rusty_alloc-api` needs 1.88, so tests and examples do too.
+rust-version = "1.87"
 
 [features]
 # `rayon` is deliberately NOT here. Upstream `jpeg-decoder` enables it by

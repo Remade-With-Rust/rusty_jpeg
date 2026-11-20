@@ -1122,7 +1122,7 @@ impl<W: JfifWrite> Encoder<W> {
                 let mcu = my * mcu_cols + mx;
                 if restart_interval > 0
                     && mcu != last_mcu
-                    && mcu % restart_interval == 0
+                    && mcu.is_multiple_of(restart_interval)
                     && mcu != 0
                 {
                     self.writer.finalize_bit_buffer()?;
@@ -1949,7 +1949,7 @@ fn get_block(
 }
 
 fn ceil_div(value: usize, div: usize) -> usize {
-    value / div + usize::from(value % div != 0)
+    value / div + usize::from(!value.is_multiple_of(div))
 }
 
 fn get_num_bits(mut value: i16) -> u8 {

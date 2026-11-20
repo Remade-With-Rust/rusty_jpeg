@@ -650,12 +650,20 @@ pub fn parse_dqt<R: Source>(reader: &mut R) -> Result<[Option<[u16; 64]>; 4]> {
             };
         }
 
-        if table.contains(&0) {
-            return Err(Error::Format(
-                "quantization table contains element with a zero value".to_owned(),
-            ));
-        }
-
+        // A zero entry is outside the spec (B.2.4.1: Qk is 1..=255, or 1..=65535
+        // for 16-bit tables), but it occurs in the wild, notably in damaged
+        // JPEG-in-TIFF strips, and libjpeg-turbo decodes such files: `get_dqt`
+        // (jdmarker.c) stores the value unchecked, `start_pass` (jddctmgr.c)
+        // copies it into the IDCT multiplier table, and the coefficient in that
+        // position therefore dequantizes to 0. (Its only zero check,
+        // `smoothing_ok` in jdcoefct.c, turns off progressive block smoothing,
+        // which we do not implement.) The clamp of 0 to 1 people remember is
+        // the ENCODER's (`jpeg_add_quant_table`, jcparam.c), not the decoder's.
+        //
+        // We do the same. Every dequantization here is a multiply, never a
+        // division, so a zero table entry is safe and simply zeroes that
+        // coefficient. Rejecting the whole image, as this used to, was the
+        // stricter choice, not the compatible one.
         tables[index] = Some(table);
         length -= 65 + 64 * precision;
     }

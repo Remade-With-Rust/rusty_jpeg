@@ -250,8 +250,8 @@ fn choose_upsampler(
         Ok(Kind::H1V2)
     } else if h2 && v2 {
         Ok(Kind::H2V2)
-    } else if max_sampling_factors.0 % sampling_factors.0 != 0
-        || max_sampling_factors.1 % sampling_factors.1 != 0
+    } else if !max_sampling_factors.0.is_multiple_of(sampling_factors.0)
+        || !max_sampling_factors.1.is_multiple_of(sampling_factors.1)
     {
         Err(Error::Unsupported(
             UnsupportedFeature::NonIntegerSubsamplingRatio,

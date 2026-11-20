@@ -25,6 +25,11 @@ pub struct HuffmanDecoder {
     bits: u64,
     num_bits: u8,
     marker: Option<Marker>,
+    /// Zero bits appended after `marker` was reached, since the last `reset`.
+    /// They sit at the tail of `bits`, behind every real bit, so a decode has
+    /// consumed one exactly when `num_bits < fill_bits` (see `ran_out`).
+    /// Touched only on the byte-at-a-time refill path, never per symbol.
+    fill_bits: u32,
 }
 
 impl HuffmanDecoder {
@@ -33,6 +38,7 @@ impl HuffmanDecoder {
             bits: 0,
             num_bits: 0,
             marker: None,
+            fill_bits: 0,
         }
     }
 
@@ -160,6 +166,28 @@ impl HuffmanDecoder {
     pub fn reset(&mut self) {
         self.bits = 0;
         self.num_bits = 0;
+        self.fill_bits = 0;
+    }
+
+    /// libjpeg's `insufficient_data`: a symbol has been decoded from the zero
+    /// bits inserted after the entropy-coded segment ran into a marker, so the
+    /// segment's real data is exhausted. Sticky until the next `reset`.
+    #[inline]
+    pub fn ran_out(&self) -> bool {
+        self.fill_bits > u32::from(self.num_bits)
+    }
+
+    /// Take the marker the bit reader has already run into, WITHOUT reading
+    /// any further. (`take_marker` refills first, which pulls bytes.)
+    pub fn take_pending_marker(&mut self) -> Option<Marker> {
+        self.marker.take()
+    }
+
+    /// Leave `marker` unread: the reader treats it as sitting at the current
+    /// input position, so the next refill yields zero bits and the next
+    /// `take_marker` returns it again (libjpeg's non-zero `unread_marker`).
+    pub fn set_pending_marker(&mut self, marker: Marker) {
+        self.marker = Some(marker);
     }
 
     pub fn take_marker<R: Source>(
@@ -218,7 +246,10 @@ impl HuffmanDecoder {
             crate::prof::bump(crate::prof::Count::DecBytesRead, 1);
             // Fill with zero bits if we have reached the end.
             let byte = match self.marker {
-                Some(_) => 0,
+                Some(_) => {
+                    self.fill_bits = self.fill_bits.saturating_add(8);
+                    0
+                }
                 None => reader.next_byte()?,
             };
 
@@ -237,16 +268,13 @@ impl HuffmanDecoder {
                         next_byte = reader.next_byte()?;
                     }
 
-                    match next_byte {
-                        0x00 => {
-                            return Err(Error::Format(
-                                "FF 00 found where marker was expected".to_owned(),
-                            ))
-                        }
-                        _ => self.marker = Some(Marker::from_u8(next_byte).unwrap()),
+                    if next_byte != 0x00 {
+                        self.marker = Some(Marker::from_u8(next_byte).unwrap());
+                        continue;
                     }
-
-                    continue;
+                    // `FF FF .. FF 00` is not valid, but libjpeg-turbo reads it
+                    // as a single FF data byte (`jpeg_fill_bit_buffer`,
+                    // jdhuff.c) rather than failing the image, and so do we.
                 }
             }
 

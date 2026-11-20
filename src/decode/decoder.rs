@@ -294,15 +294,21 @@ impl<R: Source> Decoder<R> {
     pub fn info(&self) -> Option<ImageInfo> {
         match self.frame {
             Some(ref frame) => {
+                // The frame header is validated (1, 3 or 4 components,
+                // precision 2..=16) before a frame is stored, so the `None`
+                // arms are unreachable today. They are `None` rather than
+                // `panic!()` so that admitting another layout later, such as
+                // the 2-component lossless tiles in DNG, cannot turn a metadata
+                // query into a panic.
                 let pixel_format = match frame.components.len() {
                     1 => match frame.precision {
                         2..=8 => PixelFormat::L8,
                         9..=16 => PixelFormat::L16,
-                        _ => panic!(),
+                        _ => return None,
                     },
                     3 => PixelFormat::RGB24,
                     4 => PixelFormat::CMYK32,
-                    _ => panic!(),
+                    _ => return None,
                 };
 
                 Some(ImageInfo {
@@ -840,13 +846,11 @@ impl<R: Source> Decoder<R> {
                 }
                 // Restart
                 Marker::RST(..) => {
-                    // Some encoders emit a final RST marker after entropy-coded data, which
-                    // decode_scan does not take care of. So if we encounter one, we ignore it.
-                    if previous_marker != Marker::SOS {
-                        return Err(Error::Format(
-                            "RST found outside of entropy-coded data".to_owned(),
-                        ));
-                    }
+                    // A stray RST between marker segments carries no data and
+                    // no parameters. libjpeg-turbo's `read_markers` ignores it
+                    // wherever it appears, so do we, rather than refusing the
+                    // image. It does not count as the previous marker.
+                    continue;
                 }
 
                 // Define number of lines
@@ -1083,30 +1087,7 @@ impl<R: Source> Decoder<R> {
     }
 
     fn read_marker(&mut self) -> Result<Marker> {
-        loop {
-            // This should be an error as the JPEG spec doesn't allow extraneous data between marker segments.
-            // libjpeg allows this though and there are images in the wild utilising it, so we are
-            // forced to support this behavior.
-            // Sony Ericsson P990i is an example of a device which produce this sort of JPEGs.
-            while read_u8(&mut self.reader)? != 0xFF {}
-
-            // Section B.1.1.2
-            // All markers are assigned two-byte codes: an X’FF’ byte followed by a
-            // byte which is not equal to 0 or X’FF’ (see Table B.1). Any marker may
-            // optionally be preceded by any number of fill bytes, which are bytes
-            // assigned code X’FF’.
-            let mut byte = read_u8(&mut self.reader)?;
-
-            // Section B.1.1.2
-            // "Any marker may optionally be preceded by any number of fill bytes, which are bytes assigned code X’FF’."
-            while byte == 0xFF {
-                byte = read_u8(&mut self.reader)?;
-            }
-
-            if byte != 0x00 && byte != 0xFF {
-                return Ok(Marker::from_u8(byte).unwrap());
-            }
-        }
+        next_marker(&mut self.reader)
     }
 
     #[allow(clippy::type_complexity)]
@@ -1205,6 +1186,13 @@ impl<R: Source> Decoder<R> {
         let mut dc_predictors = [0i16; MAX_COMPONENTS];
         let mut mcus_left_until_restart = self.restart_interval;
         let mut expected_rst_num = 0;
+        // libjpeg's `insufficient_data`: once the segment's data is exhausted
+        // (a marker came early, or a restart left one unread), the rest of the
+        // segment is NOT decoded from the inserted zero bits, which would turn
+        // into arbitrary coefficients under the file's Huffman tables. Its
+        // blocks are left zero instead -- uniform grey, as libjpeg-turbo
+        // renders them -- or, in a progressive refinement, unchanged.
+        let mut insufficient = false;
         let mut eob_run = 0;
         let mut mcu_row_coefficients = vec![vec![]; components.len()];
 
@@ -1257,38 +1245,24 @@ impl<R: Source> Decoder<R> {
                     break;
                 }
 
+                // Checked before the restart below resets the bit reader.
+                insufficient |= huffman.ran_out();
+
                 if self.restart_interval > 0 {
                     if mcus_left_until_restart == 0 {
-                        match huffman.take_marker(&mut self.reader)? {
-                            Some(Marker::RST(n)) => {
-                                if n != expected_rst_num {
-                                    return Err(Error::Format(format!(
-                                        "found RST{} where RST{} was expected",
-                                        n, expected_rst_num
-                                    )));
-                                }
+                        let consumed =
+                            process_restart(&mut self.reader, &mut huffman, expected_rst_num)?;
+                        // Section F.2.1.3.1
+                        dc_predictors = [0i16; MAX_COMPONENTS];
+                        // Section G.1.2.2
+                        eob_run = 0;
 
-                                huffman.reset();
-                                // Section F.2.1.3.1
-                                dc_predictors = [0i16; MAX_COMPONENTS];
-                                // Section G.1.2.2
-                                eob_run = 0;
-
-                                expected_rst_num = (expected_rst_num + 1) % 8;
-                                mcus_left_until_restart = self.restart_interval;
-                            }
-                            Some(marker) => {
-                                return Err(Error::Format(format!(
-                                    "found marker {:?} inside scan where RST{} was expected",
-                                    marker, expected_rst_num
-                                )))
-                            }
-                            None => {
-                                return Err(Error::Format(format!(
-                                    "no marker found where RST{} was expected",
-                                    expected_rst_num
-                                )))
-                            }
+                        expected_rst_num = (expected_rst_num + 1) % 8;
+                        mcus_left_until_restart = self.restart_interval;
+                        // A fresh segment has data again -- unless the marker
+                        // was left unread, in which case it is empty.
+                        if consumed {
+                            insufficient = false;
                         }
                     }
 
@@ -1319,6 +1293,24 @@ impl<R: Source> Decoder<R> {
                     let fused = use_fused && finished[i];
                     for v_pos in 0..mcu_vertical_samples[i] {
                         for h_pos in 0..mcu_horizontal_samples[i] {
+                            if insufficient {
+                                // Leave the block as it is: zero in a fresh row
+                                // buffer, untouched in progressive storage. The
+                                // fused path has no buffer, so hand the
+                                // transform an all-zero block itself.
+                                if fused {
+                                    let by = (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
+                                    let bx = (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
+                                    fused_worker.as_mut().unwrap().fused_block_inner(
+                                        i,
+                                        by,
+                                        bx,
+                                        &[0i16; 64],
+                                        true,
+                                    );
+                                }
+                                continue;
+                            }
                             if fused {
                                 // Stack-local, so it never leaves L1.
                                 let mut block = [0i16; 64];
@@ -1458,7 +1450,12 @@ impl<R: Source> Decoder<R> {
         }
 
         let mut marker = huffman.take_marker(&mut self.reader)?;
-        while let Some(Marker::RST(_)) = marker {
+        // Some encoders emit a final RST after the entropy-coded data; skip it.
+        // A TEM or RES code here is corrupt entropy data that merely looked
+        // like a marker (FF followed by a byte below SOF0): skip to the next
+        // real marker rather than fail an image whose scan has been decoded --
+        // libjpeg-turbo has already output those rows by the time it complains.
+        while let Some(Marker::RST(_) | Marker::TEM | Marker::RES) = marker {
             marker = self.read_marker().ok();
         }
 
@@ -1475,6 +1472,100 @@ impl<R: Source> Decoder<R> {
             Ok((marker, Some(data)))
         } else {
             Ok((marker, None))
+        }
+    }
+}
+
+/// Skip to the next marker and return it: libjpeg's `next_marker`.
+///
+/// This should be an error as the JPEG spec doesn't allow extraneous data
+/// between marker segments. libjpeg allows it though (with a warning), and there
+/// are images in the wild relying on it; the Sony Ericsson P990i is one device
+/// that produces them. A stuffed `FF 00` is data, not a marker, and is skipped
+/// like any other byte.
+fn next_marker<R: Source>(reader: &mut R) -> Result<Marker> {
+    loop {
+        while read_u8(reader)? != 0xFF {}
+
+        // Section B.1.1.2
+        // All markers are assigned two-byte codes: an X'FF' byte followed by a
+        // byte which is not equal to 0 or X'FF' (see Table B.1). Any marker may
+        // optionally be preceded by any number of fill bytes, which are bytes
+        // assigned code X'FF'.
+        let mut byte = read_u8(reader)?;
+        while byte == 0xFF {
+            byte = read_u8(reader)?;
+        }
+
+        if byte != 0x00 {
+            return Ok(Marker::from_u8(byte).unwrap());
+        }
+    }
+}
+
+/// Cross a restart boundary the way libjpeg-turbo does, instead of failing the
+/// image when the marker found there is not the `RST{expected}` due: the
+/// equivalent of `process_restart` (jdhuff.c), `read_restart_marker` and
+/// `jpeg_resync_to_restart` (jdmarker.c).
+///
+/// The caller resets its DC predictions and EOB run, advances the expected
+/// restart number and reloads the restart counter whatever this returns, as
+/// libjpeg does. Returns whether the marker was consumed. `false` means it was
+/// left unread in `huffman` (libjpeg's "action 3"): the next segment then reads
+/// as empty, and the caller must keep treating its data as exhausted.
+pub(crate) fn process_restart<R: Source>(
+    reader: &mut crate::decode::Buffered<R>,
+    huffman: &mut HuffmanDecoder,
+    expected: u8,
+) -> Result<bool> {
+    // Whatever bits remain belong to the segment just finished (padding, or
+    // data an over-long segment carried); libjpeg discards them too. Then take
+    // the marker the bit reader already ran into, or scan forward to the next
+    // one, skipping anything that is not a marker.
+    let mut marker = match huffman.take_pending_marker() {
+        Some(marker) => marker,
+        None => next_marker(reader)?,
+    };
+    huffman.reset();
+
+    if marker == Marker::RST(expected) {
+        return Ok(true);
+    }
+
+    // The restart markers are out of step: a corrupted RST, a dropped segment,
+    // or the end of the scan data arriving early. libjpeg cannot back up in
+    // the stream, and neither can we, so the choice is made from the marker
+    // found:
+    //   1. discard it and resume decoding right after it;
+    //   2. scan forward to the next marker and decide again;
+    //   3. leave it unread, so the coming segment decodes as empty.
+    // An RST one or two counts ahead means the expected one was lost: wait for
+    // it (3). One or two behind means this segment ran over: advance (2). One
+    // further away than that is not trusted for resynchronising at all (1).
+    // A code below SOF0 (TEM, RES) cannot be a real marker here and is skipped
+    // (2); any other real marker (EOI, SOS, DHT, ...) must not be read past, or
+    // the scan would run over its end (3).
+    loop {
+        let action = match marker {
+            Marker::RST(n) => {
+                if n == (expected + 1) & 7 || n == (expected + 2) & 7 {
+                    3
+                } else if n == expected.wrapping_sub(1) & 7 || n == expected.wrapping_sub(2) & 7 {
+                    2
+                } else {
+                    1
+                }
+            }
+            Marker::TEM | Marker::RES => 2,
+            _ => 3,
+        };
+        match action {
+            1 => return Ok(true),
+            2 => marker = next_marker(reader)?,
+            _ => {
+                huffman.set_pending_marker(marker);
+                return Ok(false);
+            }
         }
     }
 }
@@ -1849,7 +1940,11 @@ pub(crate) fn choose_color_convert_func(
             )),
             ColorTransform::Unknown => Err(Error::Format("Unknown colour transform".to_string())),
         },
-        _ => panic!(),
+        // Unreachable while frame validation admits only 1, 3 or 4 components
+        // (and 1 never comes here), but an error, not a panic, if it ever is.
+        n => Err(Error::Unsupported(UnsupportedFeature::ComponentCount(
+            n as u8,
+        ))),
     }
 }
 

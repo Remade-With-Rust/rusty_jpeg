@@ -102,6 +102,22 @@ jobs:
         run: cargo fuzz run roundtrip -- -max_total_time=60 -rss_limit_mb=4096
         working-directory: fuzz
 
+  msrv:
+    name: MSRV (rust-version 1.87)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.87.0
+        with:
+          targets: aarch64-unknown-linux-gnu
+      # The library must build on the `rust-version` Cargo.toml declares. Only
+      # the library: the dev-dependency `rusty_alloc-api` needs 1.88, so tests
+      # and examples are not part of this promise. 1.86 fails here (safe
+      # intrinsic calls inside the AVX2 `#[target_feature]` functions).
+      - run: cargo check --lib
+      - run: cargo check --lib --no-default-features
+      - run: cargo check --lib --target aarch64-unknown-linux-gnu
+
   lint:
     runs-on: ubuntu-latest
     steps:
