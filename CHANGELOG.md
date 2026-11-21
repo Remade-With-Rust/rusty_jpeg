@@ -14,6 +14,31 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ## [Unreleased]
 
+## [0.4.10](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.9...v0.4.10) - 2026-11-21
+
+### Other
+
+- *(decode)* two 16-pair groups per step in the 4:2:0 upsampling kernel
+- *(decode)* finish short 4:2:0 upsampling tails without the Vec
+- *(decode)* borrow the waiting block for the pair IDCT
+- *(decode)* resolve each component's Huffman tables once per scan
+- *(decode)* AVX2 interior for 4:2:2 chroma upsampling
+- *(decode)* track the pairing column instead of dividing for it
+- *(decode)* make the point transform a constant in sequential scans
+- *(decode)* keep the bit accumulator in registers through the AC loop
+- *(decode)* convert 32 pixels per step in the AVX2 YCbCr kernel
+- *(decode)* compile the scan body once per coding process
+- *(decode)* inline the table hit of refinement symbol decodes
+- *(decode)* transform finished progressive rows in place
+- *(decode)* refill the bit reader from one 8-byte load
+- *(decode)* resolve the pair IDCT kernel once per worker
+- *(decode)* pair IDCT blocks per component in the fused path
+- *(decode)* walk progressive refinement bands by a nonzero mask
+- *(smoothing)* iterate the band instead of indexing it
+- pin the smoothed row to djpeg; note the lossless point-transform fix
+- WIP test: satisfy clippy in the lossless point-transform test
+- WIP feat(decode): recover truncated and damaged streams as libjpeg-turbo does
+
 ## [0.4.9](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.8...v0.4.9) - 2026-11-20
 
 ### Fixed
