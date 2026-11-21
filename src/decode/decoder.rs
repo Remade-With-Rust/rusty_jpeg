@@ -1,5 +1,7 @@
 use crate::decode::error::{Error, Result, UnsupportedFeature, Warning, Warnings};
-use crate::decode::huffman::{fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable, AC_EOB};
+use crate::decode::huffman::{
+    fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable, AC_EOB, FAST_BITS,
+};
 use crate::decode::marker::Marker;
 use crate::decode::parser::{
     parse_app, parse_com, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos,
@@ -2093,66 +2095,84 @@ fn decode_block<R: Source, T: Track>(
                 ))
             }
         };
-        while index < spectral_selection.end {
-            if let Some((value, run)) = huffman.decode_fast_ac(reader, ac_table)? {
-                if run == AC_EOB {
-                    // What the slow path does for r == 0, s == 0.
-                    *eob_run = 0;
-                    break;
+        // The accumulator lives in locals for the loop (see
+        // `HuffmanDecoder::state`) and is handed back before every call that
+        // uses the decoder and at every exit; the slow path's own exits leave
+        // it in the decoder and leave the block directly.
+        'ac: {
+            let (mut bits, mut num_bits) = huffman.state();
+            while index < spectral_selection.end {
+                if num_bits < FAST_BITS {
+                    huffman.set_state(bits, num_bits);
+                    huffman.refill(reader)?;
+                    (bits, num_bits) = huffman.state();
                 }
-                index += run;
-
-                if index >= spectral_selection.end {
-                    // A run past the end of the band: only corrupt data does
-                    // this. See `overrun_position`.
-                    let v = value << successive_approximation_low;
-                    coefficients[overrun_position(index)] = v;
-                    track.write(cmp::min(index, 63), v);
-                    wrote_ac = true;
-                    break;
-                }
-
-                let v = value << successive_approximation_low;
-                coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = v;
-                track.write(index & 63, v);
-                wrote_ac = true;
-                index += 1;
-            } else {
-                let byte = huffman.decode(reader, ac_table)?;
-                let r = byte >> 4;
-                let s = byte & 0x0f;
-
-                if s == 0 {
-                    match r {
-                        15 => index += 16, // Run length of 16 zero coefficients.
-                        _ => {
-                            *eob_run = (1 << r) - 1;
-
-                            if r > 0 {
-                                *eob_run += huffman.get_bits(reader, r)?;
-                            }
-
-                            break;
-                        }
+                if let Some((value, run)) =
+                    HuffmanDecoder::fast_ac(ac_table, &mut bits, &mut num_bits)
+                {
+                    if run == AC_EOB {
+                        // What the slow path does for r == 0, s == 0.
+                        *eob_run = 0;
+                        break;
                     }
-                } else {
-                    index += r;
+                    index += run;
 
                     if index >= spectral_selection.end {
-                        let v = huffman.receive_extend(reader, s)? << successive_approximation_low;
+                        // A run past the end of the band: only corrupt data does
+                        // this. See `overrun_position`.
+                        let v = value << successive_approximation_low;
                         coefficients[overrun_position(index)] = v;
                         track.write(cmp::min(index, 63), v);
                         wrote_ac = true;
                         break;
                     }
 
-                    let v = huffman.receive_extend(reader, s)? << successive_approximation_low;
+                    let v = value << successive_approximation_low;
                     coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = v;
                     track.write(index & 63, v);
                     wrote_ac = true;
                     index += 1;
+                } else {
+                    huffman.set_state(bits, num_bits);
+                    let byte = huffman.decode(reader, ac_table)?;
+                    let r = byte >> 4;
+                    let s = byte & 0x0f;
+
+                    if s == 0 {
+                        match r {
+                            15 => index += 16, // Run length of 16 zero coefficients.
+                            _ => {
+                                *eob_run = (1 << r) - 1;
+
+                                if r > 0 {
+                                    *eob_run += huffman.get_bits(reader, r)?;
+                                }
+
+                                break 'ac;
+                            }
+                        }
+                    } else {
+                        index += r;
+
+                        if index >= spectral_selection.end {
+                            let v =
+                                huffman.receive_extend(reader, s)? << successive_approximation_low;
+                            coefficients[overrun_position(index)] = v;
+                            track.write(cmp::min(index, 63), v);
+                            wrote_ac = true;
+                            break 'ac;
+                        }
+
+                        let v = huffman.receive_extend(reader, s)? << successive_approximation_low;
+                        coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = v;
+                        track.write(index & 63, v);
+                        wrote_ac = true;
+                        index += 1;
+                    }
+                    (bits, num_bits) = huffman.state();
                 }
             }
+            huffman.set_state(bits, num_bits);
         }
     }
 

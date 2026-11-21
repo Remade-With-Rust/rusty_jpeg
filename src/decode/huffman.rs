@@ -6,13 +6,17 @@ use alloc::borrow::ToOwned;
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// Width of the first-level lookup (`LUT_BITS`), for callers holding the
+/// accumulator themselves (see `HuffmanDecoder::state`).
+pub const FAST_BITS: u8 = LUT_BITS;
+
 /// Width of the first-level lookup. 9 bits, not the 8 jpeg-decoder used:
 /// measured against 8, both 9 and 10 took the dense photos 3-6% faster
 /// (more AC codes resolve in one lookup together with their value) and were
 /// neutral on sparse 1080p video frames; 9 keeps the two tables at 1.5 KB.
 const LUT_BITS: u8 = 9;
 
-/// The run `decode_fast_ac` reports for an end-of-block code. A real entry's
+/// The run `fast_ac` reports for an end-of-block code. A real entry's
 /// run is at most 15, so this cannot collide with one.
 pub const AC_EOB: u8 = 0xFF;
 /// The `run_size` marking an EOB entry in `ac_lut`. Real entries pack
@@ -143,39 +147,57 @@ impl HuffmanDecoder {
         Ok(0)
     }
 
-    pub fn decode_fast_ac<R: Source>(
-        &mut self,
-        reader: &mut crate::decode::Buffered<R>,
-        table: &HuffmanTable,
-    ) -> Result<Option<(i16, u8)>> {
-        if self.num_bits < LUT_BITS {
-            self.read_bits(reader)?;
-        }
+    /// The accumulator `(bits, num_bits)`, for a caller that keeps it in
+    /// registers across a loop of table lookups (`decode_block`'s AC loop).
+    /// Through `&mut self` LLVM kept it in memory: a load, a store and two
+    /// read-modify-writes of `num_bits` per symbol, because the refill call
+    /// in the same loop might touch it. The caller hands it back with
+    /// [`set_state`](Self::set_state) before any other method runs.
+    #[inline(always)]
+    pub fn state(&self) -> (u64, u8) {
+        (self.bits, self.num_bits)
+    }
 
-        let (value, run_size) =
-            table.ac_lut[self.peek_bits(LUT_BITS) as usize & ((1 << LUT_BITS) - 1)];
+    /// See [`state`](Self::state).
+    #[inline(always)]
+    pub fn set_state(&mut self, bits: u64, num_bits: u8) {
+        self.bits = bits;
+        self.num_bits = num_bits;
+    }
 
+    /// Refill (`read_bits`) for a caller holding the state: it must have
+    /// handed it back first and must take it again after.
+    #[inline(always)]
+    pub fn refill<R: Source>(&mut self, reader: &mut crate::decode::Buffered<R>) -> Result<()> {
+        self.read_bits(reader)
+    }
+
+    /// One AC symbol and its value in one lookup, on a caller-held
+    /// accumulator holding at least `LUT_BITS` bits (see `ac_lut`):
+    /// `Some((value, run))`, with run `AC_EOB` for an end-of-block, or `None`
+    /// when the code and its magnitude bits do not fit the table -- the
+    /// caller then hands the state back and takes `decode` + `receive_extend`,
+    /// which read exactly the same bits. (This was `decode_fast_ac`, which
+    /// did the same through `&mut self`.)
+    #[inline(always)]
+    pub fn fast_ac(table: &HuffmanTable, bits: &mut u64, num_bits: &mut u8) -> Option<(i16, u8)> {
+        debug_assert!(*num_bits >= LUT_BITS);
+        let (value, run_size) = table.ac_lut[(*bits >> (64 - LUT_BITS)) as usize];
         if run_size == AC_LUT_EOB {
-            // End of block: every block that does not fill all 63 AC
-            // positions ends with one, and it used to miss this table and pay
-            // a second lookup through `decode` (one per block -- 49k on a
-            // 1080p frame).
             crate::prof::bump(crate::prof::Count::DecFastAcHit, 1);
-            self.consume_bits(value as u8);
-            return Ok(Some((0, AC_EOB)));
+            *bits <<= value as u8;
+            *num_bits -= value as u8;
+            return Some((0, AC_EOB));
         }
-
         if run_size != 0 {
             crate::prof::bump(crate::prof::Count::DecFastAcHit, 1);
-            let run = run_size >> 4;
             let size = run_size & 0x0f;
-
-            self.consume_bits(size);
-            return Ok(Some((value, run)));
+            *bits <<= size;
+            *num_bits -= size;
+            return Some((value, run_size >> 4));
         }
-
         crate::prof::bump(crate::prof::Count::DecFastAcMiss, 1);
-        Ok(None)
+        None
     }
 
     /// A DC difference in one lookup: the symbol and its magnitude bits
