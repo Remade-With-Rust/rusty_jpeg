@@ -313,7 +313,26 @@ impl HuffmanDecoder {
         if self.marker.is_none() {
             let want = ((64 - self.num_bits) / 8) as usize;
             let avail = reader.buffered();
-            if want > 0 && avail.len() >= want && !avail[..want].contains(&0xFF) {
+            // With a whole 8-byte window buffered (all but the last few bytes
+            // of each buffer fill), take it in ONE constant-length load and
+            // test the bytes for 0xFF in-register. The general form below
+            // copied `want` bytes -- a runtime length, so a `memcpy` call --
+            // and scanned them with `contains`, a `memchr` call: two calls per
+            // refill, ~27k refills per 2000x1250 4:4:4 frame.
+            if want > 0 && avail.len() >= 8 {
+                let window = u64::from_be_bytes([
+                    avail[0], avail[1], avail[2], avail[3], avail[4], avail[5], avail[6], avail[7],
+                ]);
+                // The top `want` bytes: those the accumulator has room for.
+                let keep = !(!0u64).checked_shr(want as u32 * 8).unwrap_or(0);
+                if ff_bytes(window) & keep == 0 {
+                    self.bits |= (window & keep) >> self.num_bits;
+                    self.num_bits += (want * 8) as u8;
+                    reader.consume(want);
+                    crate::prof::bump(crate::prof::Count::DecBulkRefills, 1);
+                    return Ok(());
+                }
+            } else if want > 0 && avail.len() >= want && !avail[..want].contains(&0xFF) {
                 let mut window = [0u8; 8];
                 window[..want].copy_from_slice(&avail[..want]);
                 self.bits |= u64::from_be_bytes(window) >> self.num_bits;
@@ -393,6 +412,18 @@ impl HuffmanDecoder {
     }
 }
 
+/// The high bit of every byte of `x` that is 0xFF, and no other bit.
+///
+/// Exact, not the usual "has a zero byte" approximation, whose borrow can flag
+/// a byte above a real hit: `(b & 0x7F) + 0x7F` carries into bit 7 for every
+/// low part except 0x7F, so bit 7 ends up clear only for a byte of 0xFF.
+#[inline]
+fn ff_bytes(x: u64) -> u64 {
+    const LOW7: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    let y = !x;
+    !(((y & LOW7) + LOW7) | y | LOW7)
+}
+
 // Section F.2.2.1
 // Figure F.12
 fn extend(value: u16, count: u8) -> i16 {
@@ -402,6 +433,32 @@ fn extend(value: u16, count: u8) -> i16 {
         value as i16 + (-1 << count as i16) + 1
     } else {
         value as i16
+    }
+}
+
+#[cfg(test)]
+mod ff_bytes_tests {
+    /// Every byte value in every lane, alone and next to every other value:
+    /// exactly the 0xFF bytes are flagged.
+    #[test]
+    fn ff_bytes_flags_exactly_the_ff_bytes() {
+        for lane in 0..8 {
+            for a in 0..=255u64 {
+                for b in [0u64, 1, 0x7F, 0x80, 0xFE, 0xFF] {
+                    let mut x = 0x0102_0304_0506_0708u64 ^ (b * 0x0101_0101_0101_0101);
+                    x &= !(0xFF << (8 * lane));
+                    x |= a << (8 * lane);
+                    let want = (0..8).fold(0u64, |m, i| {
+                        if (x >> (8 * i)) & 0xFF == 0xFF {
+                            m | (0x80 << (8 * i))
+                        } else {
+                            m
+                        }
+                    });
+                    assert_eq!(super::ff_bytes(x), want, "x = {x:#018x}");
+                }
+            }
+        }
     }
 }
 
