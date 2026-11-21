@@ -836,11 +836,12 @@ fn lossless_point_transform_predicts_from_the_unscaled_samples() {
         let mut data = l.hdr.clone();
         data.extend_from_slice(&bw.out);
         let got = l.decode(&data);
-        for y in 0..12 {
+        assert_eq!(got.len(), 12);
+        for (y, row) in got.iter().enumerate() {
             match y {
-                0..=4 => assert_eq!(got[y], l.expected_row(y), "pt={pt} row {y}"),
+                0..=4 => assert_eq!(row, &l.expected_row(y), "pt={pt} row {y}"),
                 5 | 6 => {}
-                _ => assert!(got[y].iter().all(|&s| s == 128), "pt={pt} row {y}"),
+                _ => assert!(row.iter().all(|&s| s == 128), "pt={pt} row {y}"),
             }
         }
     }
