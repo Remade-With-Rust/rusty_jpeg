@@ -166,7 +166,10 @@ impl ImmediateWorker {
             // needs a full transform.
             #[cfg(not(feature = "platform_independent"))]
             if let Some(idct_pair) = pair_idct {
-                if !dc_only && i + 1 < block_count && (i % blocks_wide) + 1 < blocks_wide {
+                // `bx` is `i % blocks_wide`, tracked incrementally: the modulo
+                // was a 64-bit division by a runtime width for every non-DC
+                // block of every row -- one instruction, tens of cycles.
+                if !dc_only && i + 1 < block_count && bx + 1 < blocks_wide {
                     let next: &[i16; 64] = data[(i + 1) * 64..(i + 2) * 64].try_into().unwrap();
                     if !dc_only_at(i + 1, next) {
                         crate::prof::bump(crate::prof::Count::DecBlocks, 1);
