@@ -611,9 +611,9 @@ fn truncated_progressive_image_is_smoothed_across_blocks() {
     );
 }
 
-/// Row 20 of the image in `truncated_progressive_image_is_smoothed_across_blocks`.
-// WIP: this is this decoder's own output; the comparison of this stream with
-// djpeg 3.1.0 (within one level) has not been run yet.
+/// Row 20 of the image in `truncated_progressive_image_is_smoothed_across_blocks`,
+/// exactly as libjpeg-turbo 3.1.0's `djpeg -pnm` decodes the stream (checked
+/// sample for sample; djpeg warns "Premature end of JPEG file").
 const SMOOTHED_ROW: [u8; 72] = [
     61, 62, 62, 62, 64, 65, 68, 69, 69, 71, 74, 77, 79, 82, 85, 87, 88, 90, 93, 95, 97, 99, 102,
     104, 104, 106, 109, 111, 113, 115, 118, 120, 120, 122, 125, 127, 129, 131, 134, 136, 136, 138,

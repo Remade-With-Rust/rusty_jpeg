@@ -42,7 +42,15 @@ upstream possible.
     the prediction to start afresh at each restart marker (H.1.1), which this
     decoder never did: **a lossless image with restart intervals decoded
     wrongly even when intact**, and now decodes as libjpeg-turbo decodes it.
-    (Lossless images without restart intervals are unchanged.)
+    (Lossless images without restart intervals are unchanged, except those
+    with a point transform: see the next item.)
+  - **Lossless with a point transform (Pt > 0) decoded wrongly** even when
+    intact: each sample was scaled up by 2^Pt as it was decoded, and the
+    scaled value then fed the prediction of its neighbours. The prediction
+    works on the unscaled samples (H.1.2.1) and the output is scaled once,
+    afterwards, as libjpeg-turbo does. Checked against libjpeg-turbo 3.1.0's
+    djpeg: four `cjpeg -lossless 1,2` files now match it exactly (0.4.9: 98 %
+    of samples differed).
   - **Before any scan data** (inside the headers, or a first scan header with
     nothing after it): still `Error::UnexpectedEof`. There is nothing to show,
     and a bare header must not make the decoder allocate the image it

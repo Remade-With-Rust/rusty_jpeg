@@ -210,7 +210,8 @@ fn malformed_input_never_panics() {
             // Both output paths: they assemble results differently and have
             // diverged before.
             let planar = i % 2 == 0;
-            // Every fourth case in strict mode: the refusals are code too.
+            // Half the cases (two in every four, both output paths) in strict
+            // mode: the refusals are code too.
             let strict = i % 4 >= 2;
             let res = std::panic::catch_unwind(|| {
                 let mut d = Decoder::new(&data[..]);
