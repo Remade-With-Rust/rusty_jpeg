@@ -1978,6 +1978,12 @@ pub(crate) fn process_restart<R: Source>(
 #[allow(clippy::too_many_arguments)]
 /// What `decode_block` records about the AC coefficients it writes.
 trait Track {
+    /// The scan is sequential, so its point transform `Al` is zero: the
+    /// parser refuses successive approximation outside a progressive frame.
+    /// With that a constant, the AC loop drops a shift and the register that
+    /// held `Al` (it was reloaded from the stack for every coefficient).
+    const SEQUENTIAL: bool;
+
     /// The coefficient at zigzag position `zz` (1..=63) now holds `v`.
     fn write(&mut self, zz: u8, v: i16);
 }
@@ -1988,6 +1994,8 @@ trait Track {
 struct NoTrack;
 
 impl Track for NoTrack {
+    const SEQUENTIAL: bool = true;
+
     #[inline(always)]
     fn write(&mut self, _zz: u8, _v: i16) {}
 }
@@ -1995,6 +2003,8 @@ impl Track for NoTrack {
 /// Progressive storage: keep the block's `nonzero` mask (see
 /// `Decoder::nonzero`) exact.
 impl Track for &mut u64 {
+    const SEQUENTIAL: bool = false;
+
     #[inline(always)]
     fn write(&mut self, zz: u8, v: i16) {
         let bit = 1u64 << zz;
@@ -2015,6 +2025,12 @@ fn decode_block<R: Source, T: Track>(
     dc_predictor: &mut i16,
     mut track: T,
 ) -> Result<bool> {
+    debug_assert!(!T::SEQUENTIAL || successive_approximation_low == 0);
+    let successive_approximation_low = if T::SEQUENTIAL {
+        0
+    } else {
+        successive_approximation_low
+    };
     let _s = crate::prof::scope(crate::prof::Stage::DecEntropy);
     // Whether any AC coefficient was written. A written coefficient is never
     // zero (receive_extend of a non-zero magnitude, or an `ac_lut` value), so
