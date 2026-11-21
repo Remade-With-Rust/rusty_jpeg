@@ -30,15 +30,28 @@ pub struct HuffmanDecoder {
     /// consumed one exactly when `num_bits < fill_bits` (see `ran_out`).
     /// Touched only on the byte-at-a-time refill path, never per symbol.
     fill_bits: u32,
+    /// Refuse what the tolerant decoder recovers from: the end of the data
+    /// inside a scan and a bad Huffman code are errors, as they were before
+    /// the recovery existed (`Decoder::set_strict`).
+    strict: bool,
+    /// The data source ended inside this scan. `marker` is then a synthetic
+    /// EOI, as libjpeg-turbo's data source inserts one (`fill_input_buffer`,
+    /// jdatasrc.c). Never cleared: the data does not come back.
+    eof: bool,
+    /// A bit sequence that is no code of its table was read as symbol 0.
+    bad_code: bool,
 }
 
 impl HuffmanDecoder {
-    pub fn new() -> HuffmanDecoder {
+    pub fn new(strict: bool) -> HuffmanDecoder {
         HuffmanDecoder {
             bits: 0,
             num_bits: 0,
             marker: None,
             fill_bits: 0,
+            strict,
+            eof: false,
+            bad_code: false,
         }
     }
 
@@ -75,8 +88,30 @@ impl HuffmanDecoder {
                 }
             }
 
-            Err(Error::Format("failed to decode huffman code".to_owned()))
+            // libjpeg-turbo reads a 17th bit before it gives up.
+            if self.num_bits < 17 {
+                self.read_bits(reader)?;
+            }
+            self.bad_huffman_code()
         }
+    }
+
+    /// No code of the table matches the next 16 bits: libjpeg-turbo's
+    /// `JWRN_HUFF_BAD_CODE` (`jpeg_huff_decode`, jdhuff.c, and the
+    /// `HUFF_DECODE_FAST` macro). It has by then consumed 17 bits -- its
+    /// length search runs into the sentinel at 17 -- and it returns symbol 0
+    /// "as the safest result", then carries on. What follows is garbage until
+    /// the next restart marker (or the end of the scan), but it is the same
+    /// garbage libjpeg-turbo shows, and the image is not refused for it.
+    #[cold]
+    fn bad_huffman_code(&mut self) -> Result<u8> {
+        if self.strict {
+            return Err(Error::Format("failed to decode huffman code".to_owned()));
+        }
+        self.bad_code = true;
+        // `decode` made sure the accumulator holds them.
+        self.consume_bits(17);
+        Ok(0)
     }
 
     pub fn decode_fast_ac<R: Source>(
@@ -169,6 +204,53 @@ impl HuffmanDecoder {
         self.fill_bits = 0;
     }
 
+    /// A code that is in the table but cannot occur where it was read (a
+    /// refinement scan's new coefficient with a size other than 1).
+    /// libjpeg-turbo warns "bad Huffman code" and goes on.
+    #[cold]
+    pub fn unexpected_code(&mut self) -> Result<()> {
+        if self.strict {
+            return Err(Error::Format("unexpected huffman code".to_owned()));
+        }
+        self.bad_code = true;
+        Ok(())
+    }
+
+    /// Whether the data source ended inside this scan (see `eof`).
+    pub fn hit_end_of_data(&self) -> bool {
+        self.eof
+    }
+
+    /// Whether a bad Huffman code was read as symbol 0 in this scan.
+    pub fn saw_bad_code(&self) -> bool {
+        self.bad_code
+    }
+
+    /// Whole bytes of real data (not the zero fill) still unread in the
+    /// accumulator. A valid segment leaves none when its last MCU is done --
+    /// only padding bits, fewer than eight -- so any that remain are data the
+    /// scan did not account for, which libjpeg-turbo counts into its
+    /// "extraneous bytes before marker" warning (`discarded_bytes`).
+    pub fn unread_bytes(&self) -> u32 {
+        u32::from(self.num_bits).saturating_sub(self.fill_bits) / 8
+    }
+
+    /// The data source has ended: from here on the scan sees an EOI, exactly
+    /// as if `FF D9` followed the last byte. libjpeg-turbo's stdio and memory
+    /// sources do this literally ("insert a fake EOI marker", jdatasrc.c).
+    /// Any other error, and every error in strict mode, is passed on.
+    #[cold]
+    pub fn end_of_data(&mut self, error: Error) -> Result<()> {
+        match error {
+            Error::UnexpectedEof if !self.strict => {
+                self.marker = Some(Marker::EOI);
+                self.eof = true;
+                Ok(())
+            }
+            error => Err(error),
+        }
+    }
+
     /// libjpeg's `insufficient_data`: a symbol has been decoded from the zero
     /// bits inserted after the entropy-coded segment ran into a marker, so the
     /// segment's real data is exhausted. Sticky until the next `reset`.
@@ -250,11 +332,26 @@ impl HuffmanDecoder {
                     self.fill_bits = self.fill_bits.saturating_add(8);
                     0
                 }
-                None => reader.next_byte()?,
+                None => match reader.next_byte() {
+                    Ok(byte) => byte,
+                    Err(error) => {
+                        self.end_of_data(error)?;
+                        continue;
+                    }
+                },
             };
 
             if byte == 0xFF {
-                let mut next_byte = reader.next_byte()?;
+                // The data ending after an FF (a marker or a stuffed FF cut in
+                // two) leaves that FF as a fill byte before the synthetic EOI,
+                // which is how libjpeg-turbo reads `FF` + its fake `FF D9`.
+                let mut next_byte = match reader.next_byte() {
+                    Ok(byte) => byte,
+                    Err(error) => {
+                        self.end_of_data(error)?;
+                        continue;
+                    }
+                };
 
                 // Check for byte stuffing.
                 if next_byte != 0x00 {
@@ -265,7 +362,17 @@ impl HuffmanDecoder {
                     // Section B.1.1.2
                     // "Any marker may optionally be preceded by any number of fill bytes, which are bytes assigned code X’FF’."
                     while next_byte == 0xFF {
-                        next_byte = reader.next_byte()?;
+                        next_byte = match reader.next_byte() {
+                            Ok(byte) => byte,
+                            Err(error) => {
+                                self.end_of_data(error)?;
+                                break;
+                            }
+                        };
+                    }
+                    if self.marker.is_some() {
+                        // The data ended in the run of fill bytes.
+                        continue;
                     }
 
                     if next_byte != 0x00 {

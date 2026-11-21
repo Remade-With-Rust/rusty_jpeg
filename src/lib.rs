@@ -24,6 +24,11 @@
 //! The decoder reads any [`decode::Source`]: with `std` that is every
 //! `std::io::Read`; without it, a `&[u8]`.
 //!
+//! A file that ends early or is damaged inside a scan is decoded as far as it
+//! can be, the way libjpeg-turbo decodes it. [`decode::Decoder::warnings`]
+//! says what was recovered from ([`decode::Decoder::is_truncated`] for a file
+//! cut short), and [`decode::Decoder::set_strict`] refuses such input instead.
+//!
 //! # Encode
 //! ```no_run
 //! # fn main() -> Result<(), rusty_jpeg::encode::EncodingError> {

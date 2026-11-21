@@ -14,6 +14,8 @@
 //! seeds produced 38,192 successful decodes, 41,808 clean rejections and
 //! **zero panics**.
 
+mod stream_builder;
+
 use rusty_jpeg::decode::Decoder;
 use rusty_jpeg::encode::{ColorType, Encoder, SamplingFactor};
 
@@ -114,6 +116,61 @@ fn mutate(src: &[u8], kind: u64, rng: &mut u64) -> Vec<u8> {
 /// two published releases. A fuzz corpus is only as good as the shapes in it.
 const LIBJPEG_PROGRESSIVE: &[u8] = include_bytes!("fixtures/progressive_libjpeg.jpg");
 
+/// A lossless (SOF3) image, 24x16 grey with a restart interval of two rows,
+/// built byte by byte: the encoder here writes no lossless JPEG, so without
+/// this seed no mutation reaches the lossless scan decoder, its restart
+/// handling or its fill of rows whose data ran out.
+fn seed_lossless() -> Vec<u8> {
+    use stream_builder::*;
+    let (w, h) = (24usize, 16usize);
+    let mut v = frame(
+        0xC3,
+        w as u16,
+        h as u16,
+        1,
+        (2 * w) as u16,
+        &dqt8(&qtable()),
+    );
+    v.extend(scan_header(&[1], 4, 0, 0));
+    for y0 in (0..h).step_by(2) {
+        let mut bw = BitWriter::new();
+        for i in 0..2 * w {
+            // Any differences decode; these keep the samples moving.
+            put_diff(&mut bw, ((i * 7 + y0 * 3) % 23) as i32 - 11);
+        }
+        v.extend(bw.finish());
+        if y0 + 2 < h {
+            v.extend(rst(y0 / 2));
+        }
+    }
+    v.extend_from_slice(&[0xFF, 0xD9]);
+    v
+}
+
+/// A sequential image of three components in three scans, the middle one with
+/// a restart interval: the multi-scan paths, where a stream cut between scans
+/// leaves whole components to be filled.
+fn seed_three_scans() -> Vec<u8> {
+    use stream_builder::*;
+    let (w, h) = (32u16, 24u16);
+    let mcus = 4 * 3;
+    let mut v = frame(0xC0, w, h, 3, 0, &dqt8(&qtable()));
+    for id in 1..=3u8 {
+        let dri = if id == 2 { 2 } else { 0 };
+        segment(&mut v, 0xDD, &(dri as u16).to_be_bytes());
+        v.extend(scan_header(&[id], 0, 63, 0));
+        let segs = segments(mcus, 1, dri);
+        for (i, seg) in segs.iter().enumerate() {
+            v.extend_from_slice(seg);
+            if i + 1 < segs.len() {
+                v.extend(rst(i));
+            }
+        }
+    }
+    v.extend_from_slice(&[0xFF, 0xD9]);
+    v
+}
+
 #[test]
 fn malformed_input_never_panics() {
     let seeds = [
@@ -126,7 +183,17 @@ fn malformed_input_never_panics() {
         // Restart markers every 2 MCUs: mutated RSTs, dropped segments and
         // bogus markers drive the libjpeg-style resynchronisation.
         seed_jpeg_rst(48, 40, SamplingFactor::R_4_2_0, false, 2),
+        // Lossless, and three scans: built by hand (see above).
+        seed_lossless(),
+        seed_three_scans(),
     ];
+    // The hand-built seeds must be valid streams, or their mutations test
+    // only the first error they hit.
+    for seed in &seeds[5..] {
+        let mut d = Decoder::new(&seed[..]);
+        d.decode().expect("hand-built seed decodes");
+        assert!(d.warnings().is_empty(), "{:?}", d.warnings());
+    }
 
     // Small images and a modest count so this stays a CI test, not a fuzz run.
     // `fuzz/` is where depth comes from.
@@ -143,9 +210,13 @@ fn malformed_input_never_panics() {
             // Both output paths: they assemble results differently and have
             // diverged before.
             let planar = i % 2 == 0;
+            // Half the cases (two in every four, both output paths) in strict
+            // mode: the refusals are code too.
+            let strict = i % 4 >= 2;
             let res = std::panic::catch_unwind(|| {
                 let mut d = Decoder::new(&data[..]);
                 d.set_single_threaded(true);
+                d.set_strict(strict);
                 d.set_max_decoding_buffer_size(32 * 1024 * 1024);
                 if planar {
                     d.decode_planar().map(|p| p.components.len())

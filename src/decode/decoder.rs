@@ -1,4 +1,4 @@
-use crate::decode::error::{Error, Result, UnsupportedFeature};
+use crate::decode::error::{Error, Result, UnsupportedFeature, Warning, Warnings};
 use crate::decode::huffman::{fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable, AC_EOB};
 use crate::decode::marker::Marker;
 use crate::decode::parser::{
@@ -24,7 +24,9 @@ use core::ops::Range;
 pub const MAX_COMPONENTS: usize = 4;
 
 mod lossless;
+mod smoothing;
 use self::lossless::compute_image_lossless;
+use self::smoothing::{Grid, Progression};
 
 #[rustfmt::skip]
 static UNZIGZAG: [u8; 64] = [
@@ -127,6 +129,9 @@ pub struct Decoder<R> {
     coefficients: Vec<Vec<i16>>,
     // Bitmask of which coefficients has been completely decoded.
     coefficients_finished: [u64; MAX_COMPONENTS],
+    // How precisely each component's low coefficients are known so far, for
+    // smoothing a progressive image whose data ends early.
+    progression: Progression,
 
     // Maximum allowed size of decoded image buffer
     decoding_buffer_size_limit: usize,
@@ -141,6 +146,10 @@ pub struct Decoder<R> {
 
     /// Output-plane allocations handed back by a previous decode.
     plane_pool: Vec<Vec<u8>>,
+
+    /// What this decode recovered from, and whether to refuse instead. See
+    /// [`warnings`](Self::warnings) and [`set_strict`](Self::set_strict).
+    warnings: Warnings,
 }
 
 /// One decoded component plane, at its own (possibly subsampled) resolution.
@@ -268,12 +277,66 @@ impl<R: Source> Decoder<R> {
             psir_data: None,
             coefficients: Vec::new(),
             coefficients_finished: [0; MAX_COMPONENTS],
+            progression: Progression::default(),
             decoding_buffer_size_limit: usize::MAX,
             planar_output: false,
             planar_result: None,
             single_threaded: false,
             plane_pool: Vec::new(),
+            warnings: Warnings::default(),
         }
+    }
+
+    /// What the last decode recovered from instead of refusing the image.
+    ///
+    /// Empty after a decode of a complete, well-formed stream. Otherwise the
+    /// pixels returned are the decoder's best effort, built the way
+    /// libjpeg-turbo builds them, and each [`Warning`] names one kind of
+    /// repair (each kind is listed once, in the order first met):
+    ///
+    /// - [`Warning::Truncated`]: the data ended before the end-of-image
+    ///   marker. A baseline image is complete down to the MCU the data ran
+    ///   out in and uniform grey below; a progressive image shows every block
+    ///   at the precision the scans that did arrive gave it.
+    /// - [`Warning::SegmentEndedEarly`], [`Warning::BadHuffmanCode`],
+    ///   [`Warning::RestartMarkerMismatch`], [`Warning::ExtraneousBytes`],
+    ///   [`Warning::MissingScan`]: damage inside the stream.
+    ///
+    /// ```no_run
+    /// # use rusty_jpeg::decode::{Decoder, Warning};
+    /// # fn f(bytes: &[u8]) -> Result<(), rusty_jpeg::decode::Error> {
+    /// let mut decoder = Decoder::new(bytes);
+    /// let pixels = decoder.decode()?;
+    /// if decoder.is_truncated() {
+    ///     // the bottom of `pixels` is grey fill; the file was cut short
+    /// } else if !decoder.warnings().is_empty() {
+    ///     // decoded, but the stream was damaged
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn warnings(&self) -> &[Warning] {
+        self.warnings.as_slice()
+    }
+
+    /// Whether the last decode reached the end of the data before the
+    /// end-of-image marker ([`Warning::Truncated`]), so part of the image was
+    /// filled rather than decoded. A file missing only its final `FF D9`
+    /// reports this too, although every pixel of it was decoded.
+    pub fn is_truncated(&self) -> bool {
+        self.warnings.as_slice().contains(&Warning::Truncated)
+    }
+
+    /// Refuse a damaged or incomplete stream instead of recovering it.
+    ///
+    /// Off by default: the decoder then returns the pixels it could recover
+    /// and lists what it repaired in [`warnings`](Self::warnings), as
+    /// libjpeg-turbo returns an image and emits warnings. In strict mode every
+    /// such [`Warning`] is an error at the point it would have been raised: a
+    /// truncated stream is [`Error::UnexpectedEof`], anything else an
+    /// [`Error::Format`]. `decode` returning `Ok` in strict mode therefore
+    /// means the same as `Ok` with no warnings in the default mode.
+    pub fn set_strict(&mut self, strict: bool) {
+        self.warnings.strict = strict;
     }
 
     /// Colour transform to use when decoding the image. App segments relating to colour transforms
@@ -424,6 +487,14 @@ impl<R: Source> Decoder<R> {
     }
 
     /// Decodes the image and returns the decoded pixels if successful.
+    ///
+    /// A stream that is damaged, or ends early, is decoded as far as it can
+    /// be, as libjpeg-turbo decodes it: `Ok` then means "these are the pixels
+    /// that could be recovered", and [`warnings`](Self::warnings) says what
+    /// was repaired ([`is_truncated`](Self::is_truncated) for the common
+    /// case, a file cut short). Call [`set_strict`](Self::set_strict) first to
+    /// have such a stream refused instead. The same holds for
+    /// [`decode_planar`](Self::decode_planar).
     pub fn decode(&mut self) -> Result<Vec<u8>> {
         WorkerScope::with(|worker| self.decode_internal(false, worker))
     }
@@ -501,13 +572,16 @@ impl<R: Source> Decoder<R> {
         if stop_after_metadata && self.frame.is_some() {
             // The metadata has already been read.
             return Ok(Vec::new());
-        } else if self.frame.is_none()
-            && (read_u8(&mut self.reader)? != 0xFF
-                || Marker::from_u8(read_u8(&mut self.reader)?) != Some(Marker::SOI))
-        {
-            return Err(Error::Format(
-                "first two bytes are not an SOI marker".to_owned(),
-            ));
+        }
+        if self.frame.is_none() {
+            self.warnings.clear();
+            if read_u8(&mut self.reader)? != 0xFF
+                || Marker::from_u8(read_u8(&mut self.reader)?) != Some(Marker::SOI)
+            {
+                return Err(Error::Format(
+                    "first two bytes are not an SOI marker".to_owned(),
+                ));
+            }
         }
 
         let mut previous_marker = Marker::SOI;
@@ -526,10 +600,33 @@ impl<R: Source> Decoder<R> {
                 .map_or(0, |frame| frame.components.len())
         ];
 
+        // The end of the data where a marker, or the rest of a marker segment,
+        // should be. Once a scan has been decoded there is an image to show,
+        // and the stream is read as if an EOI stood where the data stops:
+        // libjpeg-turbo's data source inserts one (`fill_input_buffer`,
+        // jdatasrc.c, "Premature end of JPEG file"). A segment cut in two is
+        // dropped whole. (libjpeg-turbo reads its inserted `FF D9` bytes as
+        // the missing part of the segment, which either changes nothing, the
+        // EOI being next, or is a fatal error; taking the first outcome every
+        // time is the one deliberate difference.) Before the first scan there
+        // is nothing to show, and it stays `Error::UnexpectedEof`, as
+        // libjpeg-turbo fails with "JPEG datastream contains no image".
+        macro_rules! or_end_of_image {
+            ($result:expr) => {
+                match $result {
+                    Err(Error::UnexpectedEof) if scans_processed > 0 => {
+                        self.warnings.raise(Warning::Truncated)?;
+                        break;
+                    }
+                    other => other?,
+                }
+            };
+        }
+
         loop {
             let marker = match pending_marker.take() {
                 Some(m) => m,
-                None => self.read_marker()?,
+                None => or_end_of_image!(self.read_marker()),
             };
 
             match marker {
@@ -594,7 +691,7 @@ impl<R: Source> Decoder<R> {
                     }
 
                     let frame = self.frame.clone().unwrap();
-                    let scan = parse_sos(&mut self.reader, &frame)?;
+                    let scan = or_end_of_image!(parse_sos(&mut self.reader, &frame));
 
                     // Validate the scan's Huffman table references ONCE, here,
                     // rather than discovering a missing table three levels down
@@ -634,6 +731,34 @@ impl<R: Source> Decoder<R> {
                                 )));
                             }
                         }
+                    }
+
+                    // `decoding_buffer_size_limit` bounds the output, and it
+                    // has to do so HERE, before the scan sizes its planes from
+                    // the frame header -- not only in `decode_planes`, after
+                    // every scan has run. A stream may now end anywhere and
+                    // still decode, so a header and a few bytes of scan data
+                    // are all it takes to reach those allocations.
+                    if frame
+                        .components
+                        .len()
+                        .checked_mul(frame.output_size.width.into())
+                        .and_then(|m| m.checked_mul(frame.output_size.height.into()))
+                        .is_none_or(|m| self.decoding_buffer_size_limit < m)
+                    {
+                        return Err(Error::Format(
+                            "size of decoded image exceeds maximum allowed size".to_owned(),
+                        ));
+                    }
+
+                    // A first scan with no entropy-coded data at all: nothing
+                    // has been decoded and nothing would be -- the image would
+                    // be the fill alone. That is still a truncated stream with
+                    // nothing to show, and refusing it here keeps a bare
+                    // header from allocating the image it declares.
+                    // (libjpeg-turbo would output a uniform grey image.)
+                    if scans_processed == 0 && self.reader.at_end()? {
+                        return Err(Error::UnexpectedEof);
                     }
 
                     if frame.coding_process == CodingProcess::DctProgressive
@@ -711,6 +836,10 @@ impl<R: Source> Decoder<R> {
                         // But this means we track precisely which components get completed here.
                         let mut finished = [false; MAX_COMPONENTS];
 
+                        if frame.coding_process == CodingProcess::DctProgressive {
+                            self.progression.start_scan(&scan);
+                        }
+
                         if scan.successive_approximation_low == 0 {
                             for (&i, component_finished) in
                                 scan.component_indices.iter().zip(&mut finished)
@@ -770,7 +899,7 @@ impl<R: Source> Decoder<R> {
                 // Table-specification and miscellaneous markers
                 // Quantization table-specification
                 Marker::DQT => {
-                    let tables = parse_dqt(&mut self.reader)?;
+                    let tables = or_end_of_image!(parse_dqt(&mut self.reader));
 
                     for (i, &table) in tables.iter().enumerate() {
                         if let Some(table) = table {
@@ -787,7 +916,8 @@ impl<R: Source> Decoder<R> {
                 // Huffman table-specification
                 Marker::DHT => {
                     let is_baseline = self.frame.as_ref().map(|frame| frame.is_baseline);
-                    let (dc_tables, ac_tables) = parse_dht(&mut self.reader, is_baseline)?;
+                    let (dc_tables, ac_tables) =
+                        or_end_of_image!(parse_dht(&mut self.reader, is_baseline));
 
                     let current_dc_tables = mem::take(&mut self.dc_huffman_tables);
                     self.dc_huffman_tables = dc_tables
@@ -810,14 +940,16 @@ impl<R: Source> Decoder<R> {
                     ))
                 }
                 // Restart interval definition
-                Marker::DRI => self.restart_interval = parse_dri(&mut self.reader)?,
+                Marker::DRI => {
+                    self.restart_interval = or_end_of_image!(parse_dri(&mut self.reader))
+                }
                 // Comment
                 Marker::COM => {
-                    let _comment = parse_com(&mut self.reader)?;
+                    let _comment = or_end_of_image!(parse_com(&mut self.reader));
                 }
                 // Application data
                 Marker::APP(..) => {
-                    if let Some(data) = parse_app(&mut self.reader, marker)? {
+                    if let Some(data) = or_end_of_image!(parse_app(&mut self.reader, marker)) {
                         match data {
                             AppData::Adobe(color_transform) => {
                                 self.adobe_color_transform = Some(color_transform)
@@ -902,7 +1034,7 @@ impl<R: Source> Decoder<R> {
         );
 
         worker_scope.get_or_init_worker(preference, |worker| {
-            self.decode_planes(worker, planes, planes_u16)
+            self.decode_planes(worker, planes, planes_u16, scans_processed > 0)
         })
     }
 
@@ -910,7 +1042,8 @@ impl<R: Source> Decoder<R> {
         &mut self,
         worker: &mut dyn Worker,
         mut planes: Vec<Vec<u8>>,
-        planes_u16: Vec<Vec<u16>>,
+        mut planes_u16: Vec<Vec<u16>>,
+        any_scan: bool,
     ) -> Result<Vec<u8>> {
         if self.frame.is_none() {
             return Err(Error::Format(
@@ -936,9 +1069,33 @@ impl<R: Source> Decoder<R> {
         if frame.coding_process == CodingProcess::DctProgressive
             && self.coefficients.len() == frame.components.len()
         {
+            // A progressive image whose DATA ENDED EARLY is rendered with
+            // libjpeg-turbo's interblock smoothing (see `smoothing`), which is
+            // what makes a cut-short download look like a soft version of the
+            // picture rather than a mosaic of blocks -- and what libjpeg-turbo
+            // itself outputs for it. Smoothing touches every component, so
+            // each is rendered again from the stored coefficients, including
+            // one a scan had already finished.
+            //
+            // It is tied to truncation on purpose. libjpeg-turbo also smooths
+            // a stream that ends with a proper EOI but whose scans never bring
+            // the low coefficients to full precision; such a stream decodes
+            // here today, and its output is left exactly as it was.
+            let smoothing = if self.warnings.as_slice().contains(&Warning::Truncated) {
+                self.progression
+                    .smoothing(&frame.components, &self.quantization_tables)
+            } else {
+                None
+            };
+            let max_sampling = |factor: fn(&Component) -> u8| {
+                usize::from(frame.components.iter().map(factor).max().unwrap_or(1))
+            };
+            let h_max = max_sampling(|c| c.horizontal_sampling_factor);
+            let v_max = max_sampling(|c| c.vertical_sampling_factor);
+
             for (i, component) in frame.components.iter().enumerate() {
                 // Only dealing with unfinished components
-                if self.coefficients_finished[i] == !0 {
+                if smoothing.is_none() && self.coefficients_finished[i] == !0 {
                     continue;
                 }
 
@@ -951,9 +1108,13 @@ impl<R: Source> Decoder<R> {
                 // Get the worker prepared
                 let row_data = RowData {
                     index: i,
-                    recycled: Self::take_plane(&mut self.plane_pool, component),
+                    recycled: if planes[i].is_empty() {
+                        Self::take_plane(&mut self.plane_pool, component)
+                    } else {
+                        Some(mem::take(&mut planes[i]))
+                    },
                     component: component.clone(),
-                    quantization_table,
+                    quantization_table: quantization_table.clone(),
                 };
                 worker.start(row_data)?;
 
@@ -962,10 +1123,32 @@ impl<R: Source> Decoder<R> {
                     * usize::from(component.vertical_sampling_factor)
                     * 64;
 
+                let grid = Grid {
+                    coefficients: &self.coefficients[i],
+                    blocks_wide: usize::from(component.block_size.width),
+                    width_in_blocks: (usize::from(frame.image_size.width)
+                        * usize::from(component.horizontal_sampling_factor))
+                    .div_ceil(h_max * 8),
+                    height_in_blocks: (usize::from(frame.image_size.height)
+                        * usize::from(component.vertical_sampling_factor))
+                    .div_ceil(v_max * 8),
+                    v_samp: usize::from(component.vertical_sampling_factor),
+                    mcu_rows: usize::from(frame.mcu_size.height),
+                };
+
                 let mut tasks = (0..frame.mcu_size.height).map(|mcu_y| {
                     let offset = usize::from(mcu_y) * coefficients_per_mcu_row;
-                    let row_coefficients =
+                    let mut row_coefficients =
                         self.coefficients[i][offset..offset + coefficients_per_mcu_row].to_vec();
+                    if let Some(smoothing) = &smoothing {
+                        smoothing.smooth_mcu_row(
+                            i,
+                            &grid,
+                            &quantization_table,
+                            usize::from(mcu_y),
+                            &mut row_coefficients,
+                        );
+                    }
                     (i, row_coefficients)
                 });
 
@@ -973,6 +1156,38 @@ impl<R: Source> Decoder<R> {
                 // also internally can parallelize over components.
                 worker.append_rows(&mut tasks)?;
                 planes[i] = worker.get_result(i)?;
+            }
+        }
+
+        // A component no scan ever coded, in an image that has at least one
+        // scan: the stream ended first (or never carried it). libjpeg-turbo
+        // keeps such a component's coefficients at zero and outputs it, so it
+        // is uniform mid-grey; refusing the whole image for it ("not all
+        // components have data") was the stricter choice.
+        if any_scan {
+            if frame.coding_process == CodingProcess::Lossless {
+                let samples =
+                    usize::from(frame.image_size.width) * usize::from(frame.image_size.height);
+                let grey = 1u16 << (frame.precision - 1);
+                for plane in planes_u16.iter_mut().filter(|plane| plane.is_empty()) {
+                    self.warnings.raise(Warning::MissingScan)?;
+                    *plane = vec![grey; samples];
+                }
+            } else {
+                for (plane, component) in planes.iter_mut().zip(&frame.components) {
+                    if plane.is_empty() {
+                        self.warnings.raise(Warning::MissingScan)?;
+                        let needed = component.block_size.width as usize
+                            * component.block_size.height as usize
+                            * component.dct_scale
+                            * component.dct_scale;
+                        let mut grey =
+                            Self::take_plane(&mut self.plane_pool, component).unwrap_or_default();
+                        grey.clear();
+                        grey.resize(needed, 128);
+                        *plane = grey;
+                    }
+                }
             }
         }
 
@@ -1086,8 +1301,13 @@ impl<R: Source> Decoder<R> {
         }
     }
 
-    fn read_marker(&mut self) -> Result<Marker> {
-        next_marker(&mut self.reader)
+    pub(crate) fn read_marker(&mut self) -> Result<Marker> {
+        let mut skipped = false;
+        let marker = next_marker(&mut self.reader, &mut skipped)?;
+        if skipped {
+            self.warnings.raise(Warning::ExtraneousBytes)?;
+        }
+        Ok(marker)
     }
 
     #[allow(clippy::type_complexity)]
@@ -1182,7 +1402,7 @@ impl<R: Source> Decoder<R> {
         // resolves, so this bool decides both paths.
         let use_fused = fused_eligible;
         let mut dummy_block = [0i16; 64];
-        let mut huffman = HuffmanDecoder::new();
+        let mut huffman = HuffmanDecoder::new(self.warnings.strict);
         let mut dc_predictors = [0i16; MAX_COMPONENTS];
         let mut mcus_left_until_restart = self.restart_interval;
         let mut expected_rst_num = 0;
@@ -1193,6 +1413,10 @@ impl<R: Source> Decoder<R> {
         // blocks are left zero instead -- uniform grey, as libjpeg-turbo
         // renders them -- or, in a progressive refinement, unchanged.
         let mut insufficient = false;
+        // libjpeg's `last_good_iMCU_row`: the row of the last MCU that began
+        // with data still to read. Smoothing a truncated progressive image
+        // needs to know where this scan stopped.
+        let mut last_good_row = 0;
         let mut eob_run = 0;
         let mut mcu_row_coefficients = vec![vec![]; components.len()];
 
@@ -1246,12 +1470,22 @@ impl<R: Source> Decoder<R> {
                 }
 
                 // Checked before the restart below resets the bit reader.
-                insufficient |= huffman.ran_out();
+                if huffman.ran_out() && !insufficient {
+                    insufficient = true;
+                    self.segment_ended_early(&huffman)?;
+                }
+                if !insufficient {
+                    last_good_row = mcu_y;
+                }
 
                 if self.restart_interval > 0 {
                     if mcus_left_until_restart == 0 {
-                        let consumed =
-                            process_restart(&mut self.reader, &mut huffman, expected_rst_num)?;
+                        let consumed = process_restart(
+                            &mut self.reader,
+                            &mut huffman,
+                            expected_rst_num,
+                            &mut self.warnings,
+                        )?;
                         // Section F.2.1.3.1
                         dc_predictors = [0i16; MAX_COMPONENTS];
                         // Section G.1.2.2
@@ -1449,15 +1683,14 @@ impl<R: Source> Decoder<R> {
             }
         }
 
-        let mut marker = huffman.take_marker(&mut self.reader)?;
-        // Some encoders emit a final RST after the entropy-coded data; skip it.
-        // A TEM or RES code here is corrupt entropy data that merely looked
-        // like a marker (FF followed by a byte below SOF0): skip to the next
-        // real marker rather than fail an image whose scan has been decoded --
-        // libjpeg-turbo has already output those rows by the time it complains.
-        while let Some(Marker::RST(_) | Marker::TEM | Marker::RES) = marker {
-            marker = self.read_marker().ok();
-        }
+        let marker = self.finish_scan(&mut huffman)?;
+        // In MCU rows of the image: a scan of one component counts its own
+        // block rows.
+        self.progression.last_good_row = if is_interleaved {
+            last_good_row
+        } else {
+            last_good_row / u16::from(components[0].vertical_sampling_factor)
+        };
 
         if finished.iter().any(|&c| c) {
             // Retrieve all the data from the worker thread.
@@ -1474,6 +1707,49 @@ impl<R: Source> Decoder<R> {
             Ok((marker, None))
         }
     }
+
+    /// A segment's data ran out before its MCUs did: because the whole stream
+    /// ended there, or at a marker that came early.
+    #[cold]
+    pub(crate) fn segment_ended_early(&mut self, huffman: &HuffmanDecoder) -> Result<()> {
+        if huffman.hit_end_of_data() {
+            self.warnings.raise(Warning::Truncated)?;
+        }
+        self.warnings.raise(Warning::SegmentEndedEarly)
+    }
+
+    /// The marker that ends a scan whose MCUs have all been decoded, and the
+    /// warnings the scan's bit reader collected along the way.
+    pub(crate) fn finish_scan(&mut self, huffman: &mut HuffmanDecoder) -> Result<Option<Marker>> {
+        // Whole bytes of the scan's data that no MCU used, here or (below)
+        // beyond what the bit reader can hold before it meets a marker.
+        let mut extraneous = huffman.unread_bytes() > 0;
+        let mut marker = huffman.take_marker(&mut self.reader)?;
+        extraneous |= marker.is_none();
+        if extraneous {
+            self.warnings.raise(Warning::ExtraneousBytes)?;
+        }
+        // Some encoders emit a final RST after the entropy-coded data; skip it.
+        // A TEM or RES code here is corrupt entropy data that merely looked
+        // like a marker (FF followed by a byte below SOF0): skip to the next
+        // real marker rather than fail an image whose scan has been decoded --
+        // libjpeg-turbo has already output those rows by the time it complains.
+        while let Some(Marker::RST(_) | Marker::TEM | Marker::RES) = marker {
+            marker = match self.read_marker() {
+                Ok(marker) => Some(marker),
+                // The marker loop meets the end of the data again, and decides.
+                Err(Error::UnexpectedEof) => None,
+                Err(error) => return Err(error),
+            };
+        }
+        if huffman.saw_bad_code() {
+            self.warnings.raise(Warning::BadHuffmanCode)?;
+        }
+        if huffman.hit_end_of_data() {
+            self.warnings.raise(Warning::Truncated)?;
+        }
+        Ok(marker)
+    }
 }
 
 /// Skip to the next marker and return it: libjpeg's `next_marker`.
@@ -1483,9 +1759,13 @@ impl<R: Source> Decoder<R> {
 /// are images in the wild relying on it; the Sony Ericsson P990i is one device
 /// that produces them. A stuffed `FF 00` is data, not a marker, and is skipped
 /// like any other byte.
-fn next_marker<R: Source>(reader: &mut R) -> Result<Marker> {
+///
+/// `skipped` is set when anything was skipped (libjpeg's `discarded_bytes`).
+fn next_marker<R: Source>(reader: &mut R, skipped: &mut bool) -> Result<Marker> {
     loop {
-        while read_u8(reader)? != 0xFF {}
+        while read_u8(reader)? != 0xFF {
+            *skipped = true;
+        }
 
         // Section B.1.1.2
         // All markers are assigned two-byte codes: an X'FF' byte followed by a
@@ -1500,7 +1780,31 @@ fn next_marker<R: Source>(reader: &mut R) -> Result<Marker> {
         if byte != 0x00 {
             return Ok(Marker::from_u8(byte).unwrap());
         }
+        *skipped = true;
     }
+}
+
+/// [`next_marker`] inside a scan: the end of the data reads as an EOI (see
+/// `HuffmanDecoder::end_of_data`), and skipped bytes are a warning.
+fn next_marker_in_scan<R: Source>(
+    reader: &mut crate::decode::Buffered<R>,
+    huffman: &mut HuffmanDecoder,
+    warnings: &mut Warnings,
+) -> Result<Marker> {
+    let mut skipped = false;
+    let marker = match next_marker(reader, &mut skipped) {
+        Ok(marker) => marker,
+        Err(error) => {
+            huffman.end_of_data(error)?;
+            // `end_of_data` left the EOI pending; it is taken here instead.
+            huffman.take_pending_marker();
+            Marker::EOI
+        }
+    };
+    if skipped {
+        warnings.raise(Warning::ExtraneousBytes)?;
+    }
+    Ok(marker)
 }
 
 /// Cross a restart boundary the way libjpeg-turbo does, instead of failing the
@@ -1517,20 +1821,25 @@ pub(crate) fn process_restart<R: Source>(
     reader: &mut crate::decode::Buffered<R>,
     huffman: &mut HuffmanDecoder,
     expected: u8,
+    warnings: &mut Warnings,
 ) -> Result<bool> {
     // Whatever bits remain belong to the segment just finished (padding, or
     // data an over-long segment carried); libjpeg discards them too. Then take
     // the marker the bit reader already ran into, or scan forward to the next
     // one, skipping anything that is not a marker.
+    if huffman.unread_bytes() > 0 {
+        warnings.raise(Warning::ExtraneousBytes)?;
+    }
     let mut marker = match huffman.take_pending_marker() {
         Some(marker) => marker,
-        None => next_marker(reader)?,
+        None => next_marker_in_scan(reader, huffman, warnings)?,
     };
     huffman.reset();
 
     if marker == Marker::RST(expected) {
         return Ok(true);
     }
+    warnings.raise(Warning::RestartMarkerMismatch)?;
 
     // The restart markers are out of step: a corrupted RST, a dropped segment,
     // or the end of the scan data arriving early. libjpeg cannot back up in
@@ -1561,7 +1870,7 @@ pub(crate) fn process_restart<R: Source>(
         };
         match action {
             1 => return Ok(true),
-            2 => marker = next_marker(reader)?,
+            2 => marker = next_marker_in_scan(reader, huffman, warnings)?,
             _ => {
                 huffman.set_pending_marker(marker);
                 return Ok(false);
@@ -1611,7 +1920,11 @@ fn decode_block<R: Source>(
                 let value = huffman.decode(reader, dc_table)?;
                 match value {
                     0 => 0,
-                    1..=11 => huffman.receive_extend(reader, value)?,
+                    // Table F.1 stops at 11 (8-bit samples). libjpeg-turbo
+                    // reads any category its table check admits, up to 15, so
+                    // a damaged stream is not refused for one; the difference
+                    // wraps like every other DC overflow does.
+                    1..=15 => huffman.receive_extend(reader, value)?,
                     _ => {
                         // Section F.1.2.1.1
                         // Table F.1
@@ -1668,6 +1981,10 @@ fn decode_block<R: Source>(
                 index += run;
 
                 if index >= spectral_selection.end {
+                    // A run past the end of the band: only corrupt data does
+                    // this. See `overrun_position`.
+                    coefficients[overrun_position(index)] = value << successive_approximation_low;
+                    wrote_ac = true;
                     break;
                 }
 
@@ -1697,6 +2014,9 @@ fn decode_block<R: Source>(
                     index += r;
 
                     if index >= spectral_selection.end {
+                        coefficients[overrun_position(index)] =
+                            huffman.receive_extend(reader, s)? << successive_approximation_low;
+                        wrote_ac = true;
                         break;
                     }
 
@@ -1710,6 +2030,22 @@ fn decode_block<R: Source>(
     }
 
     Ok(wrote_ac)
+}
+
+/// Where a coefficient goes whose zero run carried it past the end of its band
+/// (`index` is its zigzag position, at or beyond the band's end).
+///
+/// A valid stream never does this; corrupt entropy data does. libjpeg-turbo
+/// still reads the coefficient's bits and stores it: at its zigzag position if
+/// that is inside the block, else at position 63, through the sixteen padding
+/// entries of `jpeg_natural_order` (`decode_mcu_slow`, jdhuff.c, and
+/// `decode_mcu_AC_first`, jdphuff.c). Doing the same -- rather than dropping
+/// the coefficient, and on one path its bits too -- keeps a damaged stream in
+/// step with libjpeg-turbo, so both show the same garbage and run out of data
+/// at the same MCU.
+#[cold]
+fn overrun_position(index: u8) -> usize {
+    usize::from(UNZIGZAG[cmp::min(usize::from(index), 63)])
 }
 
 fn decode_block_successive_approximation<R: Source>(
@@ -1782,14 +2118,19 @@ fn decode_block_successive_approximation<R: Source>(
                         }
                     }
                 }
-                1 => {
+                _ => {
+                    // The size of a newly non-zero coefficient is always 1.
+                    // libjpeg-turbo warns about any other ("bad Huffman code",
+                    // `decode_mcu_AC_refine`) and reads it as 1.
+                    if s != 1 {
+                        huffman.unexpected_code()?;
+                    }
                     if huffman.get_bits(reader, 1)? == 1 {
                         value = bit;
                     } else {
                         value = -bit;
                     }
                 }
-                _ => return Err(Error::Format("unexpected huffman code".to_owned())),
             }
 
             let range = Range {
@@ -1799,7 +2140,15 @@ fn decode_block_successive_approximation<R: Source>(
             index = refine_non_zeroes(reader, coefficients, huffman, range, zero_run_length, bit)?;
 
             if value != 0 {
-                coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = value;
+                // `index` is the zero the run ended on -- or, in corrupt data,
+                // the end of the band, when there were not that many zeros
+                // left; libjpeg-turbo stores the coefficient even then (see
+                // `overrun_position`).
+                if index >= spectral_selection.end {
+                    coefficients[overrun_position(index)] = value;
+                } else {
+                    coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = value;
+                }
             }
 
             index += 1;
@@ -1819,7 +2168,9 @@ fn refine_non_zeroes<R: Source>(
 ) -> Result<u8> {
     debug_assert_eq!(coefficients.len(), 64);
 
-    let last = range.end - 1;
+    // Returned when the band ends before the run does: an end-of-block, a run
+    // of sixteen zeros at the end of the band, or corrupt data.
+    let end = range.end;
     let mut zero_run_length = zrl;
 
     for i in range {
@@ -1834,19 +2185,17 @@ fn refine_non_zeroes<R: Source>(
 
             zero_run_length -= 1;
         } else if huffman.get_bits(reader, 1)? == 1 && *coefficient & bit == 0 {
+            // Wrapping, as libjpeg-turbo's 16-bit `JCOEF` arithmetic does: only
+            // corrupt data can overflow here, and that is not refused.
             if *coefficient > 0 {
-                *coefficient = coefficient
-                    .checked_add(bit)
-                    .ok_or_else(|| Error::Format("Coefficient overflow".to_owned()))?;
+                *coefficient = coefficient.wrapping_add(bit);
             } else {
-                *coefficient = coefficient
-                    .checked_sub(bit)
-                    .ok_or_else(|| Error::Format("Coefficient overflow".to_owned()))?;
+                *coefficient = coefficient.wrapping_sub(bit);
             }
         }
     }
 
-    Ok(last)
+    Ok(end)
 }
 
 fn compute_image(

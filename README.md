@@ -99,6 +99,32 @@ fn main() -> Result<(), rusty_jpeg::decode::Error> {
 `decode_planar()` returns the YCbCr planes directly, skipping upsampling and
 colour conversion — use it when the consumer wants planar YUV.
 
+### Damaged and cut-short files
+
+A file that ends early (a download cut short, a crashed write) or is damaged
+inside a scan decodes the way libjpeg-turbo decodes it: what is there is
+decoded, what is not is filled (grey below the cut in a baseline image; in a
+progressive one, every block at the precision the scans that did arrive gave
+it, smoothed as libjpeg-turbo smooths it), and the decoder says what it did:
+
+```rust
+let mut decoder = rusty_jpeg::Decoder::new(&bytes[..]);
+let pixels = decoder.decode()?;          // Ok: the recoverable part of the image
+if decoder.is_truncated() {
+    // the data ended before the end-of-image marker
+}
+for warning in decoder.warnings() {      // empty for a complete, well-formed file
+    eprintln!("recovered from: {warning}");
+}
+```
+
+`decoder.set_strict(true)` refuses such a file instead: a truncated one with
+`Error::UnexpectedEof` (so a frame receiver can still drop it and
+resynchronise), any other damage with `Error::Format`. A file that ends before
+its first scan has any data is an error in both modes — there is nothing to
+show. `set_max_decoding_buffer_size` bounds what a header may make the decoder
+allocate, and is checked before the first scan is decoded.
+
 ## Encode
 
 ```rust

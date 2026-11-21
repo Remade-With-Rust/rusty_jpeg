@@ -38,43 +38,91 @@ impl<R: Source> Decoder<R> {
             ));
         }
 
-        let mut huffman = HuffmanDecoder::new();
-        let reader = &mut self.reader;
+        let mut huffman = HuffmanDecoder::new(self.warnings.strict);
         let mut mcus_left_until_restart = self.restart_interval;
         let mut expected_rst_num = 0;
-        let mut ra = [0u16; MAX_COMPONENTS];
-        let mut rb = [0u16; MAX_COMPONENTS];
-        let mut rc = [0u16; MAX_COMPONENTS];
 
         let width = frame.image_size.width as usize;
         let height = frame.image_size.height as usize;
 
+        // libjpeg-turbo's lossless decoder works a row at a time
+        // (`decompress_data`, jddiffct.c; `decode_mcus`, jdlhuff.c), and so do
+        // the two things below that a damaged or cut-short stream needs.
+        //
+        // `insufficient`: the segment's data is exhausted (see `decode_scan`).
+        // The row in which it runs out is finished from the inserted zero
+        // bits; every later row of the segment is not decoded at all and comes
+        // out uniform mid-grey (`row_filled`).
+        //
+        // `row_restarts`: a restart marker was crossed at the start of the
+        // row, so its prediction starts afresh like the first row of the scan
+        // (H.1.1: "at the beginning of each restart interval"). Both vectors
+        // stay empty, and cost nothing, for a stream that never needs them.
+        let mut insufficient = false;
+        let mut row_filled: Vec<bool> = Vec::new();
+        let mut row_restarts: Vec<bool> = Vec::new();
+
         let mut differences = vec![Vec::with_capacity(npixel); ncomp];
-        for _mcu_y in 0..height {
-            for _mcu_x in 0..width {
+        for mcu_y in 0..height {
+            // Checked before a restart below resets the bit reader.
+            if huffman.ran_out() && !insufficient {
+                insufficient = true;
+                self.segment_ended_early(&huffman)?;
+            }
+            let mut fill_row = false;
+
+            for mcu_x in 0..width {
                 if self.restart_interval > 0 {
                     if mcus_left_until_restart == 0 {
                         // Out-of-step restart markers resynchronise as in the
-                        // DCT path (see `process_restart`). The lossless path
-                        // keeps decoding an emptied segment from the inserted
-                        // zero bits rather than zero-filling it.
-                        process_restart(reader, &mut huffman, expected_rst_num)?;
+                        // DCT path (see `process_restart`).
+                        let consumed = process_restart(
+                            &mut self.reader,
+                            &mut huffman,
+                            expected_rst_num,
+                            &mut self.warnings,
+                        )?;
 
                         expected_rst_num = (expected_rst_num + 1) % 8;
                         mcus_left_until_restart = self.restart_interval;
+                        // A fresh segment has data again -- unless the marker
+                        // was left unread, in which case it is empty.
+                        if consumed {
+                            insufficient = false;
+                        }
+                        // libjpeg-turbo refuses a lossless restart interval
+                        // that is not a whole number of rows. Such a restart,
+                        // in the middle of a row, is left as it was here: the
+                        // bit reader is reset and the prediction is not.
+                        if mcu_x == 0 {
+                            row_restarts.resize(height, false);
+                            row_restarts[mcu_y] = true;
+                        }
                     }
 
                     mcus_left_until_restart -= 1;
+                }
+
+                if mcu_x == 0 && insufficient {
+                    fill_row = true;
+                    row_filled.resize(height, false);
+                    row_filled[mcu_y] = true;
+                }
+                if fill_row {
+                    for difference in differences.iter_mut() {
+                        difference.push(0);
+                    }
+                    continue;
                 }
 
                 for (i, _component) in components.iter().enumerate() {
                     let dc_table = self.dc_huffman_tables[scan.dc_table_indices[i]]
                         .as_ref()
                         .unwrap();
-                    let value = huffman.decode(reader, dc_table)?;
+                    let value = huffman.decode(&mut self.reader, dc_table)?;
                     let diff = match value {
                         0 => 0,
-                        1..=15 => huffman.receive_extend(reader, value)? as i32,
+                        1..=15 => huffman.receive_extend(&mut self.reader, value)? as i32,
                         16 => 32768,
                         _ => {
                             // Section F.1.2.1.1
@@ -89,125 +137,79 @@ impl<R: Source> Decoder<R> {
             }
         }
 
-        if scan.predictor_selection == Predictor::Ra {
-            for (i, _component) in components.iter().enumerate() {
-                // calculate the top left pixel
-                let diff = differences[i][0];
-                let prediction = 1 << (frame.precision - scan.point_transform - 1) as i32;
-                let result = ((prediction + diff) & 0xFFFF) as u16; // modulo 2^16
-                let result = result << scan.point_transform;
-                results[i][0] = result;
-
-                // calculate leftmost column, using top pixel as predictor
-                let mut previous = result;
-                for mcu_y in 1..height {
-                    let diff = differences[i][mcu_y * width];
-                    let prediction = previous as i32;
-                    let result = ((prediction + diff) & 0xFFFF) as u16; // modulo 2^16
-                    let result = result << scan.point_transform;
-                    results[i][mcu_y * width] = result;
-                    previous = result;
-                }
-
-                // calculate rows, using left pixel as predictor
-                for mcu_y in 0..height {
-                    for mcu_x in 1..width {
-                        let diff = differences[i][mcu_y * width + mcu_x];
-                        let prediction = results[i][mcu_y * width + mcu_x - 1] as i32;
-                        let result = ((prediction + diff) & 0xFFFF) as u16; // modulo 2^16
-                        let result = result << scan.point_transform;
-                        results[i][mcu_y * width + mcu_x] = result;
-                    }
-                }
-            }
+        // H.1.2.1. The first sample of the scan, and of each restart interval,
+        // is predicted by 2^(P-Pt-1); the rest of that row by the sample to
+        // its left (Ra). In every other row the first sample is predicted by
+        // the one above (Rb) and the rest by the scan's predictor.
+        let initial = if scan.predictor_selection == Predictor::Ra
+            || frame.precision > 1 + scan.point_transform
+        {
+            1i32 << (frame.precision - scan.point_transform - 1)
         } else {
-            for mcu_y in 0..height {
-                for mcu_x in 0..width {
-                    for (i, _component) in components.iter().enumerate() {
-                        let diff = differences[i][mcu_y * width + mcu_x];
-
-                        // The following lines could be further optimized, e.g. moving the checks
-                        // and updates of the previous values into the prediction function or
-                        // iterating such that diagonals with mcu_x + mcu_y = const are computed at
-                        // the same time to exploit independent predictions in this case
-                        if mcu_x > 0 {
-                            ra[i] = results[i][mcu_y * frame.image_size.width as usize + mcu_x - 1];
+            0
+        };
+        // What libjpeg-turbo's undifferencer gives a row with no data: zero
+        // differences from a freshly reset prediction, so the initial value in
+        // every sample.
+        let grey = (initial & 0xFFFF) as u16;
+        for (result, difference) in results.iter_mut().zip(&differences) {
+            for y in 0..height {
+                let row = y * width;
+                if row_filled.get(y).copied().unwrap_or(false) {
+                    result[row..row + width].fill(grey);
+                    continue;
+                }
+                let first_row = y == 0 || row_restarts.get(y).copied().unwrap_or(false);
+                for x in 0..width {
+                    let prediction = if x == 0 {
+                        if first_row {
+                            initial
+                        } else {
+                            result[row - width] as i32
                         }
-                        if mcu_y > 0 {
-                            rb[i] =
-                                results[i][(mcu_y - 1) * frame.image_size.width as usize + mcu_x];
-                            if mcu_x > 0 {
-                                rc[i] = results[i]
-                                    [(mcu_y - 1) * frame.image_size.width as usize + (mcu_x - 1)];
-                            }
+                    } else {
+                        let ra = result[row + x - 1] as i32;
+                        if first_row {
+                            ra
+                        } else {
+                            let rb = result[row - width + x] as i32;
+                            let rc = result[row - width + x - 1] as i32;
+                            predict(ra, rb, rc, scan.predictor_selection)
                         }
-                        let prediction = predict(
-                            ra[i] as i32,
-                            rb[i] as i32,
-                            rc[i] as i32,
-                            scan.predictor_selection,
-                            scan.point_transform,
-                            frame.precision,
-                            mcu_x,
-                            mcu_y,
-                            self.restart_interval > 0
-                                && mcus_left_until_restart == self.restart_interval - 1,
-                        );
-                        let result = ((prediction + diff) & 0xFFFF) as u16; // modulo 2^16
-                        results[i][mcu_y * width + mcu_x] = result << scan.point_transform;
-                    }
+                    };
+                    let sample = ((prediction + difference[row + x]) & 0xFFFF) as u16; // modulo 2^16
+                    result[row + x] = sample;
+                }
+            }
+            // The point transform (H.1.2.1): what is coded, and predicted, is
+            // the sample divided by 2^Pt; the output is that scaled back up.
+            // The scaling has to wait until the whole component is predicted
+            // -- applying it sample by sample, as this did, fed the scaled
+            // values back into the prediction, and an image coded with Pt > 0
+            // decoded wrongly.
+            if scan.point_transform > 0 {
+                for sample in result.iter_mut() {
+                    *sample <<= scan.point_transform;
                 }
             }
         }
 
-        let mut marker = huffman.take_marker(&mut self.reader)?;
-        // A trailing RST, or a TEM/RES code that is corrupt data posing as a
-        // marker: skip to the next real marker (as `decode_scan` does).
-        while let Some(Marker::RST(_) | Marker::TEM | Marker::RES) = marker {
-            marker = self.read_marker().ok();
-        }
+        let marker = self.finish_scan(&mut huffman)?;
         Ok((marker, results))
     }
 }
 
-/// H.1.2.1
-#[allow(clippy::too_many_arguments)]
-fn predict(
-    ra: i32,
-    rb: i32,
-    rc: i32,
-    predictor: Predictor,
-    point_transform: u8,
-    input_precision: u8,
-    ix: usize,
-    iy: usize,
-    restart: bool,
-) -> i32 {
-    if (ix == 0 && iy == 0) || restart {
-        // start of first line or restart
-        if input_precision > 1 + point_transform {
-            1 << (input_precision - point_transform - 1)
-        } else {
-            0
-        }
-    } else if iy == 0 {
-        // rest of first line
-        ra
-    } else if ix == 0 {
-        // start of other line
-        rb
-    } else {
-        // use predictor Table H.1
-        match predictor {
-            Predictor::NoPrediction => 0,
-            Predictor::Ra => ra,
-            Predictor::Rb => rb,
-            Predictor::Rc => rc,
-            Predictor::RaRbRc1 => ra + rb - rc,
-            Predictor::RaRbRc2 => ra + ((rb - rc) >> 1),
-            Predictor::RaRbRc3 => rb + ((ra - rc) >> 1),
-            Predictor::RaRb => (ra + rb) / 2,
-        }
+/// Table H.1: the prediction for a sample that has all three neighbours.
+fn predict(ra: i32, rb: i32, rc: i32, predictor: Predictor) -> i32 {
+    match predictor {
+        Predictor::NoPrediction => 0,
+        Predictor::Ra => ra,
+        Predictor::Rb => rb,
+        Predictor::Rc => rc,
+        Predictor::RaRbRc1 => ra + rb - rc,
+        Predictor::RaRbRc2 => ra + ((rb - rc) >> 1),
+        Predictor::RaRbRc3 => rb + ((ra - rc) >> 1),
+        Predictor::RaRb => (ra + rb) / 2,
     }
 }
 
