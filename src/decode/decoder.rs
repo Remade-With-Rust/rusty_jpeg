@@ -102,6 +102,10 @@ pub enum ColorTransform {
     JcsBgRgb,
 }
 
+/// What a scan leaves: the marker that ended it, and the planes of the
+/// components it finished.
+type ScanResult = Result<(Option<Marker>, Option<Vec<Vec<u8>>>)>;
+
 /// JPEG decoder
 pub struct Decoder<R> {
     reader: crate::decode::Buffered<R>,
@@ -1334,7 +1338,27 @@ impl<R: Source> Decoder<R> {
         scan: &ScanInfo,
         worker: &mut dyn Worker,
         finished: &[bool; MAX_COMPONENTS],
-    ) -> Result<(Option<Marker>, Option<Vec<Vec<u8>>>)> {
+    ) -> ScanResult {
+        // One body per coding process. The block loop serves the fused,
+        // row-buffered and progressive paths; compiled once for all three,
+        // every progressive addition re-rolled the sequential loop's
+        // registers (+0.7% Ir on a sequential 4:4:4 decode after the
+        // `nonzero` refinement and the in-place row hand-off). With the
+        // process a constant, each copy carries only its own paths.
+        if frame.coding_process == CodingProcess::DctProgressive {
+            self.decode_scan_for::<true>(frame, scan, worker, finished)
+        } else {
+            self.decode_scan_for::<false>(frame, scan, worker, finished)
+        }
+    }
+
+    fn decode_scan_for<const PROGRESSIVE: bool>(
+        &mut self,
+        frame: &FrameInfo,
+        scan: &ScanInfo,
+        worker: &mut dyn Worker,
+        finished: &[bool; MAX_COMPONENTS],
+    ) -> ScanResult {
         let _s = crate::prof::scope(crate::prof::Stage::DecScan);
         assert!(scan.component_indices.len() <= MAX_COMPONENTS);
 
@@ -1399,7 +1423,11 @@ impl<R: Source> Decoder<R> {
             }
         }
 
-        let is_progressive = frame.coding_process == CodingProcess::DctProgressive;
+        debug_assert_eq!(
+            PROGRESSIVE,
+            frame.coding_process == CodingProcess::DctProgressive
+        );
+        let is_progressive = PROGRESSIVE;
         let is_interleaved = components.len() > 1;
         // Fuse entropy decode straight into the IDCT when the worker consumes
         // blocks synchronously. That removes the write -> zero -> read round trip
