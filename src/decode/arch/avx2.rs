@@ -446,8 +446,7 @@ pub unsafe fn upsample_h2v2_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> us
         let f = _mm256_cvtepu8_epi16(_mm_loadu_si128(f as *const __m128i));
         _mm256_add_epi16(three(n), f)
     };
-    let mut k = 0;
-    while k + 16 <= pairs {
+    let step = |k: usize, out: &mut [u8]| {
         let (np, fp) = (near.as_ptr().add(k), far.as_ptr().add(k));
         let t0 = column(np, fp);
         let t1 = column(np.add(1), fp.add(1));
@@ -455,6 +454,17 @@ pub unsafe fn upsample_h2v2_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> us
         let hi = _mm256_srli_epi16(_mm256_add_epi16(_mm256_add_epi16(three(t1), t0), eight), 4);
         let packed = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 8));
         _mm256_storeu_si256(out.as_mut_ptr().add(2 * k) as *mut __m256i, packed);
+    };
+    let mut k = 0;
+    // Two independent 16-pair groups per trip: the loop's own bookkeeping
+    // (index, bound test, branch, addressing) was a sixth of a 16-pair step.
+    while k + 32 <= pairs {
+        step(k, out);
+        step(k + 16, out);
+        k += 32;
+    }
+    while k + 16 <= pairs {
+        step(k, out);
         k += 16;
     }
     k
