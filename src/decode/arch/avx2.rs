@@ -460,6 +460,41 @@ pub unsafe fn upsample_h2v2_pairs(near: &[u8], far: &[u8], out: &mut [u8]) -> us
     k
 }
 
+/// The interior of a 4:2:2 "fancy" upsampled row, 16 samples per step.
+///
+/// Window `j` is input samples `j, j+1, j+2` and writes output bytes `2j` and
+/// `2j+1` of `out` -- which starts at output byte 2 of the row; the first
+/// and last two bytes are the caller's:
+/// `out[2j] = (3*in[j+1] + in[j] + 2) >> 2` and
+/// `out[2j+1] = (3*in[j+1] + in[j+2] + 2) >> 2`. Integer maths in 16-bit
+/// lanes (at most 1022, no overflow), so the result is bit-identical to the
+/// scalar loop by construction; `h2v1_matches_reference` in the upsampler
+/// checks it. The two results of a window are packed as `lo | hi << 8`, which
+/// in little-endian memory is the interleaved byte order.
+///
+/// Returns how many windows it wrote (a multiple of 16); the caller finishes
+/// the rest.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+pub unsafe fn upsample_h2v1_windows(input: &[u8], out: &mut [u8]) -> usize {
+    // Windows j..j+16 read samples j..j+18.
+    let windows = input.len().saturating_sub(2).min(out.len() / 2);
+    let two = _mm256_set1_epi16(2);
+    let widen = |p: *const u8| _mm256_cvtepu8_epi16(_mm_loadu_si128(p as *const __m128i));
+    let mut j = 0;
+    while j + 16 <= windows {
+        let p = input.as_ptr().add(j);
+        let (left, centre, right) = (widen(p), widen(p.add(1)), widen(p.add(2)));
+        let sample = _mm256_add_epi16(_mm256_add_epi16(centre, _mm256_slli_epi16(centre, 1)), two);
+        let lo = _mm256_srli_epi16(_mm256_add_epi16(sample, left), 2);
+        let hi = _mm256_srli_epi16(_mm256_add_epi16(sample, right), 2);
+        let packed = _mm256_or_si256(lo, _mm256_slli_epi16(hi, 8));
+        _mm256_storeu_si256(out.as_mut_ptr().add(2 * j) as *mut __m256i, packed);
+        j += 16;
+    }
+    j
+}
+
 #[cfg(test)]
 mod color_tests {
     #[test]

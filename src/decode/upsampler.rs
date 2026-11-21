@@ -14,10 +14,14 @@ pub struct Upsampler {
     line_buffer_size: usize,
     /// The vectorized H2V2 interior, resolved once per image.
     h2v2_pairs: Option<H2v2Pairs>,
+    /// The vectorized H2V1 interior, resolved once per image.
+    h2v1_windows: Option<H2v1Windows>,
 }
 
 /// See `arch::get_upsample_h2v2_pairs`.
 type H2v2Pairs = unsafe fn(&[u8], &[u8], &mut [u8]) -> usize;
+/// See `arch::get_upsample_h2v1_windows`.
+type H2v1Windows = unsafe fn(&[u8], &mut [u8]) -> usize;
 
 struct UpsamplerComponent {
     kind: Kind,
@@ -94,11 +98,16 @@ impl Upsampler {
         let h2v2_pairs = crate::decode::arch::get_upsample_h2v2_pairs();
         #[cfg(feature = "platform_independent")]
         let h2v2_pairs = None;
+        #[cfg(not(feature = "platform_independent"))]
+        let h2v1_windows = crate::decode::arch::get_upsample_h2v1_windows();
+        #[cfg(feature = "platform_independent")]
+        let h2v1_windows = None;
 
         Ok(Upsampler {
             components: upsampler_components,
             line_buffer_size: buffer_size,
             h2v2_pairs,
+            h2v1_windows,
         })
     }
 
@@ -213,6 +222,7 @@ impl Upsampler {
                 line_buffer,
                 &mut scratch.sums,
                 self.h2v2_pairs,
+                self.h2v1_windows,
             );
         }
 
@@ -264,6 +274,7 @@ fn choose_upsampler(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn upsample_row(
     c: &UpsamplerComponent,
@@ -273,13 +284,14 @@ fn upsample_row(
     output: &mut [u8],
     sums: &mut Vec<u16>,
     h2v2_pairs: Option<H2v2Pairs>,
+    h2v1_windows: Option<H2v1Windows>,
 ) {
     match c.kind {
         Kind::H1V1 => {
             let input = &input[row * c.row_stride..];
             output[..output_width].copy_from_slice(&input[..output_width]);
         }
-        Kind::H2V1 => h2v1(&input[row * c.row_stride..], c.width, output),
+        Kind::H2V1 => h2v1(&input[row * c.row_stride..], c.width, output, h2v1_windows),
         Kind::H1V2 => h1v2(input, c.height, c.row_stride, row, output_width, output),
         Kind::H2V2 => h2v2(
             input,
@@ -325,7 +337,11 @@ fn far_row(row: usize, input_height: usize) -> usize {
     }
 }
 
-fn h2v1(input: &[u8], input_width: usize, output: &mut [u8]) {
+/// 4:2:2 chroma: libjpeg's "fancy" horizontal triangle filter. The interior
+/// goes to the AVX2 kernel when there is one (the scalar loop measured ~3 Ir
+/// per sample, 9.4% of a 2000x1250 4:2:2 decode); the scalar loop finishes it
+/// and is the oracle.
+fn h2v1(input: &[u8], input_width: usize, output: &mut [u8], windows_kernel: Option<H2v1Windows>) {
     if input_width == 1 {
         output[0] = input[0];
         output[1] = input[0];
@@ -338,11 +354,24 @@ fn h2v1(input: &[u8], input_width: usize, output: &mut [u8]) {
     output[1] = ((input[0] as u32 * 3 + input[1] as u32 + 2) >> 2) as u8;
 
     // Interior: sample i yields outputs 2i and 2i+1 from (i-1, i, i+1). Written
-    // over `windows(3)` / `chunks_exact_mut(2)` so the bounds are proven once
-    // and the loop vectorizes; same integer arithmetic as before.
-    for (o, w) in output[2..input_width * 2 - 2]
+    // over `windows(3)` / `chunks_exact_mut(2)` so the bounds are proven once;
+    // same integer arithmetic as before.
+    #[allow(unused_mut)]
+    let mut done = 0;
+    #[cfg(not(feature = "platform_independent"))]
+    if let Some(kernel) = windows_kernel {
+        // SAFETY: the kernel was chosen by runtime feature detection, and it
+        // reads only within `input` and writes only within the interior.
+        #[allow(unsafe_code)]
+        {
+            done = unsafe { kernel(input, &mut output[2..input_width * 2 - 2]) };
+        }
+    }
+    #[cfg(feature = "platform_independent")]
+    let _ = windows_kernel;
+    for (o, w) in output[2 + 2 * done..input_width * 2 - 2]
         .chunks_exact_mut(2)
-        .zip(input.windows(3))
+        .zip(input[done..].windows(3))
     {
         let sample = 3 * w[1] as u16 + 2;
         o[0] = ((sample + w[0] as u16) >> 2) as u8;
@@ -566,13 +595,19 @@ mod tests {
 
     #[test]
     fn h2v1_matches_reference() {
-        for w in [1usize, 2, 3, 4, 17, 960, 961] {
+        for w in [1usize, 2, 3, 4, 17, 18, 19, 33, 34, 35, 64, 960, 961, 1000] {
             let input = noise(w + 5, w as u64 * 7 + 1);
             let mut want = vec![0u8; 2 * w];
             let mut got = vec![0u8; 2 * w];
             h2v1_reference(&input, w, &mut want);
-            h2v1(&input, w, &mut got);
-            assert_eq!(got, want, "w {w}");
+            h2v1(&input, w, &mut got, None);
+            assert_eq!(got, want, "scalar: w {w}");
+            #[cfg(not(feature = "platform_independent"))]
+            if let Some(kernel) = crate::decode::arch::get_upsample_h2v1_windows() {
+                got.fill(0);
+                h2v1(&input, w, &mut got, Some(kernel));
+                assert_eq!(got, want, "simd: w {w}");
+            }
         }
     }
 }
