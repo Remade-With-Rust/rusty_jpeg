@@ -2213,7 +2213,7 @@ fn decode_block_successive_approximation<R: Source>(
             }
         };
         while index < end {
-            let byte = huffman.decode(reader, ac_table)?;
+            let byte = huffman.decode_inline(reader, ac_table)?;
             let r = byte >> 4;
             let s = byte & 0x0f;
 

@@ -96,6 +96,35 @@ impl HuffmanDecoder {
         }
     }
 
+    /// [`decode`](Self::decode), with its common case inlined at the call
+    /// site: the accumulator already holds the 16 bits `decode` refills to,
+    /// and the code fits the first-level table. Anything else goes to
+    /// `decode`, which then refills and resolves exactly as it always has --
+    /// with 16 bits present it would not have refilled, so both paths consume
+    /// the same bits and return the same symbol.
+    ///
+    /// For the refinement scans, whose every symbol went through the
+    /// out-of-line `decode` (1.23M calls at 36.6 Ir per 2000x1250 4:2:0
+    /// progressive decode pair).
+    #[inline(always)]
+    pub fn decode_inline<R: Source>(
+        &mut self,
+        reader: &mut crate::decode::Buffered<R>,
+        table: &HuffmanTable,
+    ) -> Result<u8> {
+        if self.num_bits >= 16 {
+            let (value, size) =
+                table.lut[self.peek_bits(LUT_BITS) as usize & ((1 << LUT_BITS) - 1)];
+            if size > 0 {
+                crate::prof::bump(crate::prof::Count::DecSymbols, 1);
+                crate::prof::bump(crate::prof::Count::DecLutHit, 1);
+                self.consume_bits(size);
+                return Ok(value);
+            }
+        }
+        self.decode(reader, table)
+    }
+
     /// No code of the table matches the next 16 bits: libjpeg-turbo's
     /// `JWRN_HUFF_BAD_CODE` (`jpeg_huff_decode`, jdhuff.c, and the
     /// `HUFF_DECODE_FAST` macro). It has by then consumed 17 bits -- its
