@@ -279,7 +279,11 @@ impl ImmediateWorker {
             return;
         }
 
-        if let Some((py, px, pcoeffs)) = self.pending[index].take() {
+        // The waiting block is BORROWED for the pair: `take()` moved its 128
+        // coefficients out to a stack temporary first -- sixteen moves per
+        // pair -- only to hand the kernel a reference to the copy.
+        if let Some((py, px, pcoeffs)) = &self.pending[index] {
+            let (py, px) = (*py, *px);
             if py == block_y && px + 1 == block_x {
                 #[cfg(not(feature = "platform_independent"))]
                 if let Some(idct_pair) = self.pair_idct {
@@ -290,12 +294,14 @@ impl ImmediateWorker {
                     let _s = crate::prof::scope(crate::prof::Stage::DecIdct);
                     #[allow(unsafe_code)]
                     unsafe {
-                        idct_pair(&pcoeffs, coeffs, qt, line_stride, out, scale);
+                        idct_pair(pcoeffs, coeffs, qt, line_stride, out, scale);
                     }
+                    self.pending[index] = None;
                     return;
                 }
             }
-            self.emit_single(index, py, px, &pcoeffs);
+            let _ = pcoeffs;
+            self.flush_pending(index);
         }
         self.pending[index] = Some((block_y, block_x, *coeffs));
     }
