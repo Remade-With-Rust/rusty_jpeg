@@ -28,7 +28,15 @@ pub struct ImmediateWorker {
     /// slot each, a component's block waits across the other components'
     /// blocks for its own neighbour in the next MCU.
     pending: [Option<(usize, usize, [i16; 64])>; MAX_COMPONENTS],
+    /// The two-block transform, resolved once when the worker is made. Asking
+    /// the dispatcher per pair re-read the CPU-feature cache every time:
+    /// 113,968 calls at 11 Ir on a 2000x1250 4:4:4 decode.
+    #[cfg(not(feature = "platform_independent"))]
+    pair_idct: Option<PairIdct>,
 }
+
+#[cfg(not(feature = "platform_independent"))]
+type PairIdct = unsafe fn(&[i16; 64], &[i16; 64], &[u16; 64], usize, &mut [u8], usize);
 
 impl Default for ImmediateWorker {
     fn default() -> Self {
@@ -39,6 +47,8 @@ impl Default for ImmediateWorker {
             quantization_tables: vec![None; MAX_COMPONENTS],
             spare: None,
             pending: [None; MAX_COMPONENTS],
+            #[cfg(not(feature = "platform_independent"))]
+            pair_idct: crate::decode::arch::get_dequantize_and_idct_block_8x8_pair(),
         }
     }
 }
@@ -103,7 +113,7 @@ impl ImmediateWorker {
         let blocks_wide = component.block_size.width as usize;
         #[cfg(not(feature = "platform_independent"))]
         let pair_idct = if component.dct_scale == 8 {
-            crate::decode::arch::get_dequantize_and_idct_block_8x8_pair()
+            self.pair_idct
         } else {
             None
         };
@@ -248,9 +258,7 @@ impl ImmediateWorker {
         if let Some((py, px, pcoeffs)) = self.pending[index].take() {
             if py == block_y && px + 1 == block_x {
                 #[cfg(not(feature = "platform_independent"))]
-                if let Some(idct_pair) =
-                    crate::decode::arch::get_dequantize_and_idct_block_8x8_pair()
-                {
+                if let Some(idct_pair) = self.pair_idct {
                     let off = py * scale * line_stride + px * scale;
                     let qt = self.quantization_tables[index].as_ref().unwrap();
                     let out = &mut self.results[index][off..];
