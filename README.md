@@ -26,21 +26,72 @@ forward in-tree as one codec:
 | `decode` | [`jpeg-decoder`](https://github.com/image-rs/jpeg-decoder) 0.3.2 | MIT OR Apache-2.0 |
 | `encode` | [`jpeg-encoder`](https://github.com/vstroebel/jpeg-encoder) 0.7.0 | (MIT OR Apache-2.0) AND IJG |
 
-See [`NOTICE.md`](NOTICE.md) for attribution and the IJG obligations, and
-[`CHANGES.md`](CHANGES.md) for everything changed since vendoring.
+See [`NOTICE.md`](https://github.com/Remade-With-Rust/rusty_jpeg/blob/main/NOTICE.md)
+for attribution and the IJG obligations, and
+[`CHANGES.md`](https://github.com/Remade-With-Rust/rusty_jpeg/blob/main/CHANGES.md)
+for everything changed since vendoring.
 
 > This software is based in part on the work of the Independent JPEG Group.
 
 ## Performance
 
-Measured against system **FFmpeg 8.1.2**, same machine, one pinned core each,
-CPU time, the two binaries interleaved, paired win-rate with a z-score at
-N &ge; 31.
+### Decode: faster than 0.4.9 and than zune-jpeg on every layout measured
 
-| | vs FFmpeg | |
+Sixteen byte-identical changes
+([#32](https://github.com/Remade-With-Rust/rusty_jpeg/pull/32)) took the
+progressive decoder from behind [zune-jpeg](https://crates.io/crates/zune-jpeg)
+to ahead of it. The numbers below were measured independently by the
+downstream team behind the ArtCraft apps, which decode with zune-jpeg today
+([their verification](https://github.com/Remade-With-Rust/rusty_jpeg/pull/32#issuecomment-7060532772)):
+
+| case (3840&times;2400 unless noted) | vs 0.4.9 | vs zune-jpeg 0.5.15 | ms per decode (min) |
+|---|---:|---:|---:|
+| baseline 4:2:0 | 1.14&times; | 1.21&times; | 17.8 |
+| baseline 4:2:0, second photo | 1.15&times; | 1.20&times; | 17.6 |
+| baseline 4:2:2 | 1.17&times; | 1.19&times; | 19.4 |
+| baseline 4:4:4 | 1.22&times; | 1.17&times; | 25.6 |
+| progressive 4:2:0 | 1.80&times; | 1.41&times; | 33.2 |
+| progressive 4:4:4 | 1.82&times; | 1.42&times; | 47.5 |
+| greyscale baseline | 1.16&times; | 1.17&times; | 9.2 |
+| baseline 4:2:0, 1024&times;640 | 1.15&times; | 1.22&times; | 1.8 |
+
+Higher is faster. For comparison, released 0.4.9 against zune-jpeg in the same
+run: **0.80&times;** on progressive 4:2:0 and **0.97&times;** on 4:4:4, both
+slower.
+
+*Method:* decode only, at head `6fdb490` of #32; photos written by libjpeg
+(Pillow, quality 90); one pinned core, `RAYON_NUM_THREADS=1`; an in-process
+decode loop of at least 400 ms per process, minimum per process; 20 rounds
+alternated ABBA, ratio = median of the per-round ratios. Every row won 20/20
+rounds (sign test z = +4.47); the null arm (0.4.9 against itself) read
+0.992&ndash;1.004.
+
+**Output is byte-identical.** Each of the 16 changes was gated on 5,754 files
+(valid and damaged, packed and planar, single- and multi-threaded) with zero
+differing outputs, and the downstream check found the same output hash, status
+and error text as before the speed work on all 10,452 of its files. Against
+0.4.9, valid files decode byte-identically except lossless JPEGs with restart
+intervals or a point transform, which 0.4.9 decoded wrongly and which now match
+`djpeg` exactly ([#31](https://github.com/Remade-With-Rust/rusty_jpeg/pull/31)).
+Our own instruction-count and clock ledger for each change is in #32. That
+campaign's harness runs under
+[rusty_alloc](https://github.com/Remade-With-Rust/rusty_alloc), the pure-Rust
+remake of mimalloc that our binaries ship with.
+
+**Not covered yet:** 12-bit DCT files and arithmetic-coded files are refused
+with `Error::Unsupported`. libjpeg-turbo opens both.
+
+### Against FFmpeg (measured at 0.3.0)
+
+Measured at release 0.3.0 against system **FFmpeg 8.1.2**, same machine, one
+pinned core each, CPU time, the two binaries interleaved, paired win-rate with
+a z-score at N &ge; 31. Not re-run since. The decode row predates the 0.5.0
+speedups above.
+
+| | vs FFmpeg (0.3.0) | |
 |---|---|---|
-| **Encode** | **parity** — median 0.96&times; | matched output size (ours 3.1% smaller), fixed Huffman tables both sides; N=41, z &minus;3.59 |
-| **Decode** | **parity** — median 1.02&times; | byte-identical bitstream, both arms discarding output; N=31, z &minus;0.18, inside noise |
+| **Encode** | parity, but **0.96&times;: slightly slower** | matched output size (ours 3.1% smaller), fixed Huffman tables both sides; N=41, z &minus;3.59 |
+| **Decode** | parity, median 1.02&times; | byte-identical bitstream, both arms discarding output; N=31, z &minus;0.18, inside noise |
 
 Encode is measured on a 40-frame 1920&times;1080 4:2:0 clip at ~680 KB/frame;
 decode on a photographic still stream-copied to 300 frames.
@@ -124,6 +175,27 @@ resynchronise), any other damage with `Error::Format`. A file that ends before
 its first scan has any data is an error in both modes — there is nothing to
 show. `set_max_decoding_buffer_size` bounds what a header may make the decoder
 allocate, and is checked before the first scan is decoded.
+
+How close that is to libjpeg-turbo
+([#31](https://github.com/Remade-With-Rust/rusty_jpeg/pull/31)):
+
+| | this release | 0.4.9 |
+|---|---:|---:|
+| damaged variants matching `djpeg` (of 5,368 it decodes) | **4,875 (90.8%)** | 1,454 (27.1%) |
+| cut-short files decoded, downstream corpus (libjpeg-turbo: 172 of 179) | 170 of 179 | 0 of 179 |
+| panics | 0 | 0 |
+
+*Method:* `djpeg -pnm` from libjpeg-turbo 3.1.0; 5,544 variants of 210 files
+(baseline, progressive, restart intervals, lossless; cuts, single-bit flips,
+garbles). A file matches when every sample is within 1 (grey) or 3 (colour) of
+`djpeg`. The cut-short row is the
+[downstream team's check](https://github.com/Remade-With-Rust/rusty_jpeg/pull/31#issuecomment-7058586712)
+against libjpeg-turbo 3.x.
+
+**Still short of libjpeg-turbo:** the two cut-short files it opens and we do
+not are progressive files with a damaged DHT. 4:2:2 output differs from
+`djpeg` by up to 4&ndash;5 levels from upsampling rounding, on intact and
+cut-short files alike.
 
 ## Encode
 
@@ -236,4 +308,4 @@ permissively-licensed building blocks that work depends on.
 ## Licence
 
 `(MIT OR Apache-2.0) AND IJG` — the IJG clause attaches to the forward-DCT
-files inherited from the encoder. See [`NOTICE.md`](NOTICE.md).
+files inherited from the encoder. See [`NOTICE.md`](https://github.com/Remade-With-Rust/rusty_jpeg/blob/main/NOTICE.md).
