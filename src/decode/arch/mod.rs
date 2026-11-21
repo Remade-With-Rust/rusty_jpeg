@@ -54,6 +54,20 @@ pub fn get_upsample_h2v2_pairs() -> Option<unsafe fn(&[u8], &[u8], &mut [u8]) ->
     None
 }
 
+/// Arch-specific interior of a 4:2:2 fancy-upsampled row (see
+/// `avx2::upsample_h2v1_windows`). Returns the number of windows written.
+#[allow(clippy::type_complexity)]
+pub fn get_upsample_h2v1_windows() -> Option<unsafe fn(&[u8], &mut [u8]) -> usize> {
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if is_x86_feature_detected!("avx2") {
+            return Some(avx2::upsample_h2v1_windows);
+        }
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 /// Arch-specific implementation of 8x8 IDCT.
 #[allow(clippy::type_complexity)]
 pub fn get_dequantize_and_idct_block_8x8(

@@ -1,5 +1,7 @@
 use crate::decode::error::{Error, Result, UnsupportedFeature, Warning, Warnings};
-use crate::decode::huffman::{fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable, AC_EOB};
+use crate::decode::huffman::{
+    fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable, AC_EOB, FAST_BITS,
+};
 use crate::decode::marker::Marker;
 use crate::decode::parser::{
     parse_app, parse_com, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos,
@@ -102,6 +104,10 @@ pub enum ColorTransform {
     JcsBgRgb,
 }
 
+/// What a scan leaves: the marker that ended it, and the planes of the
+/// components it finished.
+type ScanResult = Result<(Option<Marker>, Option<Vec<Vec<u8>>>)>;
+
 /// JPEG decoder
 pub struct Decoder<R> {
     reader: crate::decode::Buffered<R>,
@@ -127,6 +133,14 @@ pub struct Decoder<R> {
 
     // Used for progressive JPEGs.
     coefficients: Vec<Vec<i16>>,
+    /// Per block of `coefficients`, which AC coefficients are non-zero: bit
+    /// `k` is set exactly when the coefficient at ZIGZAG position `k` (1..=63)
+    /// is non-zero. A refinement scan corrects every non-zero coefficient of
+    /// its band and places each new one on the n-th ZERO after a run, so it
+    /// needs both sets; with them it visits only the non-zero coefficients
+    /// instead of walking every position of the band. (Bit 0, the DC, is
+    /// never set: no AC band includes it.)
+    nonzero: Vec<Vec<u64>>,
     // Bitmask of which coefficients has been completely decoded.
     coefficients_finished: [u64; MAX_COMPONENTS],
     // How precisely each component's low coefficients are known so far, for
@@ -276,6 +290,7 @@ impl<R: Source> Decoder<R> {
             xmp_data: None,
             psir_data: None,
             coefficients: Vec::new(),
+            nonzero: Vec::new(),
             coefficients_finished: [0; MAX_COMPONENTS],
             progression: Progression::default(),
             decoding_buffer_size_limit: usize::MAX,
@@ -807,6 +822,13 @@ impl<R: Source> Decoder<R> {
                                 vec![0; block_count * 64]
                             })
                             .collect();
+                        self.nonzero = frame
+                            .components
+                            .iter()
+                            .map(|c| {
+                                vec![0; c.block_size.width as usize * c.block_size.height as usize]
+                            })
+                            .collect();
                     }
 
                     if frame.coding_process == CodingProcess::Lossless {
@@ -1318,7 +1340,27 @@ impl<R: Source> Decoder<R> {
         scan: &ScanInfo,
         worker: &mut dyn Worker,
         finished: &[bool; MAX_COMPONENTS],
-    ) -> Result<(Option<Marker>, Option<Vec<Vec<u8>>>)> {
+    ) -> ScanResult {
+        // One body per coding process. The block loop serves the fused,
+        // row-buffered and progressive paths; compiled once for all three,
+        // every progressive addition re-rolled the sequential loop's
+        // registers (+0.7% Ir on a sequential 4:4:4 decode after the
+        // `nonzero` refinement and the in-place row hand-off). With the
+        // process a constant, each copy carries only its own paths.
+        if frame.coding_process == CodingProcess::DctProgressive {
+            self.decode_scan_for::<true>(frame, scan, worker, finished)
+        } else {
+            self.decode_scan_for::<false>(frame, scan, worker, finished)
+        }
+    }
+
+    fn decode_scan_for<const PROGRESSIVE: bool>(
+        &mut self,
+        frame: &FrameInfo,
+        scan: &ScanInfo,
+        worker: &mut dyn Worker,
+        finished: &[bool; MAX_COMPONENTS],
+    ) -> ScanResult {
         let _s = crate::prof::scope(crate::prof::Stage::DecScan);
         assert!(scan.component_indices.len() <= MAX_COMPONENTS);
 
@@ -1383,7 +1425,11 @@ impl<R: Source> Decoder<R> {
             }
         }
 
-        let is_progressive = frame.coding_process == CodingProcess::DctProgressive;
+        debug_assert_eq!(
+            PROGRESSIVE,
+            frame.coding_process == CodingProcess::DctProgressive
+        );
+        let is_progressive = PROGRESSIVE;
         let is_interleaved = components.len() > 1;
         // Fuse entropy decode straight into the IDCT when the worker consumes
         // blocks synchronously. That removes the write -> zero -> read round trip
@@ -1459,6 +1505,23 @@ impl<R: Source> Decoder<R> {
             )
         };
 
+        // Each component's tables, resolved once for the scan. They are fixed
+        // for the whole scan, but were looked up for every MCU -- two double
+        // indirections through the scan's table indices and the table `Vec`s,
+        // each bounds-checked -- and in a progressive AC scan an MCU is ONE
+        // block, so that was per block (~400k times per 2000x1250 decode).
+        let tables: [(Option<&HuffmanTable>, Option<&HuffmanTable>); MAX_COMPONENTS] =
+            core::array::from_fn(|i| {
+                if i < components.len() {
+                    (
+                        self.dc_huffman_tables[scan.dc_table_indices[i]].as_ref(),
+                        self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref(),
+                    )
+                } else {
+                    (None, None)
+                }
+            });
+
         for mcu_y in 0..max_mcu_y {
             if mcu_y * 8 >= frame.image_size.height {
                 break;
@@ -1472,7 +1535,7 @@ impl<R: Source> Decoder<R> {
                 // Checked before the restart below resets the bit reader.
                 if huffman.ran_out() && !insufficient {
                     insufficient = true;
-                    self.segment_ended_early(&huffman)?;
+                    segment_ended_early(&mut self.warnings, &huffman)?;
                 }
                 if !insufficient {
                     last_good_row = mcu_y;
@@ -1520,8 +1583,7 @@ impl<R: Source> Decoder<R> {
                     // re-derived ~49k times per 1080p frame: two double
                     // indirections through the scan's table indices plus an
                     // `Option::as_ref`, and a `Range` clone, per block.
-                    let dc_table = self.dc_huffman_tables[scan.dc_table_indices[i]].as_ref();
-                    let ac_table = self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref();
+                    let (dc_table, ac_table) = tables[i];
                     let spectral_selection = scan.spectral_selection.clone();
                     let blocks_wide = component.block_size.width as usize;
                     let fused = use_fused && finished[i];
@@ -1558,6 +1620,7 @@ impl<R: Source> Decoder<R> {
                                     scan.successive_approximation_low,
                                     &mut eob_run,
                                     &mut dc_predictors[i],
+                                    NoTrack,
                                 )?;
                                 let by = (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
                                 let bx = (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
@@ -1567,13 +1630,44 @@ impl<R: Source> Decoder<R> {
                                     .fused_block_inner(i, by, bx, &block, !wrote_ac);
                                 continue;
                             }
-                            let coefficients = if is_progressive {
+                            if is_progressive {
                                 let block_y = (mcu_y * mcu_vertical_samples[i] + v_pos) as usize;
                                 let block_x = (mcu_x * mcu_horizontal_samples[i] + h_pos) as usize;
-                                let block_offset = (block_y * blocks_wide + block_x) * 64;
-                                &mut self.coefficients[scan.component_indices[i]]
-                                    [block_offset..block_offset + 64]
-                            } else if finished[i] {
+                                let block = block_y * blocks_wide + block_x;
+                                let component_index = scan.component_indices[i];
+                                let coefficients: &mut [i16; 64] = (&mut self.coefficients
+                                    [component_index][block * 64..block * 64 + 64])
+                                    .try_into()
+                                    .unwrap();
+                                let nonzero = &mut self.nonzero[component_index][block];
+                                if scan.successive_approximation_high == 0 {
+                                    decode_block(
+                                        &mut self.reader,
+                                        coefficients,
+                                        &mut huffman,
+                                        dc_table,
+                                        ac_table,
+                                        spectral_selection.clone(),
+                                        scan.successive_approximation_low,
+                                        &mut eob_run,
+                                        &mut dc_predictors[i],
+                                        nonzero,
+                                    )?;
+                                } else {
+                                    decode_block_successive_approximation(
+                                        &mut self.reader,
+                                        coefficients,
+                                        nonzero,
+                                        &mut huffman,
+                                        ac_table,
+                                        spectral_selection.clone(),
+                                        scan.successive_approximation_low,
+                                        &mut eob_run,
+                                    )?;
+                                }
+                                continue;
+                            }
+                            let coefficients = if finished[i] {
                                 // Because the worker thread operates in batches as if we were always interleaved, we
                                 // need to distinguish between a single-shot buffer and one that's currently in process
                                 // (for a non-interleaved) stream
@@ -1594,29 +1688,21 @@ impl<R: Source> Decoder<R> {
                             .try_into()
                             .unwrap();
 
-                            if scan.successive_approximation_high == 0 {
-                                decode_block(
-                                    &mut self.reader,
-                                    coefficients,
-                                    &mut huffman,
-                                    dc_table,
-                                    ac_table,
-                                    spectral_selection.clone(),
-                                    scan.successive_approximation_low,
-                                    &mut eob_run,
-                                    &mut dc_predictors[i],
-                                )?;
-                            } else {
-                                decode_block_successive_approximation(
-                                    &mut self.reader,
-                                    coefficients,
-                                    &mut huffman,
-                                    ac_table,
-                                    spectral_selection.clone(),
-                                    scan.successive_approximation_low,
-                                    &mut eob_run,
-                                )?;
-                            }
+                            // Not progressive, so not a refinement scan either:
+                            // the parser refuses successive approximation in a
+                            // sequential scan.
+                            decode_block(
+                                &mut self.reader,
+                                coefficients,
+                                &mut huffman,
+                                dc_table,
+                                ac_table,
+                                spectral_selection.clone(),
+                                scan.successive_approximation_low,
+                                &mut eob_run,
+                                &mut dc_predictors[i],
+                                NoTrack,
+                            )?;
                         }
                     }
                 }
@@ -1642,6 +1728,32 @@ impl<R: Source> Decoder<R> {
                     let coefficients_per_mcu_row = component.block_size.width as usize
                         * component.vertical_sampling_factor as usize
                         * 64;
+
+                    // A synchronous worker transforms the row where it lies:
+                    // no copy of it, and each block's DC-only test comes from
+                    // its `nonzero` mask instead of a scan of 63 coefficients.
+                    if is_progressive {
+                        if let Some(immediate) = worker.as_immediate() {
+                            let worker_mcu_y = if is_interleaved {
+                                mcu_y
+                            } else {
+                                mcu_y / component.vertical_sampling_factor as u16
+                            };
+                            let offset = worker_mcu_y as usize * coefficients_per_mcu_row;
+                            let component_index = scan.component_indices[i];
+                            let _d = crate::prof::scope(crate::prof::Stage::DecRowDispatch);
+                            immediate.transform_row(
+                                i,
+                                &self.coefficients[component_index]
+                                    [offset..offset + coefficients_per_mcu_row],
+                                Some(
+                                    &self.nonzero[component_index]
+                                        [offset / 64..(offset + coefficients_per_mcu_row) / 64],
+                                ),
+                            );
+                            continue;
+                        }
+                    }
 
                     let row_coefficients = if is_progressive {
                         // Because non-interleaved streams will have multiple MCU rows concatenated together,
@@ -1710,12 +1822,8 @@ impl<R: Source> Decoder<R> {
 
     /// A segment's data ran out before its MCUs did: because the whole stream
     /// ended there, or at a marker that came early.
-    #[cold]
     pub(crate) fn segment_ended_early(&mut self, huffman: &HuffmanDecoder) -> Result<()> {
-        if huffman.hit_end_of_data() {
-            self.warnings.raise(Warning::Truncated)?;
-        }
-        self.warnings.raise(Warning::SegmentEndedEarly)
+        segment_ended_early(&mut self.warnings, huffman)
     }
 
     /// The marker that ends a scan whose MCUs have all been decoded, and the
@@ -1761,6 +1869,16 @@ impl<R: Source> Decoder<R> {
 /// like any other byte.
 ///
 /// `skipped` is set when anything was skipped (libjpeg's `discarded_bytes`).
+/// `Decoder::segment_ended_early` on the warnings alone, for a caller that
+/// holds other borrows of the decoder (the scan loop's tables).
+#[cold]
+fn segment_ended_early(warnings: &mut Warnings, huffman: &HuffmanDecoder) -> Result<()> {
+    if huffman.hit_end_of_data() {
+        warnings.raise(Warning::Truncated)?;
+    }
+    warnings.raise(Warning::SegmentEndedEarly)
+}
+
 fn next_marker<R: Source>(reader: &mut R, skipped: &mut bool) -> Result<Marker> {
     loop {
         while read_u8(reader)? != 0xFF {
@@ -1880,7 +1998,44 @@ pub(crate) fn process_restart<R: Source>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_block<R: Source>(
+/// What `decode_block` records about the AC coefficients it writes.
+trait Track {
+    /// The scan is sequential, so its point transform `Al` is zero: the
+    /// parser refuses successive approximation outside a progressive frame.
+    /// With that a constant, the AC loop drops a shift and the register that
+    /// held `Al` (it was reloaded from the stack for every coefficient).
+    const SEQUENTIAL: bool;
+
+    /// The coefficient at zigzag position `zz` (1..=63) now holds `v`.
+    fn write(&mut self, zz: u8, v: i16);
+}
+
+/// Sequential scans: nothing. A zero-sized type, so the sequential
+/// `decode_block` has exactly the signature it had before tracking existed (an
+/// unused `&mut u64` argument measured +0.5% Ir on sequential decodes).
+struct NoTrack;
+
+impl Track for NoTrack {
+    const SEQUENTIAL: bool = true;
+
+    #[inline(always)]
+    fn write(&mut self, _zz: u8, _v: i16) {}
+}
+
+/// Progressive storage: keep the block's `nonzero` mask (see
+/// `Decoder::nonzero`) exact.
+impl Track for &mut u64 {
+    const SEQUENTIAL: bool = false;
+
+    #[inline(always)]
+    fn write(&mut self, zz: u8, v: i16) {
+        let bit = 1u64 << zz;
+        **self = (**self & !bit) | (u64::from(v != 0) << zz);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_block<R: Source, T: Track>(
     reader: &mut crate::decode::Buffered<R>,
     coefficients: &mut [i16; 64],
     huffman: &mut HuffmanDecoder,
@@ -1890,7 +2045,14 @@ fn decode_block<R: Source>(
     successive_approximation_low: u8,
     eob_run: &mut u16,
     dc_predictor: &mut i16,
+    mut track: T,
 ) -> Result<bool> {
+    debug_assert!(!T::SEQUENTIAL || successive_approximation_low == 0);
+    let successive_approximation_low = if T::SEQUENTIAL {
+        0
+    } else {
+        successive_approximation_low
+    };
     let _s = crate::prof::scope(crate::prof::Stage::DecEntropy);
     // Whether any AC coefficient was written. A written coefficient is never
     // zero (receive_extend of a non-zero magnitude, or an `ac_lut` value), so
@@ -1971,61 +2133,84 @@ fn decode_block<R: Source>(
                 ))
             }
         };
-        while index < spectral_selection.end {
-            if let Some((value, run)) = huffman.decode_fast_ac(reader, ac_table)? {
-                if run == AC_EOB {
-                    // What the slow path does for r == 0, s == 0.
-                    *eob_run = 0;
-                    break;
+        // The accumulator lives in locals for the loop (see
+        // `HuffmanDecoder::state`) and is handed back before every call that
+        // uses the decoder and at every exit; the slow path's own exits leave
+        // it in the decoder and leave the block directly.
+        'ac: {
+            let (mut bits, mut num_bits) = huffman.state();
+            while index < spectral_selection.end {
+                if num_bits < FAST_BITS {
+                    huffman.set_state(bits, num_bits);
+                    huffman.refill(reader)?;
+                    (bits, num_bits) = huffman.state();
                 }
-                index += run;
-
-                if index >= spectral_selection.end {
-                    // A run past the end of the band: only corrupt data does
-                    // this. See `overrun_position`.
-                    coefficients[overrun_position(index)] = value << successive_approximation_low;
-                    wrote_ac = true;
-                    break;
-                }
-
-                coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
-                    value << successive_approximation_low;
-                wrote_ac = true;
-                index += 1;
-            } else {
-                let byte = huffman.decode(reader, ac_table)?;
-                let r = byte >> 4;
-                let s = byte & 0x0f;
-
-                if s == 0 {
-                    match r {
-                        15 => index += 16, // Run length of 16 zero coefficients.
-                        _ => {
-                            *eob_run = (1 << r) - 1;
-
-                            if r > 0 {
-                                *eob_run += huffman.get_bits(reader, r)?;
-                            }
-
-                            break;
-                        }
+                if let Some((value, run)) =
+                    HuffmanDecoder::fast_ac(ac_table, &mut bits, &mut num_bits)
+                {
+                    if run == AC_EOB {
+                        // What the slow path does for r == 0, s == 0.
+                        *eob_run = 0;
+                        break;
                     }
-                } else {
-                    index += r;
+                    index += run;
 
                     if index >= spectral_selection.end {
-                        coefficients[overrun_position(index)] =
-                            huffman.receive_extend(reader, s)? << successive_approximation_low;
+                        // A run past the end of the band: only corrupt data does
+                        // this. See `overrun_position`.
+                        let v = value << successive_approximation_low;
+                        coefficients[overrun_position(index)] = v;
+                        track.write(cmp::min(index, 63), v);
                         wrote_ac = true;
                         break;
                     }
 
-                    coefficients[UNZIGZAG[index as usize & 63] as usize & 63] =
-                        huffman.receive_extend(reader, s)? << successive_approximation_low;
+                    let v = value << successive_approximation_low;
+                    coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = v;
+                    track.write(index & 63, v);
                     wrote_ac = true;
                     index += 1;
+                } else {
+                    huffman.set_state(bits, num_bits);
+                    let byte = huffman.decode(reader, ac_table)?;
+                    let r = byte >> 4;
+                    let s = byte & 0x0f;
+
+                    if s == 0 {
+                        match r {
+                            15 => index += 16, // Run length of 16 zero coefficients.
+                            _ => {
+                                *eob_run = (1 << r) - 1;
+
+                                if r > 0 {
+                                    *eob_run += huffman.get_bits(reader, r)?;
+                                }
+
+                                break 'ac;
+                            }
+                        }
+                    } else {
+                        index += r;
+
+                        if index >= spectral_selection.end {
+                            let v =
+                                huffman.receive_extend(reader, s)? << successive_approximation_low;
+                            coefficients[overrun_position(index)] = v;
+                            track.write(cmp::min(index, 63), v);
+                            wrote_ac = true;
+                            break 'ac;
+                        }
+
+                        let v = huffman.receive_extend(reader, s)? << successive_approximation_low;
+                        coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = v;
+                        track.write(index & 63, v);
+                        wrote_ac = true;
+                        index += 1;
+                    }
+                    (bits, num_bits) = huffman.state();
                 }
             }
+            huffman.set_state(bits, num_bits);
         }
     }
 
@@ -2048,9 +2233,18 @@ fn overrun_position(index: u8) -> usize {
     usize::from(UNZIGZAG[cmp::min(usize::from(index), 63)])
 }
 
+/// Bits `start..end` of a zigzag mask (`start <= 63`, `end <= 64`).
+#[inline]
+fn band_mask(start: u8, end: u8) -> u64 {
+    let below_end = if end >= 64 { !0 } else { (1u64 << end) - 1 };
+    below_end & (!0u64 << start)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn decode_block_successive_approximation<R: Source>(
     reader: &mut crate::decode::Buffered<R>,
     coefficients: &mut [i16; 64],
+    nonzero: &mut u64,
     huffman: &mut HuffmanDecoder,
     ac_table: Option<&HuffmanTable>,
     spectral_selection: Range<u8>,
@@ -2069,10 +2263,25 @@ fn decode_block_successive_approximation<R: Source>(
         }
     } else {
         // Section G.1.2.3
+        //
+        // The band is `start..end` in zigzag order, `1 <= start`, `end <= 64`
+        // (the parser refuses anything else in a progressive AC scan). It is
+        // walked through `nonzero` rather than position by position: the
+        // non-zero coefficients each take one correction bit, in zigzag order,
+        // and a run of zeros ends on a zero the mask finds directly.
+        let end = spectral_selection.end;
+        let band = band_mask(spectral_selection.start, end);
+        debug_assert_eq!(
+            *nonzero,
+            (1..64u8).fold(0, |m, k| m
+                | (u64::from(coefficients[UNZIGZAG[usize::from(k)] as usize] != 0)
+                    << k)),
+            "nonzero mask out of step with the coefficients"
+        );
 
         if *eob_run > 0 {
             *eob_run -= 1;
-            refine_non_zeroes(reader, coefficients, huffman, spectral_selection, 64, bit)?;
+            refine_non_zeroes(reader, coefficients, huffman, *nonzero & band, bit)?;
             return Ok(());
         }
 
@@ -2089,22 +2298,22 @@ fn decode_block_successive_approximation<R: Source>(
                 ))
             }
         };
-        while index < spectral_selection.end {
-            let byte = huffman.decode(reader, ac_table)?;
+        while index < end {
+            let byte = huffman.decode_inline(reader, ac_table)?;
             let r = byte >> 4;
             let s = byte & 0x0f;
 
-            let mut zero_run_length = r;
+            // How many zeros the run skips: the coefficient (if any) lands on
+            // the zero after them. `None`: to the end of the band.
+            let mut zero_run_length = Some(r);
             let mut value = 0;
 
             match s {
                 0 => {
                     match r {
                         15 => {
-                            // Run length of 16 zero coefficients.
-                            // We don't need to do anything special here, zero_run_length is 15
-                            // and then value (which is zero) gets written, resulting in 16
-                            // zero coefficients.
+                            // Run length of 16 zero coefficients: skip 15 and
+                            // the value written on the 16th is zero.
                         }
                         _ => {
                             *eob_run = (1 << r) - 1;
@@ -2114,7 +2323,7 @@ fn decode_block_successive_approximation<R: Source>(
                             }
 
                             // Force end of block.
-                            zero_run_length = 64;
+                            zero_run_length = None;
                         }
                     }
                 }
@@ -2133,21 +2342,47 @@ fn decode_block_successive_approximation<R: Source>(
                 }
             }
 
-            let range = Range {
-                start: index,
-                end: spectral_selection.end,
+            // `index < end <= 64`, so the shift is in range.
+            let ahead = band & (!0u64 << index);
+            // The zero the run ends on, or the end of the band when there are
+            // not that many zeros left (an end-of-block, a run of sixteen zeros
+            // at the end of the band, or corrupt data).
+            let target = match zero_run_length {
+                Some(run) => {
+                    let mut zeros = !*nonzero & ahead;
+                    for _ in 0..run {
+                        zeros &= zeros.wrapping_sub(1);
+                    }
+                    if zeros == 0 {
+                        end
+                    } else {
+                        zeros.trailing_zeros() as u8
+                    }
+                }
+                None => end,
             };
-            index = refine_non_zeroes(reader, coefficients, huffman, range, zero_run_length, bit)?;
+            // Every non-zero coefficient the run passes takes a correction bit.
+            let before_target = (1u64.checked_shl(u32::from(target)).unwrap_or(0)).wrapping_sub(1);
+            refine_non_zeroes(
+                reader,
+                coefficients,
+                huffman,
+                *nonzero & ahead & before_target,
+                bit,
+            )?;
+            index = target;
 
             if value != 0 {
                 // `index` is the zero the run ended on -- or, in corrupt data,
                 // the end of the band, when there were not that many zeros
                 // left; libjpeg-turbo stores the coefficient even then (see
                 // `overrun_position`).
-                if index >= spectral_selection.end {
+                if index >= end {
                     coefficients[overrun_position(index)] = value;
+                    *nonzero |= 1u64 << cmp::min(index, 63);
                 } else {
                     coefficients[UNZIGZAG[index as usize & 63] as usize & 63] = value;
+                    *nonzero |= 1u64 << (index & 63);
                 }
             }
 
@@ -2158,35 +2393,25 @@ fn decode_block_successive_approximation<R: Source>(
     Ok(())
 }
 
+/// One correction bit for each coefficient in `positions` (a zigzag mask of
+/// non-zero coefficients), lowest position first.
+#[inline]
 fn refine_non_zeroes<R: Source>(
     reader: &mut crate::decode::Buffered<R>,
     coefficients: &mut [i16; 64],
     huffman: &mut HuffmanDecoder,
-    range: Range<u8>,
-    zrl: u8,
+    mut positions: u64,
     bit: i16,
-) -> Result<u8> {
-    debug_assert_eq!(coefficients.len(), 64);
-
-    // Returned when the band ends before the run does: an end-of-block, a run
-    // of sixteen zeros at the end of the band, or corrupt data.
-    let end = range.end;
-    let mut zero_run_length = zrl;
-
-    for i in range {
-        let index = UNZIGZAG[i as usize] as usize;
-
-        let coefficient = &mut coefficients[index];
-
-        if *coefficient == 0 {
-            if zero_run_length == 0 {
-                return Ok(i);
-            }
-
-            zero_run_length -= 1;
-        } else if huffman.get_bits(reader, 1)? == 1 && *coefficient & bit == 0 {
+) -> Result<()> {
+    while positions != 0 {
+        let k = positions.trailing_zeros() as usize;
+        positions &= positions - 1;
+        let coefficient = &mut coefficients[UNZIGZAG[k] as usize & 63];
+        if huffman.get_bits(reader, 1)? == 1 && *coefficient & bit == 0 {
             // Wrapping, as libjpeg-turbo's 16-bit `JCOEF` arithmetic does: only
-            // corrupt data can overflow here, and that is not refused.
+            // corrupt data can overflow here, and that is not refused. Never to
+            // zero, so `nonzero` stays exact: `coefficient & bit == 0` with
+            // `bit <= 1 << 13` keeps the sum away from a multiple of 65536.
             if *coefficient > 0 {
                 *coefficient = coefficient.wrapping_add(bit);
             } else {
@@ -2194,8 +2419,7 @@ fn refine_non_zeroes<R: Source>(
             }
         }
     }
-
-    Ok(end)
+    Ok(())
 }
 
 fn compute_image(

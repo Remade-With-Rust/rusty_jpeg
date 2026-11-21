@@ -16,10 +16,27 @@ pub struct ImmediateWorker {
     /// Last coefficient buffer this worker finished with, offered back to the
     /// caller so it can be refilled rather than reallocated.
     spare: Option<Vec<i16>>,
-    /// A block held back so it can be paired with its right-hand neighbour for
-    /// the two-block AVX2 IDCT. `(component, block_y, block_x, coefficients)`.
-    pending: Option<(usize, usize, usize, [i16; 64])>,
+    /// Per component, a block held back so it can be paired with its
+    /// right-hand neighbour for the two-block AVX2 IDCT.
+    /// `(block_y, block_x, coefficients)`.
+    ///
+    /// One slot PER COMPONENT, not one for the scan: an interleaved MCU visits
+    /// the components in turn, so in 4:4:4 the next block after a luma block is
+    /// always a chroma block and a single slot never paired anything (230,478
+    /// single-block transforms against 5,022 pair flushes on a 2000x1250
+    /// 4:4:4 frame); in 4:2:0 only the luma pairs inside an MCU met. With a
+    /// slot each, a component's block waits across the other components'
+    /// blocks for its own neighbour in the next MCU.
+    pending: [Option<(usize, usize, [i16; 64])>; MAX_COMPONENTS],
+    /// The two-block transform, resolved once when the worker is made. Asking
+    /// the dispatcher per pair re-read the CPU-feature cache every time:
+    /// 113,968 calls at 11 Ir on a 2000x1250 4:4:4 decode.
+    #[cfg(not(feature = "platform_independent"))]
+    pair_idct: Option<PairIdct>,
 }
+
+#[cfg(not(feature = "platform_independent"))]
+type PairIdct = unsafe fn(&[i16; 64], &[i16; 64], &[u16; 64], usize, &mut [u8], usize);
 
 impl Default for ImmediateWorker {
     fn default() -> Self {
@@ -29,7 +46,9 @@ impl Default for ImmediateWorker {
             components: vec![None; MAX_COMPONENTS],
             quantization_tables: vec![None; MAX_COMPONENTS],
             spare: None,
-            pending: None,
+            pending: [None; MAX_COMPONENTS],
+            #[cfg(not(feature = "platform_independent"))]
+            pair_idct: crate::decode::arch::get_dequantize_and_idct_block_8x8_pair(),
         }
     }
 }
@@ -77,8 +96,21 @@ impl ImmediateWorker {
     }
 
     pub fn append_row_immediate(&mut self, (index, data): (usize, Vec<i16>)) {
-        // Convert coefficients from a MCU row to samples.
+        self.transform_row(index, &data, None);
 
+        // This worker consumed the row synchronously, so the buffer is free
+        // now. Keep it for the caller to refill instead of dropping it and
+        // making them allocate + zero a replacement for every MCU row.
+        self.spare = Some(data);
+    }
+
+    /// Convert one MCU row of coefficients to samples.
+    ///
+    /// `nonzero`, when given, holds each block's AC mask (see
+    /// `Decoder::nonzero`): a block is DC-only exactly when its mask is zero,
+    /// which the caller's entropy decoder already knows, so the 63-coefficient
+    /// scan per block is skipped.
+    pub(crate) fn transform_row(&mut self, index: usize, data: &[i16], nonzero: Option<&[u64]>) {
         let component = self.components[index].as_ref().unwrap();
         let quantization_table = self.quantization_tables[index].as_ref().unwrap();
         let block_count =
@@ -86,6 +118,19 @@ impl ImmediateWorker {
         let line_stride = component.block_size.width as usize * component.dct_scale;
 
         assert_eq!(data.len(), block_count * 64);
+        if let Some(nonzero) = nonzero {
+            assert_eq!(nonzero.len(), block_count);
+        }
+        let dc_only_at = |i: usize, coefficients: &[i16; 64]| match nonzero {
+            Some(nonzero) => {
+                debug_assert_eq!(
+                    nonzero[i] == 0,
+                    crate::decode::idct::is_dc_only(coefficients)
+                );
+                nonzero[i] == 0
+            }
+            None => crate::decode::idct::is_dc_only(coefficients),
+        };
 
         // Two horizontally adjacent full blocks can share one AVX2 instruction
         // stream (see `arch::avx2`). Worth pairing only when BOTH need a real
@@ -94,7 +139,7 @@ impl ImmediateWorker {
         let blocks_wide = component.block_size.width as usize;
         #[cfg(not(feature = "platform_independent"))]
         let pair_idct = if component.dct_scale == 8 {
-            crate::decode::arch::get_dequantize_and_idct_block_8x8_pair()
+            self.pair_idct
         } else {
             None
         };
@@ -111,7 +156,7 @@ impl ImmediateWorker {
             let coefficients: &[i16; 64] = data[i * 64..(i + 1) * 64].try_into().unwrap();
 
             crate::prof::bump(crate::prof::Count::DecBlocks, 1);
-            let dc_only = crate::decode::idct::is_dc_only(coefficients);
+            let dc_only = dc_only_at(i, coefficients);
             if dc_only {
                 crate::prof::bump(crate::prof::Count::DecDcOnlyBlocks, 1);
             }
@@ -121,9 +166,12 @@ impl ImmediateWorker {
             // needs a full transform.
             #[cfg(not(feature = "platform_independent"))]
             if let Some(idct_pair) = pair_idct {
-                if !dc_only && i + 1 < block_count && (i % blocks_wide) + 1 < blocks_wide {
+                // `bx` is `i % blocks_wide`, tracked incrementally: the modulo
+                // was a 64-bit division by a runtime width for every non-DC
+                // block of every row -- one instruction, tens of cycles.
+                if !dc_only && i + 1 < block_count && bx + 1 < blocks_wide {
                     let next: &[i16; 64] = data[(i + 1) * 64..(i + 2) * 64].try_into().unwrap();
-                    if !crate::decode::idct::is_dc_only(next) {
+                    if !dc_only_at(i + 1, next) {
                         crate::prof::bump(crate::prof::Count::DecBlocks, 1);
                         crate::prof::bump(crate::prof::Count::DecIdctPairs, 1);
                         let _s = crate::prof::scope(crate::prof::Stage::DecIdct);
@@ -183,11 +231,6 @@ impl ImmediateWorker {
         }
 
         self.offsets[index] += block_count * component.dct_scale * component.dct_scale;
-
-        // This worker consumed the row synchronously, so the buffer is free
-        // now. Keep it for the caller to refill instead of dropping it and
-        // making them allocate + zero a replacement for every MCU row.
-        self.spare = Some(data);
     }
 
     /// Inverse-transform one block straight into the plane.
@@ -236,12 +279,14 @@ impl ImmediateWorker {
             return;
         }
 
-        if let Some((pi, py, px, pcoeffs)) = self.pending.take() {
-            if pi == index && py == block_y && px + 1 == block_x {
+        // The waiting block is BORROWED for the pair: `take()` moved its 128
+        // coefficients out to a stack temporary first -- sixteen moves per
+        // pair -- only to hand the kernel a reference to the copy.
+        if let Some((py, px, pcoeffs)) = &self.pending[index] {
+            let (py, px) = (*py, *px);
+            if py == block_y && px + 1 == block_x {
                 #[cfg(not(feature = "platform_independent"))]
-                if let Some(idct_pair) =
-                    crate::decode::arch::get_dequantize_and_idct_block_8x8_pair()
-                {
+                if let Some(idct_pair) = self.pair_idct {
                     let off = py * scale * line_stride + px * scale;
                     let qt = self.quantization_tables[index].as_ref().unwrap();
                     let out = &mut self.results[index][off..];
@@ -249,14 +294,16 @@ impl ImmediateWorker {
                     let _s = crate::prof::scope(crate::prof::Stage::DecIdct);
                     #[allow(unsafe_code)]
                     unsafe {
-                        idct_pair(&pcoeffs, coeffs, qt, line_stride, out, scale);
+                        idct_pair(pcoeffs, coeffs, qt, line_stride, out, scale);
                     }
+                    self.pending[index] = None;
                     return;
                 }
             }
-            self.emit_single(pi, py, px, &pcoeffs);
+            let _ = pcoeffs;
+            self.flush_pending(index);
         }
-        self.pending = Some((index, block_y, block_x, *coeffs));
+        self.pending[index] = Some((block_y, block_x, *coeffs));
     }
 
     fn emit_single(&mut self, index: usize, block_y: usize, block_x: usize, coeffs: &[i16; 64]) {
@@ -270,9 +317,9 @@ impl ImmediateWorker {
         dequantize_and_idct_block(scale, coeffs, qt, line_stride, out);
     }
 
-    fn flush_pending(&mut self, _index: usize) {
-        if let Some((pi, py, px, pcoeffs)) = self.pending.take() {
-            self.emit_single(pi, py, px, &pcoeffs);
+    fn flush_pending(&mut self, index: usize) {
+        if let Some((py, px, pcoeffs)) = self.pending[index].take() {
+            self.emit_single(index, py, px, &pcoeffs);
         }
     }
 
