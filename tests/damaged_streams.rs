@@ -14,258 +14,10 @@
 //! uniform grey (128), and decoding resumes, correctly aligned, at the next
 //! restart marker it can trust.
 
-use rusty_jpeg::decode::{Decoder, Error, UnsupportedFeature};
+mod stream_builder;
 
-// ---------------------------------------------------------------------------
-// A minimal baseline JPEG writer.
-// ---------------------------------------------------------------------------
-
-/// Annex K.3 luminance DC table: code `00` is category 0.
-const DC_BITS: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
-const DC_VALS: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-/// A two-symbol AC table chosen so that ZERO BITS ARE NOT HARMLESS: `0` is
-/// run 0 / size 1 and `10` is EOB. Decoding the zero fill inserted after a
-/// marker yields a block of -1 coefficients, not an empty block, so a test can
-/// tell "left grey" from "decoded the fill".
-const AC_BITS: [u8; 16] = [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-const AC_VALS: [u8; 2] = [0x01, 0x00];
-
-/// Canonical Huffman code (Annex C) of `sym` as `(code, length)`.
-fn code_for(bits: &[u8; 16], vals: &[u8], sym: u8) -> (u32, u32) {
-    let mut code = 0u32;
-    let mut k = 0;
-    for (i, &n) in bits.iter().enumerate() {
-        for _ in 0..n {
-            if vals[k] == sym {
-                return (code, i as u32 + 1);
-            }
-            code += 1;
-            k += 1;
-        }
-        code <<= 1;
-    }
-    panic!("symbol {sym} not in table");
-}
-
-struct BitWriter {
-    out: Vec<u8>,
-    acc: u32,
-    n: u32,
-    /// Bits written, excluding stuffing and padding.
-    total: usize,
-}
-
-impl BitWriter {
-    fn new() -> Self {
-        BitWriter {
-            out: Vec::new(),
-            acc: 0,
-            n: 0,
-            total: 0,
-        }
-    }
-    fn put(&mut self, value: u32, len: u32) {
-        self.total += len as usize;
-        for i in (0..len).rev() {
-            self.acc = (self.acc << 1) | ((value >> i) & 1);
-            self.n += 1;
-            if self.n == 8 {
-                let b = self.acc as u8;
-                self.out.push(b);
-                if b == 0xFF {
-                    self.out.push(0x00);
-                }
-                self.acc = 0;
-                self.n = 0;
-            }
-        }
-    }
-    /// Pad to a byte boundary with 1-bits, as a segment ends before an RST.
-    fn finish(mut self) -> Vec<u8> {
-        while self.n != 0 {
-            self.put(1, 1);
-        }
-        self.out
-    }
-}
-
-fn segment(out: &mut Vec<u8>, marker: u8, body: &[u8]) {
-    out.extend_from_slice(&[0xFF, marker]);
-    out.extend_from_slice(&((body.len() + 2) as u16).to_be_bytes());
-    out.extend_from_slice(body);
-}
-
-/// DC quantizer 8 and AC quantizers 1, so a DC-only block with DC value `d`
-/// decodes to the flat sample value `128 + d`.
-fn qtable() -> [u8; 64] {
-    let mut q = [1u8; 64];
-    q[0] = 8;
-    q
-}
-
-fn dqt8(q: &[u8; 64]) -> Vec<u8> {
-    let mut b = vec![0x00];
-    b.extend_from_slice(q);
-    b
-}
-
-fn dht() -> Vec<u8> {
-    let mut b = vec![0x00];
-    b.extend_from_slice(&DC_BITS);
-    b.extend_from_slice(&DC_VALS);
-    b.push(0x10);
-    b.extend_from_slice(&AC_BITS);
-    b.extend_from_slice(&AC_VALS);
-    b
-}
-
-/// SOI, DQT, SOF0, DHT, optional DRI and SOS for an 8-bit baseline image whose
-/// components all use 1x1 sampling, quantization table 0 and Huffman tables 0.
-fn header(w: u16, h: u16, ncomp: u8, dri: u16, dqt_body: &[u8]) -> Vec<u8> {
-    let mut v = vec![0xFF, 0xD8];
-    segment(&mut v, 0xDB, dqt_body);
-    let mut sof = vec![8];
-    sof.extend_from_slice(&h.to_be_bytes());
-    sof.extend_from_slice(&w.to_be_bytes());
-    sof.push(ncomp);
-    for c in 0..ncomp {
-        sof.extend_from_slice(&[c + 1, 0x11, 0]);
-    }
-    segment(&mut v, 0xC0, &sof);
-    segment(&mut v, 0xC4, &dht());
-    if dri != 0 {
-        segment(&mut v, 0xDD, &dri.to_be_bytes());
-    }
-    let mut sos = vec![ncomp];
-    for c in 0..ncomp {
-        sos.extend_from_slice(&[c + 1, 0x00]);
-    }
-    sos.extend_from_slice(&[0, 63, 0]);
-    segment(&mut v, 0xDA, &sos);
-    v
-}
-
-/// Write one DC-only block: DC difference `diff`, then EOB.
-fn put_block(bw: &mut BitWriter, diff: i32) {
-    let cat = 32 - diff.unsigned_abs().leading_zeros();
-    let (c, l) = code_for(&DC_BITS, &DC_VALS, cat as u8);
-    bw.put(c, l);
-    if cat > 0 {
-        let extra = if diff > 0 {
-            diff as u32
-        } else {
-            (diff - 1) as u32 & ((1 << cat) - 1)
-        };
-        bw.put(extra, cat);
-    }
-    let (c, l) = code_for(&AC_BITS, &AC_VALS, 0x00);
-    bw.put(c, l);
-}
-
-/// The DC value of the luma block of MCU `k`: distinct from its neighbours,
-/// so a block decoded out of place is visible. Sample value `128 + luma_dc(k)`.
-fn luma_dc(k: usize) -> i32 {
-    10 + 5 * (k % 16) as i32
-}
-
-/// Write MCUs `range` (luma `luma_dc`, chroma DC 0) as one entropy segment,
-/// with the DC prediction starting from 0.
-fn put_mcus(bw: &mut BitWriter, range: core::ops::Range<usize>, ncomp: u8) {
-    let mut pred = 0;
-    for m in range {
-        put_block(bw, luma_dc(m) - pred);
-        pred = luma_dc(m);
-        for _ in 1..ncomp {
-            put_block(bw, 0);
-        }
-    }
-}
-
-/// The entropy-coded data of an image with `mcus` MCUs and restart interval
-/// `dri`: one byte-aligned segment per interval, or a single one if `dri` is 0.
-fn segments(mcus: usize, ncomp: u8, dri: usize) -> Vec<Vec<u8>> {
-    let per = if dri == 0 { mcus } else { dri };
-    (0..mcus)
-        .step_by(per)
-        .map(|k| {
-            let mut bw = BitWriter::new();
-            put_mcus(&mut bw, k..(k + per).min(mcus), ncomp);
-            bw.finish()
-        })
-        .collect()
-}
-
-/// Header, then each segment followed by `between(i)` (normally RST(i)),
-/// then EOI.
-fn assemble(header: &[u8], segs: &[Vec<u8>], between: impl Fn(usize) -> Vec<u8>) -> Vec<u8> {
-    let mut v = header.to_vec();
-    for (i, s) in segs.iter().enumerate() {
-        v.extend_from_slice(s);
-        if i + 1 < segs.len() {
-            v.extend(between(i));
-        }
-    }
-    v.extend_from_slice(&[0xFF, 0xD9]);
-    v
-}
-
-fn rst(i: usize) -> Vec<u8> {
-    vec![0xFF, 0xD0 + (i % 8) as u8]
-}
-
-/// A decoded luma plane: samples (stride = width), width.
-type Plane = (Vec<u8>, usize);
-
-fn luma(data: &[u8], single_threaded: bool) -> Result<Plane, Error> {
-    let mut d = Decoder::new(data);
-    d.set_single_threaded(single_threaded);
-    let p = d.decode_planar()?;
-    let c = &p.components[0];
-    let mut out = Vec::with_capacity(c.width * c.height);
-    for y in 0..c.height {
-        out.extend_from_slice(&c.data[y * c.stride..y * c.stride + c.width]);
-    }
-    Ok((out, c.width))
-}
-
-/// The 8x8 luma block of MCU `k` (MCUs are 8x8: all sampling is 1x1).
-fn block(plane: &Plane, k: usize) -> Vec<u8> {
-    let (data, w) = plane;
-    let (bx, by) = (k % (w / 8), k / (w / 8));
-    (0..8)
-        .flat_map(|y| {
-            let o = (by * 8 + y) * w + bx * 8;
-            data[o..o + 8].to_vec()
-        })
-        .collect()
-}
-
-/// Asserts the damaged decode equals the clean one at every MCU except those
-/// in `grey`, where every sample must be exactly 128, and in `skip`.
-fn assert_recovered(damaged: &Plane, clean: &Plane, mcus: usize, grey: &[usize], skip: &[usize]) {
-    for k in 0..mcus {
-        if skip.contains(&k) {
-            continue;
-        }
-        let got = block(damaged, k);
-        if grey.contains(&k) {
-            assert!(
-                got.iter().all(|&s| s == 128),
-                "MCU {k} should be uniform grey (a lost segment), got {got:?}"
-            );
-        } else {
-            assert_eq!(
-                got,
-                block(clean, k),
-                "MCU {k} differs from the clean decode"
-            );
-            assert!(
-                got.iter().all(|&s| s as i32 == 128 + luma_dc(k)),
-                "MCU {k} does not show its own value: {got:?}"
-            );
-        }
-    }
-}
+use rusty_jpeg::decode::{Decoder, Error, UnsupportedFeature, Warning};
+use stream_builder::*;
 
 // ---------------------------------------------------------------------------
 // 1. Zero quantizer entries.
@@ -314,50 +66,6 @@ fn zero_entry_in_16_bit_quantization_table_decodes() {
 // ---------------------------------------------------------------------------
 // 2. Restart markers out of sequence, and corrupt data posing as a marker.
 // ---------------------------------------------------------------------------
-
-/// A 136x136 image with restart interval `dri`. Grayscale exercises the
-/// buffered, non-interleaved path; three components the interleaved one (the
-/// fused entropy+IDCT path when single-threaded). 136x136 is over the
-/// multithreaded worker's threshold, so the other threading mode exercises it.
-struct Layout {
-    ncomp: u8,
-    mcus: usize,
-    hdr: Vec<u8>,
-    segs: Vec<Vec<u8>>,
-}
-
-impl Layout {
-    fn new(ncomp: u8, dri: u16) -> Self {
-        let (w, h) = (136u16, 136u16);
-        let mcus = (w as usize / 8) * (h as usize / 8);
-        Layout {
-            ncomp,
-            mcus,
-            hdr: header(w, h, ncomp, dri, &dqt8(&qtable())),
-            segs: segments(mcus, ncomp, dri as usize),
-        }
-    }
-
-    fn clean(&self) -> Vec<u8> {
-        assemble(&self.hdr, &self.segs, rst)
-    }
-
-    /// Decode `data` in both threading modes, which must agree, and check the
-    /// packed (colour-converted) output path accepts it too.
-    fn decode(&self, data: &[u8]) -> Plane {
-        let a = luma(data, true).unwrap_or_else(|e| panic!("ncomp={}: {e}", self.ncomp));
-        let b = luma(data, false).unwrap_or_else(|e| panic!("ncomp={}: {e}", self.ncomp));
-        assert_eq!(a, b, "ncomp={}: threading modes disagree", self.ncomp);
-        Decoder::new(data)
-            .decode()
-            .unwrap_or_else(|e| panic!("ncomp={} packed: {e}", self.ncomp));
-        a
-    }
-}
-
-fn layouts(dri: u16) -> [Layout; 2] {
-    [Layout::new(1, dri), Layout::new(3, dri)]
-}
 
 #[test]
 fn clean_restart_stream_decodes() {
@@ -648,5 +356,107 @@ fn two_component_scans_decode() {
             d.set_single_threaded(single);
             assert_eq!(d.decode_planar().unwrap().components.len(), comps.len());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. A bit sequence that is no Huffman code.
+// ---------------------------------------------------------------------------
+
+/// The entropy data of `segments`, except that in MCU `bad_mcu` the EOB of the
+/// luma block is replaced by seventeen 1-bits -- which no code of the AC table
+/// (`0`, `10`) begins -- and, if `bad_dc`, so is the DC code of the block
+/// after it (a chroma block, DC difference 0).
+fn segments_with_bad_code(l: &Layout, dri: usize, bad_mcu: usize, bad_dc: bool) -> Vec<Vec<u8>> {
+    let per = if dri == 0 { l.mcus } else { dri };
+    let (eob, eob_len) = code_for(&AC_BITS, &AC_VALS, 0x00);
+    (0..l.mcus)
+        .step_by(per)
+        .map(|k| {
+            let mut bw = BitWriter::new();
+            let mut pred = 0;
+            for m in k..(k + per).min(l.mcus) {
+                put_diff(&mut bw, luma_dc(m) - pred);
+                pred = luma_dc(m);
+                if m == bad_mcu {
+                    bw.put(0x1FFFF, 17);
+                } else {
+                    bw.put(eob, eob_len);
+                }
+                for c in 1..l.ncomp {
+                    if m == bad_mcu && bad_dc && c == 1 {
+                        bw.put(0x1FFFF, 17);
+                        bw.put(eob, eob_len);
+                    } else {
+                        put_block(&mut bw, 0);
+                    }
+                }
+            }
+            bw.finish()
+        })
+        .collect()
+}
+
+/// libjpeg-turbo does not refuse an image for a bad Huffman code. Its decoder
+/// reads on until its length search passes 16 bits -- 17 bits consumed --
+/// warns "Corrupt JPEG data: bad Huffman code", and takes the symbol to be 0
+/// (`jpeg_huff_decode`, jdhuff.c). Symbol 0 is an end-of-block in an AC table
+/// and a zero difference in a DC table, so a stream with exactly seventeen
+/// stray bits where such a code belongs decodes to the very same image. This
+/// used to fail as "failed to decode huffman code".
+#[test]
+fn bad_huffman_code_reads_as_symbol_zero_after_seventeen_bits() {
+    for (ncomp, dri, bad_dc) in [
+        (1u8, 0u16, false),
+        (3, 0, false),
+        (3, 0, true),
+        (1, 4, false),
+        (3, 4, true),
+    ] {
+        let l = Layout::new(ncomp, dri);
+        let clean = l.decode(&l.clean());
+        let segs = segments_with_bad_code(&l, dri as usize, 50, bad_dc);
+        let data = assemble(&l.hdr, &segs, rst);
+        assert_ne!(data, l.clean());
+        assert_recovered(&l.decode(&data), &clean, l.mcus, &[], &[]);
+
+        for single in [true, false] {
+            let mut d = Decoder::new(&data[..]);
+            d.set_single_threaded(single);
+            d.decode().unwrap();
+            assert_eq!(d.warnings(), [Warning::BadHuffmanCode]);
+            assert!(!d.is_truncated());
+
+            let mut d = Decoder::new(&data[..]);
+            d.set_single_threaded(single);
+            d.set_strict(true);
+            match d.decode() {
+                Err(Error::Format(m)) => assert!(m.contains("huffman"), "{m}"),
+                other => panic!("strict: {:?}", other.map(|px| px.len())),
+            }
+        }
+    }
+}
+
+/// Bad codes that leave the decoder out of step: a segment overwritten with
+/// 1-bits. Its MCUs are lost (the first is decoded from whatever the bits
+/// mean, the rest are grey once the data runs out), and the next restart
+/// marker puts the decoder back in step, as libjpeg-turbo's does.
+#[test]
+fn bad_huffman_codes_cost_one_restart_interval() {
+    for l in layouts(4) {
+        let clean = l.decode(&l.clean());
+        let mut segs = l.segs.clone();
+        // Stuffed FF bytes: 24 one-bits of entropy data, no marker.
+        segs[20] = vec![0xFF, 0x00, 0xFF, 0x00, 0xFF, 0x00];
+        let data = assemble(&l.hdr, &segs, rst);
+        // Segment 20 is MCUs 80..84.
+        assert_recovered(&l.decode(&data), &clean, l.mcus, &[81, 82, 83], &[80]);
+        let mut d = Decoder::new(&data[..]);
+        d.decode().unwrap();
+        assert_eq!(
+            d.warnings(),
+            [Warning::SegmentEndedEarly, Warning::BadHuffmanCode]
+        );
     }
 }

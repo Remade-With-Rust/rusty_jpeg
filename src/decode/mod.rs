@@ -7,7 +7,7 @@
 #![cfg_attr(feature = "platform_independent", forbid(unsafe_code))]
 
 pub use decoder::{ColorTransform, Decoder, ImageInfo, PixelFormat, PlanarComponent, PlanarImage};
-pub use error::{Error, UnsupportedFeature};
+pub use error::{Error, UnsupportedFeature, Warning};
 pub use parser::CodingProcess;
 
 use alloc::boxed::Box;
@@ -145,6 +145,15 @@ impl<R: Source> Buffered<R> {
     #[inline]
     pub(crate) fn buffered(&self) -> &[u8] {
         &self.buf[self.pos..self.end]
+    }
+
+    /// Whether the source has no more data. Reads ahead into the buffer when
+    /// it is empty; consumes nothing.
+    pub(crate) fn at_end(&mut self) -> Result<bool, Error> {
+        if self.pos == self.end {
+            self.refill()?;
+        }
+        Ok(self.pos == self.end)
     }
 
     #[inline]

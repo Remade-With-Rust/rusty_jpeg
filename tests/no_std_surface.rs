@@ -5,7 +5,7 @@
 //! paths under `--no-default-features`). One value in three builds is the
 //! host-equals-chip gate: the same source must code to the same bytes.
 
-use rusty_jpeg::decode::{Decoder, Error};
+use rusty_jpeg::decode::{Decoder, Error, Warning};
 use rusty_jpeg::encode::{
     ColorType, Encoder, PlanarYcbcrImage, SamplingFactor, SliceWriter, YuyvImage,
 };
@@ -79,16 +79,41 @@ fn decoder_scales_from_a_slice() {
     assert_eq!(d.decode().unwrap().len(), 32 * 24 * 3);
 }
 
-/// A truncated frame is a distinct error from a corrupt one — a receiver drops
-/// the frame and resynchronises rather than declaring the stream broken.
+/// A truncated frame is distinct from a corrupt one. By default it decodes --
+/// what arrived, grey below -- and says so; a receiver that would rather drop
+/// the frame and resynchronise asks for strict decoding, and gets
+/// `UnexpectedEof` (not a format error) exactly as before.
 #[test]
-fn truncated_data_is_unexpected_eof() {
+fn truncated_data_is_reported_and_is_unexpected_eof_when_strict() {
     let jpeg = encode_rgb(64, 64, 80);
     let cut = &jpeg[..jpeg.len() / 2];
-    match Decoder::new(cut).decode() {
+
+    let mut d = Decoder::new(cut);
+    let px = d.decode().expect("a truncated frame decodes by default");
+    assert_eq!(px.len(), 64 * 64 * 3);
+    assert!(d.is_truncated());
+    assert_eq!(d.warnings()[0], Warning::Truncated);
+    // The bottom rows never arrived: uniform grey.
+    assert!(px[63 * 64 * 3..].iter().all(|&s| s == 128));
+
+    let mut d = Decoder::new(cut);
+    d.set_strict(true);
+    match d.decode() {
         Err(Error::UnexpectedEof) => {}
         other => panic!("expected UnexpectedEof, got {other:?}"),
     }
+
+    // Nothing but a header is still an error in either mode.
+    match Decoder::new(&jpeg[..100]).decode() {
+        Err(Error::UnexpectedEof) => {}
+        other => panic!("expected UnexpectedEof, got {other:?}"),
+    }
+
+    // And a whole frame has no warnings, strict or not.
+    let mut d = Decoder::new(&jpeg[..]);
+    d.set_strict(true);
+    d.decode().expect("strict decode of a complete frame");
+    assert!(!d.is_truncated() && d.warnings().is_empty());
 }
 
 /// The caller-owned sink: same bytes as the `Vec` sink, and the length comes

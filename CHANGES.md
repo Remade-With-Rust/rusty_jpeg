@@ -6,6 +6,78 @@ upstream possible.
 
 ## Unreleased
 
+- **Files that end early decode, as libjpeg-turbo decodes them** (#28 item 5;
+  the follow-up on #29). A download cut short or a crashed write used to be
+  refused with "unexpected end of JPEG data" -- even a file missing only its
+  final `FF D9`. libjpeg-turbo's data source answers the end of the data with
+  an EOI of its own (`fill_input_buffer`, jdatasrc.c), warns "Premature end of
+  JPEG file", and decodes on; this decoder now does the same, by extending the
+  0.4.9 recovery for a marker that arrives early (`process_restart`,
+  `insufficient_data`) to the end of the data itself. Regression streams,
+  built byte by byte, are in `tests/truncated_streams.rs`:
+  - **Missing EOI only**: the complete image.
+  - **Cut inside a baseline or extended-sequential scan**: everything decoded
+    so far, the MCU the data ran out in finished from inserted zero bits, the
+    rest of the scan uniform grey. With restart intervals the same: every
+    restart after the cut finds the end of the data and nothing resumes.
+  - **Cut between scans, or inside a marker segment after a scan**: the image
+    as the scans so far give it. A component no scan delivered is mid-grey
+    (also when a proper EOI ends such a stream, which was "not all components
+    have data"). A segment cut in two is dropped whole; libjpeg-turbo reads
+    its inserted `FF D9` as the missing bytes, which is either harmless or
+    fatal, so this is the one place more is recovered than it recovers.
+  - **Progressive**: every block at the precision the scans that arrived gave
+    it, rendered with libjpeg-turbo's **interblock smoothing** -- a port of
+    `smoothing_ok` / `decompress_smooth_data` (jdcoefct.c, the 3.x 5x5
+    version) and the `coef_bits` bookkeeping behind it. That is what makes a
+    half-downloaded progressive image a soft picture instead of a mosaic, and
+    it is what every libjpeg-based viewer shows. Smoothing is applied only to
+    a stream whose data ended early: a stream with a proper EOI decodes
+    exactly as before, including one whose scans stop short of full precision
+    (which libjpeg-turbo would also smooth).
+  - **Lossless (SOF3)**: rows before the cut exact, the row the data ran out
+    in finished from zero bits, every later row of the segment mid-grey, as
+    `decode_mcus` (jdlhuff.c) does. This also replaces the 0.4.9 behaviour of
+    decoding an emptied restart segment from the zero fill. Doing it needed
+    the prediction to start afresh at each restart marker (H.1.1), which this
+    decoder never did: **a lossless image with restart intervals decoded
+    wrongly even when intact**, and now decodes as libjpeg-turbo decodes it.
+    (Lossless images without restart intervals are unchanged.)
+  - **Before any scan data** (inside the headers, or a first scan header with
+    nothing after it): still `Error::UnexpectedEof`. There is nothing to show,
+    and a bare header must not make the decoder allocate the image it
+    declares. libjpeg-turbo fails the first case too ("no image"); for the
+    second it would output a uniform grey image.
+- **A bad Huffman code no longer fails the image.** As `jpeg_huff_decode`
+  (jdhuff.c): the code is taken to be symbol 0 after 17 bits have been
+  consumed, and decoding goes on -- out of step until the next restart marker,
+  where the 0.4.9 resynchronisation picks it up, or to the end of the scan.
+  Was "failed to decode huffman code". The rest of the entropy decoder now
+  takes libjpeg-turbo's path through corrupt data as well, so that both
+  decoders stay in step and run out of data at the same MCU: a coefficient
+  whose zero run passes the end of its band is still read and stored
+  (position 63, via `jpeg_natural_order`'s padding), DC categories 12..=15
+  are read (was "invalid DC difference magnitude category"), a refinement
+  scan's new coefficient with a size other than 1 reads as 1 (was "unexpected
+  huffman code") and a refined coefficient wraps instead of failing (was
+  "Coefficient overflow"). Valid streams reach none of this.
+- **`Decoder::warnings()`, `is_truncated()` and `set_strict()`.** Recovery is
+  the default, as it already was for the damage 0.4.9 handles, and as
+  libjpeg-turbo returns pixels plus warnings. What was recovered from is now
+  visible: `warnings()` lists each kind of repair once (`Warning::Truncated`,
+  `SegmentEndedEarly`, `BadHuffmanCode`, `RestartMarkerMismatch`,
+  `ExtraneousBytes`, `MissingScan`), `is_truncated()` answers the common
+  question, and a decode with no warnings read a complete, well-formed stream.
+  `set_strict(true)` turns every warning into an error at the point it would
+  be raised: `Error::UnexpectedEof` for a truncated stream, exactly as before,
+  `Error::Format` for the rest. **Behaviour change:** code that relied on
+  `Err(UnexpectedEof)` to drop a cut-short frame (an MJPEG receiver, say) must
+  now call `set_strict(true)` or check `is_truncated()`.
+- **`set_max_decoding_buffer_size` is enforced before the first scan is
+  decoded**, not only after the last. A stream may now end anywhere and still
+  decode, so the limit has to refuse an oversized frame before a scan sizes
+  its planes from the header. Same error as before ("size of decoded image
+  exceeds maximum allowed size").
 - **Damaged streams decode as libjpeg-turbo decodes them.** Four upstream
   `jpeg-decoder` refusals, met in a damaged JPEG-in-TIFF corpus, are now
   recovered the way libjpeg-turbo recovers them (regression streams in
