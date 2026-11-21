@@ -405,6 +405,12 @@ fn h1v2(
     }
 }
 
+/// The longest remainder `h2v2` finishes with a running pair of column sums
+/// rather than the two-pass form (whose `Vec` refill per row cost more than
+/// the pass saved over a handful of samples). The AVX2 kernel leaves at most
+/// 16 samples.
+const SHORT_TAIL: usize = 32;
+
 /// 4:2:0 chroma: triangle filter in both directions, libjpeg's "fancy"
 /// upsampling, bit for bit what this function always produced.
 ///
@@ -458,6 +464,22 @@ fn h2v2(
     #[cfg(feature = "platform_independent")]
     let _ = pairs_kernel;
 
+    // What the kernel left: a few pairs after it (seven of a 1000-sample row),
+    // or the whole row without one. A short tail is a running pair of column
+    // sums; a long one keeps the two-pass form, whose passes vectorize.
+    if input_width - done <= SHORT_TAIL {
+        let mut t0 = column(done);
+        for (o, i) in interior[2 * done..]
+            .chunks_exact_mut(2)
+            .zip(done + 1..input_width)
+        {
+            let t1 = column(i);
+            o[0] = ((3 * t0 + t1 + 8) >> 4) as u8;
+            o[1] = ((3 * t1 + t0 + 8) >> 4) as u8;
+            t0 = t1;
+        }
+        return;
+    }
     sums.clear();
     sums.extend(
         input_near[done..]
