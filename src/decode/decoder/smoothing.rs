@@ -74,8 +74,14 @@ impl Progression {
                     0
                 };
             }
-            for coefi in ss..=se.min(SAVED_COEFS - 1) {
-                self.coef_bits[component][coefi] = scan.successive_approximation_low as i8;
+            // Coefficients `ss ..= se` of the band, those of them that are kept.
+            let al = scan.successive_approximation_low as i8;
+            for bits in self.coef_bits[component]
+                .iter_mut()
+                .take(se.min(SAVED_COEFS - 1) + 1)
+                .skip(ss)
+            {
+                *bits = al;
             }
         }
     }
