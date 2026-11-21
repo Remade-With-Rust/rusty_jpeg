@@ -272,6 +272,91 @@ pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &
     ];
 
     let mut i = 0;
+
+    // 32 pixels per step. A 256-bit load widened with `unpacklo/hi_epi8`
+    // holds pixels 0-7 | 16-23 and 8-15 | 24-31 per 128-bit lane; the
+    // arithmetic is the 16-pixel step's, lane for lane, and `packus` of the
+    // two halves puts each channel back in pixel order (lane 0 = pixels
+    // 0-15, lane 1 = 16-31). The interleave shuffles both lanes at once, and
+    // `permute2x128` joins the six 16-byte parts into three full stores.
+    // Same pixels covered, same per-lane operations, so the same bytes.
+    let zero = _mm256_setzero_si256();
+    let wide_masks = [
+        [
+            _mm256_broadcastsi128_si256(masks[0][0]),
+            _mm256_broadcastsi128_si256(masks[0][1]),
+            _mm256_broadcastsi128_si256(masks[0][2]),
+        ],
+        [
+            _mm256_broadcastsi128_si256(masks[1][0]),
+            _mm256_broadcastsi128_si256(masks[1][1]),
+            _mm256_broadcastsi128_si256(masks[1][2]),
+        ],
+        [
+            _mm256_broadcastsi128_si256(masks[2][0]),
+            _mm256_broadcastsi128_si256(masks[2][1]),
+            _mm256_broadcastsi128_si256(masks[2][2]),
+        ],
+    ];
+    while i + 32 <= covered {
+        let load = |p: &[u8]| _mm256_loadu_si256(p.as_ptr().add(i) as *const __m256i);
+        let (yb, cbb, crb) = (load(y), load(cb), load(cr));
+        let convert = |yw: __m256i, cbw: __m256i, crw: __m256i| {
+            let yv = _mm256_adds_epi16(_mm256_slli_epi16(yw, SHIFT), half);
+            let cbv = _mm256_subs_epi16(_mm256_slli_epi16(cbw, SHIFT), c128);
+            let crv = _mm256_subs_epi16(_mm256_slli_epi16(crw, SHIFT), c128);
+
+            let cr_140200 = _mm256_adds_epi16(_mm256_mulhrs_epi16(crv, k_cr_r), crv);
+            let cb_034414 = _mm256_mulhrs_epi16(cbv, k_cb_g);
+            let cr_071414 = _mm256_mulhrs_epi16(crv, k_cr_g);
+            let cb_177200 = _mm256_adds_epi16(_mm256_mulhrs_epi16(cbv, k_cb_b), cbv);
+
+            let r = _mm256_srai_epi16(_mm256_adds_epi16(yv, cr_140200), SHIFT);
+            let g = _mm256_srai_epi16(
+                _mm256_subs_epi16(yv, _mm256_adds_epi16(cb_034414, cr_071414)),
+                SHIFT,
+            );
+            let b = _mm256_srai_epi16(_mm256_adds_epi16(yv, cb_177200), SHIFT);
+            (r, g, b)
+        };
+        let (r_lo, g_lo, b_lo) = convert(
+            _mm256_unpacklo_epi8(yb, zero),
+            _mm256_unpacklo_epi8(cbb, zero),
+            _mm256_unpacklo_epi8(crb, zero),
+        );
+        let (r_hi, g_hi, b_hi) = convert(
+            _mm256_unpackhi_epi8(yb, zero),
+            _mm256_unpackhi_epi8(cbb, zero),
+            _mm256_unpackhi_epi8(crb, zero),
+        );
+        let channels = [
+            _mm256_packus_epi16(r_lo, r_hi),
+            _mm256_packus_epi16(g_lo, g_hi),
+            _mm256_packus_epi16(b_lo, b_hi),
+        ];
+        let part = |m: &[__m256i; 3]| {
+            _mm256_or_si256(
+                _mm256_shuffle_epi8(channels[0], m[0]),
+                _mm256_or_si256(
+                    _mm256_shuffle_epi8(channels[1], m[1]),
+                    _mm256_shuffle_epi8(channels[2], m[2]),
+                ),
+            )
+        };
+        // Lane 0 of part p is output bytes 16p.. of pixels 0-15, lane 1 the
+        // same bytes of pixels 16-31 (48 bytes on).
+        let (p0, p1, p2) = (
+            part(&wide_masks[0]),
+            part(&wide_masks[1]),
+            part(&wide_masks[2]),
+        );
+        let out = output.as_mut_ptr().add(3 * i) as *mut __m256i;
+        _mm256_storeu_si256(out, _mm256_permute2x128_si256(p0, p1, 0x20));
+        _mm256_storeu_si256(out.add(1), _mm256_permute2x128_si256(p2, p0, 0x30));
+        _mm256_storeu_si256(out.add(2), _mm256_permute2x128_si256(p1, p2, 0x31));
+        i += 32;
+    }
+
     while i + 16 <= covered {
         let widen = |p: &[u8]| {
             _mm256_slli_epi16(
