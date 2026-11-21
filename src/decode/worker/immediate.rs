@@ -96,8 +96,21 @@ impl ImmediateWorker {
     }
 
     pub fn append_row_immediate(&mut self, (index, data): (usize, Vec<i16>)) {
-        // Convert coefficients from a MCU row to samples.
+        self.transform_row(index, &data, None);
 
+        // This worker consumed the row synchronously, so the buffer is free
+        // now. Keep it for the caller to refill instead of dropping it and
+        // making them allocate + zero a replacement for every MCU row.
+        self.spare = Some(data);
+    }
+
+    /// Convert one MCU row of coefficients to samples.
+    ///
+    /// `nonzero`, when given, holds each block's AC mask (see
+    /// `Decoder::nonzero`): a block is DC-only exactly when its mask is zero,
+    /// which the caller's entropy decoder already knows, so the 63-coefficient
+    /// scan per block is skipped.
+    pub(crate) fn transform_row(&mut self, index: usize, data: &[i16], nonzero: Option<&[u64]>) {
         let component = self.components[index].as_ref().unwrap();
         let quantization_table = self.quantization_tables[index].as_ref().unwrap();
         let block_count =
@@ -105,6 +118,19 @@ impl ImmediateWorker {
         let line_stride = component.block_size.width as usize * component.dct_scale;
 
         assert_eq!(data.len(), block_count * 64);
+        if let Some(nonzero) = nonzero {
+            assert_eq!(nonzero.len(), block_count);
+        }
+        let dc_only_at = |i: usize, coefficients: &[i16; 64]| match nonzero {
+            Some(nonzero) => {
+                debug_assert_eq!(
+                    nonzero[i] == 0,
+                    crate::decode::idct::is_dc_only(coefficients)
+                );
+                nonzero[i] == 0
+            }
+            None => crate::decode::idct::is_dc_only(coefficients),
+        };
 
         // Two horizontally adjacent full blocks can share one AVX2 instruction
         // stream (see `arch::avx2`). Worth pairing only when BOTH need a real
@@ -130,7 +156,7 @@ impl ImmediateWorker {
             let coefficients: &[i16; 64] = data[i * 64..(i + 1) * 64].try_into().unwrap();
 
             crate::prof::bump(crate::prof::Count::DecBlocks, 1);
-            let dc_only = crate::decode::idct::is_dc_only(coefficients);
+            let dc_only = dc_only_at(i, coefficients);
             if dc_only {
                 crate::prof::bump(crate::prof::Count::DecDcOnlyBlocks, 1);
             }
@@ -142,7 +168,7 @@ impl ImmediateWorker {
             if let Some(idct_pair) = pair_idct {
                 if !dc_only && i + 1 < block_count && (i % blocks_wide) + 1 < blocks_wide {
                     let next: &[i16; 64] = data[(i + 1) * 64..(i + 2) * 64].try_into().unwrap();
-                    if !crate::decode::idct::is_dc_only(next) {
+                    if !dc_only_at(i + 1, next) {
                         crate::prof::bump(crate::prof::Count::DecBlocks, 1);
                         crate::prof::bump(crate::prof::Count::DecIdctPairs, 1);
                         let _s = crate::prof::scope(crate::prof::Stage::DecIdct);
@@ -202,11 +228,6 @@ impl ImmediateWorker {
         }
 
         self.offsets[index] += block_count * component.dct_scale * component.dct_scale;
-
-        // This worker consumed the row synchronously, so the buffer is free
-        // now. Keep it for the caller to refill instead of dropping it and
-        // making them allocate + zero a replacement for every MCU row.
-        self.spare = Some(data);
     }
 
     /// Inverse-transform one block straight into the plane.

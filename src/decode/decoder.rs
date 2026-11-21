@@ -1683,6 +1683,32 @@ impl<R: Source> Decoder<R> {
                         * component.vertical_sampling_factor as usize
                         * 64;
 
+                    // A synchronous worker transforms the row where it lies:
+                    // no copy of it, and each block's DC-only test comes from
+                    // its `nonzero` mask instead of a scan of 63 coefficients.
+                    if is_progressive {
+                        if let Some(immediate) = worker.as_immediate() {
+                            let worker_mcu_y = if is_interleaved {
+                                mcu_y
+                            } else {
+                                mcu_y / component.vertical_sampling_factor as u16
+                            };
+                            let offset = worker_mcu_y as usize * coefficients_per_mcu_row;
+                            let component_index = scan.component_indices[i];
+                            let _d = crate::prof::scope(crate::prof::Stage::DecRowDispatch);
+                            immediate.transform_row(
+                                i,
+                                &self.coefficients[component_index]
+                                    [offset..offset + coefficients_per_mcu_row],
+                                Some(
+                                    &self.nonzero[component_index]
+                                        [offset / 64..(offset + coefficients_per_mcu_row) / 64],
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+
                     let row_coefficients = if is_progressive {
                         // Because non-interleaved streams will have multiple MCU rows concatenated together,
                         // the row for calculating the offset is different.
