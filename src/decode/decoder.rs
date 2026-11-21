@@ -1505,6 +1505,23 @@ impl<R: Source> Decoder<R> {
             )
         };
 
+        // Each component's tables, resolved once for the scan. They are fixed
+        // for the whole scan, but were looked up for every MCU -- two double
+        // indirections through the scan's table indices and the table `Vec`s,
+        // each bounds-checked -- and in a progressive AC scan an MCU is ONE
+        // block, so that was per block (~400k times per 2000x1250 decode).
+        let tables: [(Option<&HuffmanTable>, Option<&HuffmanTable>); MAX_COMPONENTS] =
+            core::array::from_fn(|i| {
+                if i < components.len() {
+                    (
+                        self.dc_huffman_tables[scan.dc_table_indices[i]].as_ref(),
+                        self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref(),
+                    )
+                } else {
+                    (None, None)
+                }
+            });
+
         for mcu_y in 0..max_mcu_y {
             if mcu_y * 8 >= frame.image_size.height {
                 break;
@@ -1518,7 +1535,7 @@ impl<R: Source> Decoder<R> {
                 // Checked before the restart below resets the bit reader.
                 if huffman.ran_out() && !insufficient {
                     insufficient = true;
-                    self.segment_ended_early(&huffman)?;
+                    segment_ended_early(&mut self.warnings, &huffman)?;
                 }
                 if !insufficient {
                     last_good_row = mcu_y;
@@ -1566,8 +1583,7 @@ impl<R: Source> Decoder<R> {
                     // re-derived ~49k times per 1080p frame: two double
                     // indirections through the scan's table indices plus an
                     // `Option::as_ref`, and a `Range` clone, per block.
-                    let dc_table = self.dc_huffman_tables[scan.dc_table_indices[i]].as_ref();
-                    let ac_table = self.ac_huffman_tables[scan.ac_table_indices[i]].as_ref();
+                    let (dc_table, ac_table) = tables[i];
                     let spectral_selection = scan.spectral_selection.clone();
                     let blocks_wide = component.block_size.width as usize;
                     let fused = use_fused && finished[i];
@@ -1806,12 +1822,8 @@ impl<R: Source> Decoder<R> {
 
     /// A segment's data ran out before its MCUs did: because the whole stream
     /// ended there, or at a marker that came early.
-    #[cold]
     pub(crate) fn segment_ended_early(&mut self, huffman: &HuffmanDecoder) -> Result<()> {
-        if huffman.hit_end_of_data() {
-            self.warnings.raise(Warning::Truncated)?;
-        }
-        self.warnings.raise(Warning::SegmentEndedEarly)
+        segment_ended_early(&mut self.warnings, huffman)
     }
 
     /// The marker that ends a scan whose MCUs have all been decoded, and the
@@ -1857,6 +1869,16 @@ impl<R: Source> Decoder<R> {
 /// like any other byte.
 ///
 /// `skipped` is set when anything was skipped (libjpeg's `discarded_bytes`).
+/// `Decoder::segment_ended_early` on the warnings alone, for a caller that
+/// holds other borrows of the decoder (the scan loop's tables).
+#[cold]
+fn segment_ended_early(warnings: &mut Warnings, huffman: &HuffmanDecoder) -> Result<()> {
+    if huffman.hit_end_of_data() {
+        warnings.raise(Warning::Truncated)?;
+    }
+    warnings.raise(Warning::SegmentEndedEarly)
+}
+
 fn next_marker<R: Source>(reader: &mut R, skipped: &mut bool) -> Result<Marker> {
     loop {
         while read_u8(reader)? != 0xFF {
