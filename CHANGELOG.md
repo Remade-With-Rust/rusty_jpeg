@@ -18,6 +18,13 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ### Other
 
+- release v0.4.12 ([#35](https://github.com/Remade-With-Rust/rusty_jpeg/pull/35))
+- bump rusty_alloc-api to 2.6.0 ([#36](https://github.com/Remade-With-Rust/rusty_jpeg/pull/36))
+
+## [0.4.12](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.11...v0.4.12) - 2026-11-23
+
+### Other
+
 - bump rusty_alloc-api to 2.6.0 ([#36](https://github.com/Remade-With-Rust/rusty_jpeg/pull/36))
 
 ## [0.4.11](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.10...v0.4.11) - 2026-11-21
