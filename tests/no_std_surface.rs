@@ -369,15 +369,15 @@ fn golden_bytes_are_identical_across_build_arms() {
     #[cfg(not(feature = "simd"))]
     const SCALAR: [u64; 4] = [
         12050974125811034566,
-        6676770829851380247,
-        3819004929965713182,
+        10306082704551533675,
+        16135061612413811335,
         DECODED,
     ];
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     const SIMD_X86_64: [u64; 4] = [
         14979219519507235267,
-        9529290799696629874,
-        9013122496169227150,
+        6006205046085897254,
+        15888096585796694199,
         DECODED,
     ];
     #[cfg(not(feature = "simd"))]

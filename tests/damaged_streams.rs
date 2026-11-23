@@ -460,3 +460,93 @@ fn bad_huffman_codes_cost_one_restart_interval() {
         );
     }
 }
+
+/// Whole bytes of entropy data that no MCU used, before the next marker:
+/// libjpeg-turbo warns "extraneous bytes before marker" and decodes on. Two
+/// stray bytes are still inside the bit reader's accumulator when the scan or
+/// restart interval ends, so this is the `unread_bytes` check, not the marker
+/// search that follows it.
+#[test]
+fn extraneous_bytes_before_marker_warn() {
+    for dri in [0u16, 4] {
+        for l in layouts(dri) {
+            let clean = l.decode(&l.clean());
+            let mut segs = l.segs.clone();
+            // The only segment, or one in the middle (ended by an RST).
+            let at = if dri == 0 { 0 } else { 20 };
+            segs[at].extend_from_slice(&[0x12, 0x34]);
+            let data = assemble(&l.hdr, &segs, rst);
+            assert_eq!(l.decode(&data), clean, "ncomp={} dri={dri}", l.ncomp);
+
+            for single in [true, false] {
+                let mut d = Decoder::new(&data[..]);
+                d.set_single_threaded(single);
+                d.decode().unwrap();
+                assert_eq!(d.warnings(), [Warning::ExtraneousBytes], "dri={dri}");
+
+                let mut d = Decoder::new(&data[..]);
+                d.set_single_threaded(single);
+                d.set_strict(true);
+                assert!(d.decode().is_err(), "strict, dri={dri}");
+            }
+        }
+    }
+}
+
+/// In an AC refinement scan a newly non-zero coefficient always has size 1.
+/// libjpeg-turbo warns "bad Huffman code" about any other size and reads it
+/// as 1 (`decode_mcu_AC_refine`); strict mode refuses the image.
+#[test]
+fn refinement_coefficient_of_size_two_is_a_bad_code() {
+    // AC table: `0` is EOB, `1` is run 0 / size 2.
+    const BITS: [u8; 16] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    const VALS: [u8; 2] = [0x00, 0x02];
+    let mut dht = vec![0x00];
+    dht.extend_from_slice(&DC_BITS);
+    dht.extend_from_slice(&DC_VALS);
+    dht.push(0x10);
+    dht.extend_from_slice(&BITS);
+    dht.extend_from_slice(&VALS);
+
+    let blocks = 4;
+    let mut data = frame_with(0xC2, 16, 16, 1, 0, &dqt8(&qtable()), &dht);
+    // DC first scan, then an AC first scan at Al=1 that leaves every band empty.
+    data.extend(scan_header(&[1], 0, 0, 0x00));
+    let mut bw = BitWriter::new();
+    for _ in 0..blocks {
+        put_diff(&mut bw, 0);
+    }
+    data.extend(bw.finish());
+    data.extend(scan_header(&[1], 1, 63, 0x01));
+    let mut bw = BitWriter::new();
+    for _ in 0..blocks {
+        bw.put(0, 1); // EOB
+    }
+    data.extend(bw.finish());
+    // AC refinement (Ah=1, Al=0): each block gets a new coefficient coded
+    // with size 2, then EOB.
+    data.extend(scan_header(&[1], 1, 63, 0x10));
+    let mut bw = BitWriter::new();
+    for _ in 0..blocks {
+        bw.put(1, 1); // run 0 / size 2
+        bw.put(1, 1); // sign: positive
+        bw.put(0, 1); // EOB
+    }
+    data.extend(bw.finish());
+    data.extend_from_slice(&[0xFF, 0xD9]);
+
+    for single in [true, false] {
+        let mut d = Decoder::new(&data[..]);
+        d.set_single_threaded(single);
+        d.decode().unwrap();
+        assert_eq!(d.warnings(), [Warning::BadHuffmanCode]);
+
+        let mut d = Decoder::new(&data[..]);
+        d.set_single_threaded(single);
+        d.set_strict(true);
+        match d.decode() {
+            Err(Error::Format(m)) => assert!(m.contains("huffman"), "{m}"),
+            other => panic!("strict: {:?}", other.map(|px| px.len())),
+        }
+    }
+}

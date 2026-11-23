@@ -633,3 +633,18 @@ mod tests {
         }
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::far_row;
+
+    /// The far row is always inside the plane and adjacent to the near row.
+    #[kani::proof]
+    fn far_row_in_bounds() {
+        let h: usize = kani::any_where(|h| (1..=u16::MAX as usize).contains(h));
+        let row: usize = kani::any_where(|r| *r < 2 * h);
+        let f = far_row(row, h);
+        assert!(f < h);
+        assert!(f.abs_diff((row / 2).min(h - 1)) <= 1);
+    }
+}

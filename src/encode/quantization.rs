@@ -35,7 +35,10 @@ pub enum QuantizationTableType {
     /// An improved detection model for DCT coefficient quantization (1993) Peterson, Ahumada and Watson
     ImprovedDetectionModel,
 
-    /// A user supplied quantization table
+    /// A user supplied quantization table, in natural (row-major) order.
+    ///
+    /// Values are clamped to `1..=255`: the DQT segment is written with 8-bit
+    /// precision, which is what baseline JPEG requires for 8-bit samples.
     Custom(Box<[u16; 64]>),
 }
 
@@ -182,35 +185,46 @@ static DEFAULT_CHROMA_TABLES: [[u16; 64]; 9] = [
     ],
 ];
 
-const SHIFT: u32 = 2 * 8 - 1;
-
-fn compute_reciprocal(divisor: u32) -> (i32, i32) {
+/// Reciprocal, rounding correction and right shift for one divisor, after
+/// libjpeg-turbo's `compute_reciprocal`: `((|v| + c) * r) >> s` equals
+/// round-half-up `|v| / d` for every `|v| <= 32768`.
+///
+/// The shift scales with the divisor (`16 + floor(log2 d)`), so the reciprocal
+/// always keeps 16 significant bits. A fixed 15-bit shift left large divisors
+/// with only a few bits and was off by one on ~1-3% of real coefficients
+/// (`reciprocal_equals_rounded_division`). The product reaches ~2^31.01 for
+/// the largest divisor, so it is computed in `u32`, never `i32`.
+fn compute_reciprocal(divisor: u32) -> (u32, u32, u32) {
     if divisor <= 1 {
-        return (1, 0);
+        return (1, 0, 0);
     }
 
-    let mut reciprocals = (1 << SHIFT) / divisor;
-    let fractional = (1 << SHIFT) % divisor;
+    let mut shift = 16 + divisor.ilog2();
+    let mut reciprocal = (1u32 << shift) / divisor;
+    let fractional = (1u32 << shift) % divisor;
 
     // Correction for rounding errors in division
     let mut correction = divisor / 2;
 
-    if fractional != 0 {
-        if fractional <= correction {
-            correction += 1;
-        } else {
-            reciprocals += 1;
-        }
+    if fractional == 0 {
+        // Power of two: the reciprocal is exact; keep it within 16 bits.
+        reciprocal >>= 1;
+        shift -= 1;
+    } else if fractional <= correction {
+        correction += 1;
+    } else {
+        reciprocal += 1;
     }
 
-    (reciprocals as i32, correction as i32)
+    (reciprocal, correction, shift)
 }
 
 pub struct QuantizationTable {
     table: [NonZeroU16; 64],
-    reciprocals: [i32; 64],
-    corrections: [i32; 64],
-    /// `reciprocals` / `corrections` pre-permuted into **zig-zag order**.
+    reciprocals: [u32; 64],
+    corrections: [u32; 64],
+    shifts: [u32; 64],
+    /// `reciprocals` / `corrections` / `shifts` pre-permuted into **zig-zag order**.
     ///
     /// The quantize loop runs `q[i] = f(block[ZIGZAG[i]], recip[ZIGZAG[i]],
     /// corr[ZIGZAG[i]])`, i.e. three permuted reads per coefficient. Two of
@@ -218,8 +232,9 @@ pub struct QuantizationTable {
     /// permutation can be applied once at table-build time instead of 64 times
     /// per block — 174M redundant index computations for one 4K frame. Only the
     /// read of `block` genuinely has to be permuted.
-    reciprocals_zz: [i32; 64],
-    corrections_zz: [i32; 64],
+    reciprocals_zz: [u32; 64],
+    corrections_zz: [u32; 64],
+    shifts_zz: [u32; 64],
 }
 
 impl QuantizationTable {
@@ -240,37 +255,44 @@ impl QuantizationTable {
             }
         };
 
-        let mut reciprocals = [0i32; 64];
-        let mut corrections = [0i32; 64];
+        let mut reciprocals = [0u32; 64];
+        let mut corrections = [0u32; 64];
+        let mut shifts = [0u32; 64];
 
         for i in 0..64 {
-            let (reciprocal, correction) = compute_reciprocal(table[i].get() as u32);
+            let (reciprocal, correction, shift) = compute_reciprocal(table[i].get() as u32);
 
             reciprocals[i] = reciprocal;
             corrections[i] = correction;
+            shifts[i] = shift;
         }
 
-        let mut reciprocals_zz = [0i32; 64];
-        let mut corrections_zz = [0i32; 64];
+        let mut reciprocals_zz = [0u32; 64];
+        let mut corrections_zz = [0u32; 64];
+        let mut shifts_zz = [0u32; 64];
         for i in 0..64 {
             let z = crate::encode::writer::ZIGZAG[i] as usize & 0x3f;
             reciprocals_zz[i] = reciprocals[z];
             corrections_zz[i] = corrections[z];
+            shifts_zz[i] = shifts[z];
         }
 
         QuantizationTable {
             table,
             reciprocals,
             corrections,
+            shifts,
             reciprocals_zz,
             corrections_zz,
+            shifts_zz,
         }
     }
 
     fn get_user_table(table: &[u16; 64]) -> [NonZeroU16; 64] {
         let mut q_table = [NonZeroU16::new(1).unwrap(); 64];
         for (i, &v) in table.iter().enumerate() {
-            q_table[i] = match NonZeroU16::new(v.clamp(1, 2 << 10) << 3) {
+            // 8-bit DQT: a larger value would be written truncated.
+            q_table[i] = match NonZeroU16::new(v.clamp(1, 255) << 3) {
                 Some(v) => v,
                 None => panic!("Invalid quantization table value: {}", v),
             };
@@ -333,8 +355,8 @@ impl QuantizationTable {
 
         let abs_value = value.abs();
 
-        let mut product = (abs_value + corrections) * reciprocal;
-        product >>= SHIFT;
+        let mut product =
+            (((abs_value as u32 + corrections) * reciprocal) >> self.shifts[index]) as i32;
 
         if value != abs_value {
             product *= -1;
@@ -358,8 +380,8 @@ impl QuantizationTable {
 
         let abs_value = value.abs();
 
-        let mut product = (abs_value + corrections) * reciprocal;
-        product >>= SHIFT;
+        let mut product =
+            (((abs_value as u32 + corrections) * reciprocal) >> self.shifts_zz[i]) as i32;
 
         if value != abs_value {
             product *= -1;
@@ -389,7 +411,8 @@ impl QuantizationTable {
         let corrections = self.corrections[index];
         let sign = value >> 31;
         let abs_value = (value ^ sign) - sign;
-        let product = ((abs_value + corrections) * reciprocal) >> SHIFT;
+        let product =
+            (((abs_value as u32 + corrections) * reciprocal) >> self.shifts[index]) as i32;
         ((product ^ sign) - sign) as i16
     }
 }
@@ -519,7 +542,7 @@ mod avx2_precondition_tests {
     use crate::encode::quantization::{QuantizationTable, QuantizationTableType};
 
     /// `_mm256_sign_epi32(q, v)` returns **0** when `v == 0`, whereas the scalar
-    /// path returns `((0 + correction) * reciprocal) >> SHIFT` and never negates.
+    /// path returns `((0 + correction) * reciprocal) >> shift` and never negates.
     /// The two agree only if that expression is 0 at every table position.
     ///
     /// If this ever fails, the AVX2 kernel must special-case zero rather than
@@ -602,7 +625,7 @@ mod avx2_precondition_tests {
 
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
 pub(crate) mod avx2 {
-    use super::{QuantizationTable, SHIFT};
+    use super::QuantizationTable;
     use crate::encode::writer::ZIGZAG;
 
     /// AVX2 twin of [`quantize_block_scalar`](super::quantize_block_scalar).
@@ -613,15 +636,15 @@ pub(crate) mod avx2 {
     /// assumed:
     ///
     /// - `_mm256_sign_epi32(q, v)` yields 0 when `v == 0`, while the scalar path
-    ///   computes `((0 + corr) * recip) >> SHIFT`. Those agree because that
+    ///   computes `((0 + corr) * recip) >> shift`. Those agree because that
     ///   expression is 0 at every position of every shipped table
     ///   (`zero_coefficient_quantizes_to_zero`).
     /// - `_mm256_packs_epi32` **saturates** where `product as i16` truncates.
     ///   They agree because quantized magnitudes stay inside i16
     ///   (`quantized_magnitude_stays_in_i16`).
-    /// - `(abs + corr) * recip` cannot overflow i32: `abs <= 32767` and
-    ///   `recip = 32768 / divisor <= 4096` (divisors are stored pre-shifted, so
-    ///   the smallest is 8), giving at most ~1.34e8.
+    /// - `(abs + corr) * recip` fits in **u32** (at most ~2^31.01, so not in
+    ///   i32): `mullo_epi32` keeps the low 32 bits, which are the exact
+    ///   unsigned product, and `srlv_epi32` shifts it logically per lane.
     ///
     /// # Safety
     /// Caller must have verified AVX2 is available. All accesses are to
@@ -642,6 +665,7 @@ pub(crate) mod avx2 {
         let mut tmp = [0i16; 64];
         let recip = table.reciprocals.as_ptr();
         let corr = table.corrections.as_ptr();
+        let shift = table.shifts.as_ptr();
         let src = block.as_ptr();
 
         for c in 0..4 {
@@ -651,21 +675,27 @@ pub(crate) mod avx2 {
             let v_lo = _mm256_cvtepi16_epi32(_mm_loadu_si128(src.add(base) as *const __m128i));
             let v_hi = _mm256_cvtepi16_epi32(_mm_loadu_si128(src.add(base + 8) as *const __m128i));
 
-            // ((|v| + correction) * reciprocal) >> SHIFT
-            let q_lo = _mm256_srli_epi32::<{ SHIFT as i32 }>(_mm256_mullo_epi32(
-                _mm256_add_epi32(
-                    _mm256_abs_epi32(v_lo),
-                    _mm256_loadu_si256(corr.add(base) as *const __m256i),
+            // ((|v| + correction) * reciprocal) >> shift, unsigned.
+            let q_lo = _mm256_srlv_epi32(
+                _mm256_mullo_epi32(
+                    _mm256_add_epi32(
+                        _mm256_abs_epi32(v_lo),
+                        _mm256_loadu_si256(corr.add(base) as *const __m256i),
+                    ),
+                    _mm256_loadu_si256(recip.add(base) as *const __m256i),
                 ),
-                _mm256_loadu_si256(recip.add(base) as *const __m256i),
-            ));
-            let q_hi = _mm256_srli_epi32::<{ SHIFT as i32 }>(_mm256_mullo_epi32(
-                _mm256_add_epi32(
-                    _mm256_abs_epi32(v_hi),
-                    _mm256_loadu_si256(corr.add(base + 8) as *const __m256i),
+                _mm256_loadu_si256(shift.add(base) as *const __m256i),
+            );
+            let q_hi = _mm256_srlv_epi32(
+                _mm256_mullo_epi32(
+                    _mm256_add_epi32(
+                        _mm256_abs_epi32(v_hi),
+                        _mm256_loadu_si256(corr.add(base + 8) as *const __m256i),
+                    ),
+                    _mm256_loadu_si256(recip.add(base + 8) as *const __m256i),
                 ),
-                _mm256_loadu_si256(recip.add(base + 8) as *const __m256i),
-            ));
+                _mm256_loadu_si256(shift.add(base + 8) as *const __m256i),
+            );
 
             // Restore the original sign (and zero where the input was zero).
             let s_lo = _mm256_sign_epi32(q_lo, v_lo);
@@ -757,20 +787,20 @@ mod avx2_kernel_tests {
 
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 pub(crate) mod neon {
-    use super::{QuantizationTable, SHIFT};
+    use super::QuantizationTable;
     use crate::encode::writer::ZIGZAG;
 
     /// NEON mirror of [`super::avx2::quantize_block_avx2`].
     ///
     /// Same arithmetic in the same order, 128-bit registers instead of 256:
     /// widen i16 -> i32, `|v| + correction`, multiply by the reciprocal, shift
-    /// by `SHIFT`, re-apply the sign, saturating-narrow back to i16, then the
+    /// by the per-position shift, re-apply the sign, saturating-narrow back to i16, then the
     /// same zig-zag gather.
     ///
     /// The sign step needs no special case for `v == 0`. AVX2's `sign_epi32`
     /// forces the result to zero there and this does not — but at `v == 0` the
     /// quantized magnitude is already zero (`correction` is about `divisor / 2`
-    /// and `reciprocal` about `2^SHIFT / divisor`, so their product shifts down
+    /// and `reciprocal` about `2^shift / divisor`, so their product shifts down
     /// to 0), and negating zero is zero. The two agree.
     ///
     /// **Not executed on the machine this was written on**, which is x86 only.
@@ -792,6 +822,7 @@ pub(crate) mod neon {
         let mut tmp = [0i16; 64];
         let recip = table.reciprocals.as_ptr();
         let corr = table.corrections.as_ptr();
+        let shift = table.shifts.as_ptr();
         let src = block.as_ptr();
 
         for c in 0..8 {
@@ -801,13 +832,27 @@ pub(crate) mod neon {
             let v_lo = vmovl_s16(vget_low_s16(v));
             let v_hi = vmovl_high_s16(v);
 
-            let q_lo = vshrq_n_s32::<{ SHIFT as i32 }>(vmulq_s32(
-                vaddq_s32(vabsq_s32(v_lo), vld1q_s32(corr.add(base))),
-                vld1q_s32(recip.add(base)),
+            // Unsigned: the product can exceed i32::MAX. `vshlq_u32` shifts
+            // right by a negative count.
+            let q_lo = vreinterpretq_s32_u32(vshlq_u32(
+                vmulq_u32(
+                    vaddq_u32(
+                        vreinterpretq_u32_s32(vabsq_s32(v_lo)),
+                        vld1q_u32(corr.add(base)),
+                    ),
+                    vld1q_u32(recip.add(base)),
+                ),
+                vnegq_s32(vreinterpretq_s32_u32(vld1q_u32(shift.add(base)))),
             ));
-            let q_hi = vshrq_n_s32::<{ SHIFT as i32 }>(vmulq_s32(
-                vaddq_s32(vabsq_s32(v_hi), vld1q_s32(corr.add(base + 4))),
-                vld1q_s32(recip.add(base + 4)),
+            let q_hi = vreinterpretq_s32_u32(vshlq_u32(
+                vmulq_u32(
+                    vaddq_u32(
+                        vreinterpretq_u32_s32(vabsq_s32(v_hi)),
+                        vld1q_u32(corr.add(base + 4)),
+                    ),
+                    vld1q_u32(recip.add(base + 4)),
+                ),
+                vnegq_s32(vreinterpretq_s32_u32(vld1q_u32(shift.add(base + 4)))),
             ));
 
             let s_lo = vbslq_s32(vcltzq_s32(v_lo), vnegq_s32(q_lo), q_lo);
@@ -875,5 +920,61 @@ pub(crate) mod neon {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod custom_table_tests {
+    use crate::encode::quantization::{QuantizationTable, QuantizationTableType};
+    use alloc::boxed::Box;
+
+    /// The DQT byte written for a position must be the divisor actually used
+    /// (in table units). The DQT segment is 8-bit, so `Custom` values above
+    /// 255 must be clamped, not truncated.
+    #[test]
+    fn custom_dqt_value_matches_divisor() {
+        for v in [1u16, 255, 256, 300, 2048] {
+            let t = QuantizationTable::new_with_quality(
+                &QuantizationTableType::Custom(Box::new([v; 64])),
+                75,
+                true,
+            );
+            assert_eq!(
+                t.get(0) as u16,
+                t.divisor(0) >> 3,
+                "custom value {v}: DQT byte disagrees with divisor"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reciprocal_tests {
+    use super::compute_reciprocal;
+
+    /// Every divisor a table can hold (`v << 3`, v in 1..=255) against every
+    /// `i16`: the reciprocal quantizer must equal round-half-up `|v| / d`
+    /// with the sign restored, and its `u32` product must not overflow.
+    #[test]
+    fn reciprocal_equals_rounded_division() {
+        let mut bad = 0u64;
+        let mut first = None;
+        for t in 1u32..=255 {
+            let d = t << 3;
+            let (r, c, s) = compute_reciprocal(d);
+            for v in i16::MIN..=i16::MAX {
+                let a = v.unsigned_abs() as u32;
+                let q = (a + c).checked_mul(r).expect("u32 overflow") >> s;
+                let want = (a + d / 2) / d;
+                if q != want {
+                    bad += 1;
+                    first.get_or_insert((d, v, q, want));
+                }
+            }
+        }
+        assert_eq!(
+            bad, 0,
+            "{bad} mismatches, first (d, v, got, want) = {first:?}"
+        );
     }
 }

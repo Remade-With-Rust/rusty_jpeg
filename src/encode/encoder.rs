@@ -222,6 +222,11 @@ pub struct Encoder<W: JfifWrite> {
     components: Vec<Component>,
     quantization_tables: [QuantizationTableType; 2],
     huffman_tables: [(HuffmanTable, HuffmanTable); 2],
+    /// AC tables trellis estimates rate with: the defaults, fixed for the
+    /// whole encode. `huffman_tables` is replaced between the streaming
+    /// optimize passes, and trellis must truncate identically in both passes
+    /// or the counted histogram no longer matches the written symbols.
+    trellis_rate_tables: [HuffmanTable; 2],
 
     sampling_factor: SamplingFactor,
 
@@ -276,6 +281,10 @@ impl<W: JfifWrite> Encoder<W> {
             components: vec![],
             quantization_tables,
             huffman_tables,
+            trellis_rate_tables: [
+                HuffmanTable::default_luma_ac(),
+                HuffmanTable::default_chroma_ac(),
+            ],
             sampling_factor,
             progressive_scans: None,
             restart_interval: None,
@@ -942,7 +951,7 @@ impl<W: JfifWrite> Encoder<W> {
                                     &block,
                                     &mut q_block,
                                     &q_tables[component.quantization_table as usize],
-                                    &self.huffman_tables[component.ac_huffman_table as usize].1,
+                                    &self.trellis_rate_tables[component.ac_huffman_table as usize],
                                 );
                             }
 
@@ -1441,7 +1450,7 @@ impl<W: JfifWrite> Encoder<W> {
                     // Rate-distortion pass over the quantized block. It needs
                     // BOTH the pre-quantization coefficients and the quantized
                     // ones, so here is the only place it can run.
-                    let ac = &self.huffman_tables[component.ac_huffman_table as usize].1;
+                    let ac = &self.trellis_rate_tables[component.ac_huffman_table as usize];
                     if self.push_blocks {
                         let mut q_block = [0i16; 64];
                         {
@@ -1556,6 +1565,7 @@ impl<W: JfifWrite> Encoder<W> {
         let max_tables = self.components.len().min(2) as u8;
 
         for table in 0..max_tables {
+            // u32 counts: see the overflow note on `HuffmanStats`.
             let mut dc_freq = [0u32; 257];
             dc_freq[256] = 1;
             let mut ac_freq = [0u32; 257];
@@ -1698,6 +1708,14 @@ impl Encoder<BufWriter<File>> {
 
 /// Huffman symbol frequencies for the (at most two) table slots a baseline
 /// JPEG uses. Index 256 is reserved by the table builder.
+///
+/// shortcut: one symbol's count can exceed `u32::MAX` (debug panic, release
+/// wrap to a wrong or missing code) once a table sees more than ~68M blocks
+/// that each emit it 63 times. Only the chroma slot of a 4:4:4 color image
+/// gets there (Cb + Cr share it, so ~46,700x46,700 px and up). Widen to `u64`
+/// here, in `optimize_huffman_table` and in `JfifWriter::count_block`
+/// (`HuffmanTable::new_optimized` sums in `u64` already) if such images
+/// become a target.
 struct HuffmanStats {
     dc: [[u32; 257]; 2],
     ac: [[u32; 257]; 2],

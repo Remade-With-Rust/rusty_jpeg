@@ -771,3 +771,25 @@ fn ac_present_does_not_take_the_shortcut() {
         );
     }
 }
+
+#[cfg(kani)]
+mod proofs {
+    use super::choose_idct_size;
+    use crate::decode::parser::Dimensions;
+
+    /// For any frame the parser accepts (non-zero sides) and any request,
+    /// the scale is one of the four IDCT sizes and nothing overflows.
+    #[kani::proof]
+    fn choose_idct_size_total() {
+        let full = Dimensions {
+            width: kani::any_where(|w: &u16| *w > 0),
+            height: kani::any_where(|h: &u16| *h > 0),
+        };
+        let req = Dimensions {
+            width: kani::any(),
+            height: kani::any(),
+        };
+        let s = choose_idct_size(full, req);
+        assert!(matches!(s, 1 | 2 | 4 | 8));
+    }
+}
