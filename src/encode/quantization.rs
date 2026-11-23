@@ -877,3 +877,60 @@ pub(crate) mod neon {
         }
     }
 }
+
+#[cfg(test)]
+mod custom_table_tests {
+    use crate::encode::quantization::{QuantizationTable, QuantizationTableType};
+    use alloc::boxed::Box;
+
+    /// The DQT byte written for a position must be the divisor actually used
+    /// (in table units). `Custom` accepts values up to 2048, the 8-bit DQT
+    /// segment holds at most 255.
+    #[test]
+    fn custom_dqt_value_matches_divisor() {
+        for v in [1u16, 255, 256, 300, 2048] {
+            let t = QuantizationTable::new_with_quality(
+                &QuantizationTableType::Custom(Box::new([v; 64])),
+                75,
+                true,
+            );
+            assert_eq!(
+                t.get(0) as u16,
+                t.divisor(0) >> 3,
+                "custom value {v}: DQT byte disagrees with divisor"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod reciprocal_tests {
+    use super::{compute_reciprocal, SHIFT};
+
+    /// Every divisor `Custom`/quality tables can produce (`v << 3`, v in
+    /// 1..=2048) against every `i16`: the reciprocal quantizer must equal
+    /// round-half-up `|v| / d` with the sign restored, and never overflow.
+    #[test]
+    fn reciprocal_equals_rounded_division() {
+        let mut bad = 0u64;
+        let mut first = None;
+        for t in 1u32..=2048 {
+            let d = t << 3;
+            let (r, c) = compute_reciprocal(d);
+            for v in i16::MIN..=i16::MAX {
+                let a = i32::from(v).abs();
+                let q = (a.checked_add(c).and_then(|x| x.checked_mul(r))).expect("i32 overflow")
+                    >> SHIFT;
+                let want = (a + d as i32 / 2) / d as i32;
+                if q != want {
+                    bad += 1;
+                    first.get_or_insert((d, v, q, want));
+                }
+            }
+        }
+        assert_eq!(
+            bad, 0,
+            "{bad} mismatches, first (d, v, got, want) = {first:?}"
+        );
+    }
+}
