@@ -14,6 +14,23 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ## [Unreleased]
 
+## [0.4.13](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.12...v0.4.13) - 2026-11-23
+
+### Fixed
+
+- *(encode)* exact rounding in the reciprocal quantizer
+- *(encode)* build optimized Huffman tables for any code depth
+- *(encode)* clamp custom quantization values to the 8-bit DQT range
+- *(encode)* rate trellis against fixed tables across streaming passes
+
+### Other
+
+- *(decode)* cover the extraneous-bytes and refinement bad-code warnings
+- *(changes)* record the four encoder fixes and their upstream status
+- *(encode)* note where Huffman symbol counters can overflow
+- add property tests that pin four encoder defects
+- add Kani proofs for entropy and geometry arithmetic
+
 ## [0.4.12](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.11...v0.4.12) - 2026-11-23
 
 ### Other
