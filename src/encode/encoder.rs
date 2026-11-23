@@ -222,6 +222,11 @@ pub struct Encoder<W: JfifWrite> {
     components: Vec<Component>,
     quantization_tables: [QuantizationTableType; 2],
     huffman_tables: [(HuffmanTable, HuffmanTable); 2],
+    /// AC tables trellis estimates rate with: the defaults, fixed for the
+    /// whole encode. `huffman_tables` is replaced between the streaming
+    /// optimize passes, and trellis must truncate identically in both passes
+    /// or the counted histogram no longer matches the written symbols.
+    trellis_rate_tables: [HuffmanTable; 2],
 
     sampling_factor: SamplingFactor,
 
@@ -276,6 +281,10 @@ impl<W: JfifWrite> Encoder<W> {
             components: vec![],
             quantization_tables,
             huffman_tables,
+            trellis_rate_tables: [
+                HuffmanTable::default_luma_ac(),
+                HuffmanTable::default_chroma_ac(),
+            ],
             sampling_factor,
             progressive_scans: None,
             restart_interval: None,
@@ -942,7 +951,7 @@ impl<W: JfifWrite> Encoder<W> {
                                     &block,
                                     &mut q_block,
                                     &q_tables[component.quantization_table as usize],
-                                    &self.huffman_tables[component.ac_huffman_table as usize].1,
+                                    &self.trellis_rate_tables[component.ac_huffman_table as usize],
                                 );
                             }
 
@@ -1441,7 +1450,7 @@ impl<W: JfifWrite> Encoder<W> {
                     // Rate-distortion pass over the quantized block. It needs
                     // BOTH the pre-quantization coefficients and the quantized
                     // ones, so here is the only place it can run.
-                    let ac = &self.huffman_tables[component.ac_huffman_table as usize].1;
+                    let ac = &self.trellis_rate_tables[component.ac_huffman_table as usize];
                     if self.push_blocks {
                         let mut q_block = [0i16; 64];
                         {
