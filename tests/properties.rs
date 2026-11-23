@@ -163,9 +163,9 @@ proptest! {
     }
 }
 
-/// `QuantizationTableType::Custom` takes `u16` values and clamps to 2048, but
-/// the DQT segment is written with 8-bit precision, so the file must not
-/// declare a different table than the one the encoder quantized with.
+/// `QuantizationTableType::Custom` takes `u16` values, but the DQT segment is
+/// written with 8-bit precision: values above 255 must clamp to 255, never
+/// truncate, so the file declares the table the encoder quantized with.
 #[test]
 fn custom_table_dqt_matches_request() {
     let px = vec![128u8; 16 * 16];
@@ -193,7 +193,11 @@ fn custom_table_dqt_matches_request() {
         } else {
             u16::from_be_bytes([jpg[at + 5], jpg[at + 6]])
         };
-        assert_eq!(q0, v, "custom value {v} written to DQT as {q0} (Pq={pq})");
+        assert_eq!(
+            q0,
+            v.min(255),
+            "custom value {v} written to DQT as {q0} (Pq={pq})"
+        );
     }
 }
 

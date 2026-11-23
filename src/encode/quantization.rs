@@ -35,7 +35,10 @@ pub enum QuantizationTableType {
     /// An improved detection model for DCT coefficient quantization (1993) Peterson, Ahumada and Watson
     ImprovedDetectionModel,
 
-    /// A user supplied quantization table
+    /// A user supplied quantization table, in natural (row-major) order.
+    ///
+    /// Values are clamped to `1..=255`: the DQT segment is written with 8-bit
+    /// precision, which is what baseline JPEG requires for 8-bit samples.
     Custom(Box<[u16; 64]>),
 }
 
@@ -270,7 +273,8 @@ impl QuantizationTable {
     fn get_user_table(table: &[u16; 64]) -> [NonZeroU16; 64] {
         let mut q_table = [NonZeroU16::new(1).unwrap(); 64];
         for (i, &v) in table.iter().enumerate() {
-            q_table[i] = match NonZeroU16::new(v.clamp(1, 2 << 10) << 3) {
+            // 8-bit DQT: a larger value would be written truncated.
+            q_table[i] = match NonZeroU16::new(v.clamp(1, 255) << 3) {
                 Some(v) => v,
                 None => panic!("Invalid quantization table value: {}", v),
             };
@@ -884,8 +888,8 @@ mod custom_table_tests {
     use alloc::boxed::Box;
 
     /// The DQT byte written for a position must be the divisor actually used
-    /// (in table units). `Custom` accepts values up to 2048, the 8-bit DQT
-    /// segment holds at most 255.
+    /// (in table units). The DQT segment is 8-bit, so `Custom` values above
+    /// 255 must be clamped, not truncated.
     #[test]
     fn custom_dqt_value_matches_divisor() {
         for v in [1u16, 255, 256, 300, 2048] {
