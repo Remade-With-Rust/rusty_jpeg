@@ -20,6 +20,8 @@ mod neon;
 mod quantization;
 mod trellis;
 mod writer;
+#[cfg(kani)]
+pub(crate) use writer::get_code;
 
 pub use encoder::{ColorType, Encoder, JpegColorType, SamplingFactor};
 pub use error::EncodingError;

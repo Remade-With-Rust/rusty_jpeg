@@ -766,3 +766,44 @@ pub fn fill_default_mjpeg_tables(
         );
     }
 }
+
+/// Kani proofs for the magnitude-category arithmetic shared by the decoder's
+/// `extend` and the encoder's `get_code`.
+#[cfg(kani)]
+mod proofs {
+    use super::extend;
+
+    /// `extend` is total and matches T.81 F.2.2.1 for every category the
+    /// decoder can pass (1..=15) and every `count`-bit value.
+    #[kani::proof]
+    fn extend_matches_spec() {
+        let count: u8 = kani::any_where(|c| (1..=15).contains(c));
+        let value: u16 = kani::any_where(|v| u32::from(*v) < 1u32 << count);
+        let got = i32::from(extend(value, count));
+        let want = if u32::from(value) < 1u32 << (count - 1) {
+            i32::from(value) - (1i32 << count) + 1
+        } else {
+            i32::from(value)
+        };
+        assert_eq!(got, want);
+    }
+
+    /// Encoder/decoder agreement: `extend(get_code(v)) == v` for every
+    /// nonzero `|v| < 2^14`. At `|v| >= 2^14` (category 15) `get_code`'s
+    /// `(1i16 << 15) - 1` overflows; the encoder never gets there for 8-bit
+    /// samples (categories stop at 11), so the bound is the reachable range.
+    #[kani::proof]
+    fn get_code_extend_roundtrip() {
+        let v: i16 = kani::any_where(|v: &i16| *v != 0 && v.unsigned_abs() < 1 << 14);
+        let (size, bits) = crate::encode::get_code(v);
+        assert!((1..=15).contains(&size));
+        assert!(u32::from(bits) < 1u32 << size);
+        assert_eq!(extend(bits, size), v);
+    }
+
+    /// `get_code(0)` is category 0, as DC/AC coding requires.
+    #[kani::proof]
+    fn get_code_zero() {
+        assert_eq!(crate::encode::get_code(0).0, 0);
+    }
+}

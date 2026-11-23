@@ -84,3 +84,7 @@ required-features = ["std"]
 [[example]]
 name = "scanmode"
 required-features = ["std"]
+
+[lints.rust]
+# `cargo kani` sets `cfg(kani)` for the proof harnesses.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
