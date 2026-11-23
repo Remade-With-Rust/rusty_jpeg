@@ -6,6 +6,34 @@ upstream possible.
 
 ## Unreleased
 
+- **Four encoder defects, found by new property tests and Kani proofs.**
+  `tests/properties.rs` and in-crate proptests check the encode -> decode
+  round trip and Huffman table construction against real oracles; Kani
+  harnesses (`cargo kani --lib --no-default-features`) prove `extend` /
+  `get_code`, `choose_idct_size` and `far_row`. Items marked *upstream* are
+  also present in `jpeg-encoder` 0.7.1 and are being sent there.
+  - **Trellis + optimized tables + streaming optimize corrupted output.**
+    Pass 1 trellised against the default Huffman tables, pass 2 against the
+    optimized ones, so pass 2 wrote symbols with no code: a debug panic, and in
+    release a file that decodes `Ok` with MAE ~75-100 instead of ~18. Trellis
+    now always rates against the default AC tables (`trellis_rate_tables`).
+    Local only: upstream has neither trellis nor streaming optimize.
+  - *Upstream:* **`QuantizationTableType::Custom` clamps to 1..=255**, not
+    2048. The DQT segment is 8-bit, so 256 was declared as 0 and 300 as 44
+    while the encoder quantized with the real value.
+  - *Upstream:* **`HuffmanTable::new_optimized` builds tables of any depth.**
+    K.2-K.4 size the length histogram at 33 and sort sizes 1..=32; skewed
+    counts (33 symbols, ~18.5M total) go deeper and indexed past `bits[33]`.
+    Counts now also merge in `u64`.
+  - *Upstream:* **Exact reciprocal quantizer.** The fixed 15-bit shift was off
+    by one on ~1-3% of real coefficients; it now uses libjpeg-turbo's
+    per-divisor shift (`16 + floor(log2 d)`), in `u32`, in the scalar, AVX2
+    and NEON kernels. Output bytes change; size within ±0.05%, PSNR within
+    0.003 dB on 4K photos.
+  - Known limit, documented at the counting sites: per-symbol Huffman counts
+    are `u32` and can overflow on 4:4:4 colour images of ~46,700x46,700 px
+    and up.
+
 - **Files that end early decode, as libjpeg-turbo decodes them** (#28 item 5;
   the follow-up on #29). A download cut short or a crashed write used to be
   refused with "unexpected end of JPEG data" -- even a file missing only its
