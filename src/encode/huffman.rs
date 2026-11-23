@@ -102,7 +102,9 @@ impl HuffmanTable {
 
     /// Generates an optimized huffman table as described in Section K.2
     #[allow(clippy::needless_range_loop)]
-    pub fn new_optimized(mut freq: [u32; 257]) -> HuffmanTable {
+    pub fn new_optimized(freq: [u32; 257]) -> HuffmanTable {
+        // Merged counts are sums of counts; u64 so they cannot wrap.
+        let mut freq = freq.map(u64::from);
         let mut others = [-1i32; 257];
         let mut codesize = [0usize; 257];
 
@@ -110,7 +112,7 @@ impl HuffmanTable {
         // Figure K.1
         loop {
             let mut v1 = None;
-            let mut v1_min = u32::MAX;
+            let mut v1_min = u64::MAX;
 
             // Find the largest value with the least non zero frequency
             for (i, &f) in freq.iter().enumerate() {
@@ -126,7 +128,7 @@ impl HuffmanTable {
             };
 
             let mut v2 = None;
-            let mut v2_min = u32::MAX;
+            let mut v2_min = u64::MAX;
 
             // Find the next largest value with the least non zero frequency
             for (i, &f) in freq.iter().enumerate() {
@@ -162,7 +164,10 @@ impl HuffmanTable {
         // Find the number of codes of each size
         // Figure K.2
 
-        let mut bits = [0u8; 33];
+        // K.2 sizes this 33 on the assumption that no code exceeds 32 bits,
+        // which skewed counts break: 33 symbols with near-Fibonacci counts
+        // (~18.5M total) already go deeper. 257 symbols cannot go past 256.
+        let mut bits = [0u16; 257];
 
         for &size in codesize.iter() {
             if size > 0 {
@@ -173,7 +178,7 @@ impl HuffmanTable {
         // Limiting code lengths to 16 bits
         // Figure K.3
 
-        let mut i = 32;
+        let mut i = bits.len() - 1;
 
         while i > 16 {
             while bits[i] > 0 {
@@ -203,7 +208,8 @@ impl HuffmanTable {
 
         let mut k = 0;
 
-        for i in 1..=32 {
+        // Every size K.1 produced, not just up to 32: see `bits` above.
+        for i in 1..=256 {
             for j in 0..=255 {
                 if codesize[j] == i {
                     huffval[k] = j as u8;
@@ -214,7 +220,8 @@ impl HuffmanTable {
 
         let mut length = [0u8; 16];
         for (i, v) in length.iter_mut().enumerate() {
-            *v = bits[i + 1];
+            // At most 256 real symbols, and never all at one length.
+            *v = bits[i + 1] as u8;
         }
 
         let values = huffval[0..k].to_vec();
