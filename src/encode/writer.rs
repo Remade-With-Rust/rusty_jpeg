@@ -466,6 +466,9 @@ impl<W: JfifWrite> JfifWriter<W> {
     /// same ZRL and EOB handling — so it lives directly beside them; change one,
     /// change the other. `streaming_matches_materialized_histogram` in the
     /// encoder's tests is the gate that they still agree.
+    ///
+    /// The `u32` counts can overflow on gigapixel 4:4:4 images; see
+    /// `HuffmanStats` in the encoder.
     pub fn count_block(block: &[i16; 64], prev_dc: i16, dc_freq: &mut [u32], ac_freq: &mut [u32]) {
         // Mirrors `write_dc`: the DC symbol is the bit-length of the difference.
         let (size, _) = get_code(block[0] - prev_dc);

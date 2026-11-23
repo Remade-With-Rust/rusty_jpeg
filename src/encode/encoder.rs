@@ -1565,6 +1565,7 @@ impl<W: JfifWrite> Encoder<W> {
         let max_tables = self.components.len().min(2) as u8;
 
         for table in 0..max_tables {
+            // u32 counts: see the overflow note on `HuffmanStats`.
             let mut dc_freq = [0u32; 257];
             dc_freq[256] = 1;
             let mut ac_freq = [0u32; 257];
@@ -1707,6 +1708,14 @@ impl Encoder<BufWriter<File>> {
 
 /// Huffman symbol frequencies for the (at most two) table slots a baseline
 /// JPEG uses. Index 256 is reserved by the table builder.
+///
+/// shortcut: one symbol's count can exceed `u32::MAX` (debug panic, release
+/// wrap to a wrong or missing code) once a table sees more than ~68M blocks
+/// that each emit it 63 times. Only the chroma slot of a 4:4:4 color image
+/// gets there (Cb + Cr share it, so ~46,700x46,700 px and up). Widen to `u64`
+/// here, in `optimize_huffman_table` and in `JfifWriter::count_block`
+/// (`HuffmanTable::new_optimized` sums in `u64` already) if such images
+/// become a target.
 struct HuffmanStats {
     dc: [[u32; 257]; 2],
     ac: [[u32; 257]; 2],
