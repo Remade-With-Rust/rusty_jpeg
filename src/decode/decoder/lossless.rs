@@ -213,36 +213,37 @@ fn predict(ra: i32, rb: i32, rc: i32, predictor: Predictor) -> i32 {
     }
 }
 
-pub fn compute_image_lossless(frame: &FrameInfo, mut data: Vec<Vec<u16>>) -> Result<Vec<u8>> {
+/// The image's samples, interleaved.
+pub fn compute_image_lossless(frame: &FrameInfo, mut data: Vec<Vec<u16>>) -> Result<Vec<u16>> {
     if data.is_empty() || data.iter().any(Vec::is_empty) {
         return Err(Error::Format("not all components have data".to_owned()));
     }
     let output_size = frame.output_size;
-    let components = &frame.components;
-    let ncomp = components.len();
+    let ncomp = frame.components.len();
 
     if ncomp == 1 {
-        let decoded = convert_to_u8(frame, data.remove(0));
-        Ok(decoded)
-    } else {
-        let mut decoded: Vec<u16> =
-            vec![0u16; ncomp * output_size.width as usize * output_size.height as usize];
-        for (x, chunk) in decoded.chunks_mut(ncomp).enumerate() {
-            for (i, (component_data, _)) in data.iter().zip(components.iter()).enumerate() {
-                chunk[i] = component_data[x];
-            }
-        }
-        let decoded = convert_to_u8(frame, decoded);
-        Ok(decoded)
+        return Ok(data.remove(0));
     }
+    let mut decoded: Vec<u16> =
+        vec![0u16; ncomp * output_size.width as usize * output_size.height as usize];
+    for (x, chunk) in decoded.chunks_mut(ncomp).enumerate() {
+        for (sample, component_data) in chunk.iter_mut().zip(&data) {
+            *sample = component_data[x];
+        }
+    }
+    Ok(decoded)
 }
 
-fn convert_to_u8(frame: &FrameInfo, data: Vec<u16>) -> Vec<u8> {
+/// Samples as the bytes `decode` returns them in.
+pub(super) fn convert_to_u8(frame: &FrameInfo, data: Vec<u16>) -> Vec<u8> {
     if frame.precision == 8 {
         data.iter().map(|x| *x as u8).collect()
     } else {
         // we output native endian, which is the standard for image-rs
-        let ne_bytes: Vec<_> = data.iter().map(|x| x.to_ne_bytes()).collect();
-        ne_bytes.concat()
+        let mut bytes = vec![0u8; data.len() * 2];
+        for (pair, sample) in bytes.chunks_exact_mut(2).zip(&data) {
+            pair.copy_from_slice(&sample.to_ne_bytes());
+        }
+        bytes
     }
 }

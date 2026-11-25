@@ -1,10 +1,11 @@
+use crate::decode::arith::Conditioning;
 use crate::decode::error::{Error, Result, UnsupportedFeature, Warning, Warnings};
 use crate::decode::huffman::{
     fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable, AC_EOB, FAST_BITS,
 };
 use crate::decode::marker::Marker;
 use crate::decode::parser::{
-    parse_app, parse_com, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos,
+    parse_app, parse_com, parse_dac, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos,
     AdobeColorTransform, AppData, CodingProcess, Component, Dimensions, EntropyCoding, FrameInfo,
     IccChunk, ScanInfo,
 };
@@ -25,13 +26,15 @@ use core::ops::Range;
 
 pub const MAX_COMPONENTS: usize = 4;
 
+mod arithmetic;
 mod lossless;
 mod smoothing;
-use self::lossless::compute_image_lossless;
+mod twelve;
+use self::lossless::{compute_image_lossless, convert_to_u8};
 use self::smoothing::{Grid, Progression};
 
 #[rustfmt::skip]
-static UNZIGZAG: [u8; 64] = [
+pub(crate) static UNZIGZAG: [u8; 64] = [
      0,  1,  8, 16,  9,  2,  3, 10,
     17, 24, 32, 25, 18, 11,  4,  5,
     12, 19, 26, 33, 40, 48, 41, 34,
@@ -78,6 +81,42 @@ pub struct ImageInfo {
     pub pixel_format: PixelFormat,
     /// The coding process of the image.
     pub coding_process: CodingProcess,
+}
+
+/// The frame header of an image: what [`ImageInfo`] says, for every layout the
+/// decoder reads, and how its samples are output.
+///
+/// [`ImageInfo`] cannot say that samples are wider than 8 bits (its
+/// [`PixelFormat`] only does for one component) and has no format at all for
+/// the two components of a lossless DNG tile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct FrameHeader {
+    /// The width of the output, in pixels.
+    pub width: u16,
+    /// The height of the output, in pixels.
+    pub height: u16,
+    /// Components per pixel, interleaved in the output: 1, 3 or 4, or 2 in a
+    /// lossless image.
+    pub components: u8,
+    /// Bits per sample. Samples are output unscaled, in `0..2^precision`.
+    pub precision: u8,
+    /// The coding process of the image.
+    pub coding_process: CodingProcess,
+    /// Arithmetic rather than Huffman entropy coding.
+    pub arithmetic_coding: bool,
+}
+
+impl FrameHeader {
+    /// Bytes per sample in what [`Decoder::decode`] returns: 1 for 8-bit
+    /// images, otherwise 2, in native byte order.
+    pub fn bytes_per_sample(&self) -> usize {
+        if self.precision == 8 {
+            1
+        } else {
+            2
+        }
+    }
 }
 
 /// Describes the colour transform to apply before binary data is returned
@@ -154,6 +193,17 @@ pub struct Decoder<R> {
     // decode leaves its result, since the decode path itself returns Vec<u8>.
     planar_output: bool,
     planar_result: Option<PlanarImage>,
+
+    // The same for `decode_u16`, for images whose samples are wider than 8 bits.
+    u16_output: bool,
+    u16_result: Option<Vec<u16>>,
+
+    /// Arithmetic conditioning parameters (DAC).
+    conditioning: Conditioning,
+    /// For a frame that `renders_late`: the quantization table each component's
+    /// first scan found (libjpeg's `latch_quant_tables`). A DQT between scans
+    /// may replace it afterwards.
+    latched_tables: [Option<Arc<[u16; 64]>>; MAX_COMPONENTS],
 
     /// Decode on the calling thread only. See [`set_single_threaded`].
     single_threaded: bool,
@@ -296,6 +346,10 @@ impl<R: Source> Decoder<R> {
             decoding_buffer_size_limit: usize::MAX,
             planar_output: false,
             planar_result: None,
+            u16_output: false,
+            u16_result: None,
+            conditioning: Conditioning::default(),
+            latched_tables: [None, None, None, None],
             single_threaded: false,
             plane_pool: Vec::new(),
             warnings: Warnings::default(),
@@ -314,8 +368,14 @@ impl<R: Source> Decoder<R> {
     ///   out in and uniform grey below; a progressive image shows every block
     ///   at the precision the scans that did arrive gave it.
     /// - [`Warning::SegmentEndedEarly`], [`Warning::BadHuffmanCode`],
-    ///   [`Warning::RestartMarkerMismatch`], [`Warning::ExtraneousBytes`],
-    ///   [`Warning::MissingScan`]: damage inside the stream.
+    ///   [`Warning::BadArithmeticCode`], [`Warning::RestartMarkerMismatch`],
+    ///   [`Warning::ExtraneousBytes`], [`Warning::MissingScan`]: damage inside
+    ///   the stream.
+    ///
+    /// Arithmetic coding allows a segment to stop before its last MCU (the
+    /// decoder supplies zero bytes), so a segment that a marker cuts short is
+    /// not reported as [`Warning::SegmentEndedEarly`]: its remaining MCUs
+    /// decode from those zeros, as in libjpeg-turbo.
     ///
     /// ```no_run
     /// # use rusty_jpeg::decode::{Decoder, Warning};
@@ -368,16 +428,15 @@ impl<R: Source> Decoder<R> {
     /// Returns metadata about the image.
     ///
     /// The returned value will be `None` until a call to either `read_info` or `decode` has
-    /// returned `Ok`.
+    /// returned `Ok`, and for a lossless image of two components, which no [`PixelFormat`]
+    /// describes: see [`frame_header`](Self::frame_header), which also tells the sample precision.
+    /// ([`PixelFormat::RGB24`] and [`PixelFormat::CMYK32`] name the components only: with more
+    /// than 8 bits per sample the output has two bytes for each.)
     pub fn info(&self) -> Option<ImageInfo> {
         match self.frame {
             Some(ref frame) => {
-                // The frame header is validated (1, 3 or 4 components,
-                // precision 2..=16) before a frame is stored, so the `None`
-                // arms are unreachable today. They are `None` rather than
-                // `panic!()` so that admitting another layout later, such as
-                // the 2-component lossless tiles in DNG, cannot turn a metadata
-                // query into a panic.
+                // The frame header is validated (1 to 4 components, precision
+                // 2..=16) before a frame is stored.
                 let pixel_format = match frame.components.len() {
                     1 => match frame.precision {
                         2..=8 => PixelFormat::L8,
@@ -398,6 +457,21 @@ impl<R: Source> Decoder<R> {
             }
             None => None,
         }
+    }
+
+    /// The frame header, for every image the decoder reads.
+    ///
+    /// The returned value will be `None` until a call to either `read_info` or `decode` has
+    /// returned `Ok`.
+    pub fn frame_header(&self) -> Option<FrameHeader> {
+        self.frame.as_ref().map(|frame| FrameHeader {
+            width: frame.output_size.width,
+            height: frame.output_size.height,
+            components: frame.components.len() as u8,
+            precision: frame.precision,
+            coding_process: frame.coding_process,
+            arithmetic_coding: frame.entropy_coding == EntropyCoding::Arithmetic,
+        })
     }
 
     /// Returns raw exif data, starting at the TIFF header, if the image contains any.
@@ -510,8 +584,36 @@ impl<R: Source> Decoder<R> {
     /// case, a file cut short). Call [`set_strict`](Self::set_strict) first to
     /// have such a stream refused instead. The same holds for
     /// [`decode_planar`](Self::decode_planar).
+    ///
+    /// Samples are interleaved. At 8 bits each is a byte. An image of any other
+    /// precision -- 12-bit DCT, lossless up to 16 bits -- has two bytes per
+    /// sample in **native byte order**, unscaled: a 12-bit sample is in
+    /// `0..=4095`. [`frame_header`](Self::frame_header) tells which, and
+    /// [`decode_u16`](Self::decode_u16) returns them as `u16`.
     pub fn decode(&mut self) -> Result<Vec<u8>> {
         WorkerScope::with(|worker| self.decode_internal(false, worker))
+    }
+
+    /// [`decode`](Self::decode), with the samples as `u16`.
+    ///
+    /// Samples are not scaled: they are in `0..2^precision` (see
+    /// [`FrameHeader::precision`]), `0..=4095` for a 12-bit image. An 8-bit
+    /// image is widened.
+    ///
+    /// A lossless image may have two components. That is how DNG codes a tile
+    /// of CFA data, whose neighbouring columns are different colours: the two
+    /// components are the even and the odd columns, so the interleaved samples
+    /// returned here are the tile's samples in order (and the tile has twice
+    /// as many per JPEG row as the JPEG has pixels).
+    pub fn decode_u16(&mut self) -> Result<Vec<u16>> {
+        self.u16_output = true;
+        let result = self.decode();
+        self.u16_output = false;
+        let bytes = result?;
+        Ok(match self.u16_result.take() {
+            Some(samples) => samples,
+            None => bytes.iter().map(|&sample| u16::from(sample)).collect(),
+        })
     }
 
     /// Hand plane allocations from a previous decode back for reuse.
@@ -567,7 +669,8 @@ impl<R: Source> Decoder<R> {
     /// planes as the entropy decoder produced them, which is what such a
     /// pipeline actually wants.
     ///
-    /// Not supported for lossless JPEG (which has its own 16-bit path).
+    /// Not supported for lossless JPEG (which has its own 16-bit path), nor for
+    /// 12-bit images.
     pub fn decode_planar(&mut self) -> Result<PlanarImage> {
         let _t = crate::prof::scope(crate::prof::Stage::Total);
         self.planar_output = true;
@@ -661,22 +764,30 @@ impl<R: Source> Decoder<R> {
                     if frame.is_differential {
                         return Err(Error::Unsupported(UnsupportedFeature::Hierarchical));
                     }
-                    if frame.entropy_coding == EntropyCoding::Arithmetic {
+                    if frame.entropy_coding == EntropyCoding::Arithmetic
+                        && frame.coding_process == CodingProcess::Lossless
+                    {
                         return Err(Error::Unsupported(
                             UnsupportedFeature::ArithmeticEntropyCoding,
                         ));
-                    }
-                    if frame.precision != 8 && frame.coding_process != CodingProcess::Lossless {
-                        return Err(Error::Unsupported(UnsupportedFeature::SamplePrecision(
-                            frame.precision,
-                        )));
                     }
                     if !(2..=16).contains(&frame.precision) {
                         return Err(Error::Unsupported(UnsupportedFeature::SamplePrecision(
                             frame.precision,
                         )));
                     }
-                    if component_count != 1 && component_count != 3 && component_count != 4 {
+                    // Two components are the columns of a DNG lossless tile,
+                    // and only make sense as full-size planes.
+                    let lossless_pair = component_count == 2
+                        && frame.coding_process == CodingProcess::Lossless
+                        && frame.components.iter().all(|c| {
+                            (c.horizontal_sampling_factor, c.vertical_sampling_factor) == (1, 1)
+                        });
+                    if !lossless_pair
+                        && component_count != 1
+                        && component_count != 3
+                        && component_count != 4
+                    {
                         return Err(Error::Unsupported(UnsupportedFeature::ComponentCount(
                             component_count as u8,
                         )));
@@ -720,11 +831,12 @@ impl<R: Source> Decoder<R> {
                     // files; demanding neither is what let a panic reach the
                     // block loop. The checks below are the exact conditions
                     // under which `decode_block` will actually use each table.
+                    // (An arithmetic scan needs none: its tables have defaults.)
                     //
                     // This is not progressive-specific: any scan, baseline
                     // included, can name a table slot no DHT ever defined.
                     // Progressive merely makes it common.
-                    {
+                    if frame.entropy_coding == EntropyCoding::Huffman {
                         let needs_dc = scan.spectral_selection.start == 0
                             && scan.successive_approximation_high == 0;
                         let needs_ac = scan.spectral_selection.end > 1;
@@ -759,6 +871,7 @@ impl<R: Source> Decoder<R> {
                         .len()
                         .checked_mul(frame.output_size.width.into())
                         .and_then(|m| m.checked_mul(frame.output_size.height.into()))
+                        .and_then(|m| m.checked_mul(1 + usize::from(frame.is_twelve_bit())))
                         .is_none_or(|m| self.decoding_buffer_size_limit < m)
                     {
                         return Err(Error::Format(
@@ -776,9 +889,13 @@ impl<R: Source> Decoder<R> {
                         return Err(Error::UnexpectedEof);
                     }
 
-                    if frame.coding_process == CodingProcess::DctProgressive
-                        && self.coefficients.is_empty()
-                    {
+                    if frame.is_twelve_bit() && self.planar_output {
+                        return Err(Error::Unsupported(UnsupportedFeature::SamplePrecision(
+                            frame.precision,
+                        )));
+                    }
+
+                    if frame.stores_coefficients() && self.coefficients.is_empty() {
                         // Progressive keeps every coefficient of the whole image
                         // resident, because later scans revisit the same blocks.
                         // That buffer is sized straight from the frame header,
@@ -834,14 +951,44 @@ impl<R: Source> Decoder<R> {
                     if frame.coding_process == CodingProcess::Lossless {
                         let (marker, data) = self.decode_scan_lossless(&frame, &scan)?;
 
-                        for (i, plane) in data
-                            .into_iter()
-                            .enumerate()
-                            .filter(|(_, plane)| !plane.is_empty())
-                        {
+                        // In scan order, which is not the frame's when a scan
+                        // codes one component of several.
+                        for (&i, plane) in scan.component_indices.iter().zip(data) {
                             planes_u16[i] = plane;
                         }
                         pending_marker = marker;
+                    } else if frame.renders_late() {
+                        if frame.coding_process == CodingProcess::DctProgressive {
+                            self.progression.start_scan(&scan);
+                        }
+                        for &i in &scan.component_indices {
+                            let table = frame.components[i].quantization_table_index;
+                            if self.latched_tables[i].is_none() {
+                                self.latched_tables[i] = self.quantization_tables[table].clone();
+                            }
+                        }
+
+                        pending_marker = if frame.entropy_coding == EntropyCoding::Arithmetic {
+                            self.decode_scan_arithmetic(&frame, &scan)?
+                        } else {
+                            // The progressive block loop, which stores what it
+                            // decodes. It codes a whole block at full precision
+                            // when the scan says so, as a sequential one does.
+                            // No component is "finished" by it, so it never
+                            // hands the worker anything.
+                            let (marker, _) = worker_scope.get_or_init_worker(
+                                PreferWorkerKind::Immediate,
+                                |worker| {
+                                    self.decode_scan(
+                                        &frame,
+                                        &scan,
+                                        worker,
+                                        &[false; MAX_COMPONENTS],
+                                    )
+                                },
+                            )?;
+                            marker
+                        };
                     } else {
                         // This was previously buggy, so let's explain the log here a bit. When a
                         // progressive frame is encoded then the coefficients (DC, AC) of each
@@ -957,9 +1104,7 @@ impl<R: Source> Decoder<R> {
                 }
                 // Arithmetic conditioning table-specification
                 Marker::DAC => {
-                    return Err(Error::Unsupported(
-                        UnsupportedFeature::ArithmeticEntropyCoding,
-                    ))
+                    or_end_of_image!(parse_dac(&mut self.reader, &mut self.conditioning))
                 }
                 // Restart interval definition
                 Marker::DRI => {
@@ -1080,6 +1225,7 @@ impl<R: Source> Decoder<R> {
             .len()
             .checked_mul(frame.output_size.width.into())
             .and_then(|m| m.checked_mul(frame.output_size.height.into()))
+            .and_then(|m| m.checked_mul(1 + usize::from(frame.is_twelve_bit())))
             .is_none_or(|m| self.decoding_buffer_size_limit < m)
         {
             return Err(Error::Format(
@@ -1087,10 +1233,13 @@ impl<R: Source> Decoder<R> {
             ));
         }
 
+        if frame.is_twelve_bit() {
+            let samples = self.render_twelve_bit(any_scan)?;
+            return Ok(self.output_wide(samples));
+        }
+
         // If we're decoding a progressive jpeg and a component is unfinished, render what we've got
-        if frame.coding_process == CodingProcess::DctProgressive
-            && self.coefficients.len() == frame.components.len()
-        {
+        if frame.stores_coefficients() && self.coefficients.len() == frame.components.len() {
             // A progressive image whose DATA ENDED EARLY is rendered with
             // libjpeg-turbo's interblock smoothing (see `smoothing`), which is
             // what makes a cut-short download look like a soft version of the
@@ -1103,29 +1252,24 @@ impl<R: Source> Decoder<R> {
             // a stream that ends with a proper EOI but whose scans never bring
             // the low coefficients to full precision; such a stream decodes
             // here today, and its output is left exactly as it was.
-            let smoothing = if self.warnings.as_slice().contains(&Warning::Truncated) {
+            let smoothing = if frame.coding_process == CodingProcess::DctProgressive
+                && self.warnings.as_slice().contains(&Warning::Truncated)
+            {
                 self.progression
-                    .smoothing(&frame.components, &self.quantization_tables)
+                    .smoothing(&frame.components, |i| self.component_table(frame, i))
             } else {
                 None
             };
-            let max_sampling = |factor: fn(&Component) -> u8| {
-                usize::from(frame.components.iter().map(factor).max().unwrap_or(1))
-            };
-            let h_max = max_sampling(|c| c.horizontal_sampling_factor);
-            let v_max = max_sampling(|c| c.vertical_sampling_factor);
-
             for (i, component) in frame.components.iter().enumerate() {
                 // Only dealing with unfinished components
                 if smoothing.is_none() && self.coefficients_finished[i] == !0 {
                     continue;
                 }
 
-                let quantization_table =
-                    match self.quantization_tables[component.quantization_table_index].clone() {
-                        Some(quantization_table) => quantization_table,
-                        None => continue,
-                    };
+                let quantization_table = match self.component_table(frame, i) {
+                    Some(quantization_table) => quantization_table,
+                    None => continue,
+                };
 
                 // Get the worker prepared
                 let row_data = RowData {
@@ -1145,18 +1289,7 @@ impl<R: Source> Decoder<R> {
                     * usize::from(component.vertical_sampling_factor)
                     * 64;
 
-                let grid = Grid {
-                    coefficients: &self.coefficients[i],
-                    blocks_wide: usize::from(component.block_size.width),
-                    width_in_blocks: (usize::from(frame.image_size.width)
-                        * usize::from(component.horizontal_sampling_factor))
-                    .div_ceil(h_max * 8),
-                    height_in_blocks: (usize::from(frame.image_size.height)
-                        * usize::from(component.vertical_sampling_factor))
-                    .div_ceil(v_max * 8),
-                    v_samp: usize::from(component.vertical_sampling_factor),
-                    mcu_rows: usize::from(frame.mcu_size.height),
-                };
+                let grid = self.grid(frame, i);
 
                 let mut tasks = (0..frame.mcu_size.height).map(|mcu_y| {
                     let offset = usize::from(mcu_y) * coefficients_per_mcu_row;
@@ -1215,7 +1348,8 @@ impl<R: Source> Decoder<R> {
 
         let _s = crate::prof::scope(crate::prof::Stage::DecOutput);
         if frame.coding_process == CodingProcess::Lossless {
-            return compute_image_lossless(frame, planes_u16);
+            let samples = compute_image_lossless(frame, planes_u16)?;
+            return Ok(self.output_wide(samples));
         }
 
         // Clone the little bits we need so the borrow of `self.frame` ends here
@@ -1239,6 +1373,97 @@ impl<R: Source> Decoder<R> {
             output_size,
             color_transform,
             !self.single_threaded,
+        )
+    }
+
+    /// The quantization table component `i` is rendered with.
+    fn component_table(&self, frame: &FrameInfo, i: usize) -> Option<Arc<[u16; 64]>> {
+        if frame.renders_late() {
+            self.latched_tables[i].clone()
+        } else {
+            self.quantization_tables[frame.components[i].quantization_table_index].clone()
+        }
+    }
+
+    /// The block grid of component `i`, for smoothing.
+    fn grid(&self, frame: &FrameInfo, i: usize) -> Grid<'_> {
+        let component = &frame.components[i];
+        let (width_in_blocks, height_in_blocks) = frame.image_blocks(i);
+        Grid {
+            coefficients: &self.coefficients[i],
+            blocks_wide: usize::from(component.block_size.width),
+            width_in_blocks: usize::from(width_in_blocks),
+            height_in_blocks: usize::from(height_in_blocks),
+            v_samp: usize::from(component.vertical_sampling_factor),
+            mcu_rows: usize::from(frame.mcu_size.height),
+        }
+    }
+
+    /// Hand out samples decoded as `u16`, as the caller asked for them.
+    fn output_wide(&mut self, samples: Vec<u16>) -> Vec<u8> {
+        if self.u16_output {
+            self.u16_result = Some(samples);
+            return Vec::new();
+        }
+        convert_to_u8(self.frame.as_ref().unwrap(), samples)
+    }
+
+    /// Render a 12-bit frame from its stored coefficients.
+    fn render_twelve_bit(&mut self, any_scan: bool) -> Result<Vec<u16>> {
+        let frame = self.frame.as_ref().unwrap();
+        if !any_scan {
+            return Err(Error::Format("not all components have data".to_owned()));
+        }
+        // As for 8 bits (see `decode_planes`).
+        let smoothing = if frame.coding_process == CodingProcess::DctProgressive
+            && self.warnings.as_slice().contains(&Warning::Truncated)
+        {
+            self.progression
+                .smoothing(&frame.components, |i| self.component_table(frame, i))
+        } else {
+            None
+        };
+
+        let mut planes = Vec::with_capacity(frame.components.len());
+        for (i, component) in frame.components.iter().enumerate() {
+            let blocks_per_row = usize::from(component.block_size.width)
+                * usize::from(component.vertical_sampling_factor);
+            let samples_per_row = blocks_per_row * component.dct_scale * component.dct_scale;
+            let mut plane = vec![0u16; samples_per_row * usize::from(frame.mcu_size.height)];
+            let table = match self.component_table(frame, i) {
+                Some(table) => table,
+                None => {
+                    self.warnings.raise(Warning::MissingScan)?;
+                    plane.fill(1 << (frame.precision - 1));
+                    planes.push(plane);
+                    continue;
+                }
+            };
+            let rows = self.coefficients[i].chunks_exact(blocks_per_row * 64);
+            let masks = self.nonzero[i].chunks_exact(blocks_per_row);
+            let grid = self.grid(frame, i);
+            let mut smoothed = Vec::new();
+            for (mcu_y, ((row, masks), output)) in rows
+                .zip(masks)
+                .zip(plane.chunks_exact_mut(samples_per_row))
+                .enumerate()
+            {
+                if let Some(smoothing) = &smoothing {
+                    smoothed.clear();
+                    smoothed.extend_from_slice(row);
+                    smoothing.smooth_mcu_row(i, &grid, &table, mcu_y, &mut smoothed);
+                    twelve::render_rows(component, &smoothed, None, &table, output);
+                } else {
+                    twelve::render_rows(component, row, Some(masks), &table, output);
+                }
+            }
+            planes.push(plane);
+        }
+        twelve::compute_image(
+            &frame.components,
+            planes,
+            frame.output_size,
+            self.determine_color_transform(),
         )
     }
 
@@ -1347,7 +1572,7 @@ impl<R: Source> Decoder<R> {
         // registers (+0.7% Ir on a sequential 4:4:4 decode after the
         // `nonzero` refinement and the in-place row hand-off). With the
         // process a constant, each copy carries only its own paths.
-        if frame.coding_process == CodingProcess::DctProgressive {
+        if frame.stores_coefficients() {
             self.decode_scan_for::<true>(frame, scan, worker, finished)
         } else {
             self.decode_scan_for::<false>(frame, scan, worker, finished)
@@ -1425,10 +1650,9 @@ impl<R: Source> Decoder<R> {
             }
         }
 
-        debug_assert_eq!(
-            PROGRESSIVE,
-            frame.coding_process == CodingProcess::DctProgressive
-        );
+        // `PROGRESSIVE` also decodes sequential frames whose coefficients are
+        // stored, with no component to hand to the worker.
+        debug_assert_eq!(PROGRESSIVE, frame.stores_coefficients());
         let is_progressive = PROGRESSIVE;
         let is_interleaved = components.len() > 1;
         // Fuse entropy decode straight into the IDCT when the worker consumes
@@ -1498,6 +1722,8 @@ impl<R: Source> Decoder<R> {
         // the MCUs will be exactly the block count.
         let (max_mcu_x, max_mcu_y) = if is_interleaved {
             (frame.mcu_size.width, frame.mcu_size.height)
+        } else if PROGRESSIVE && frame.renders_late() {
+            frame.image_blocks(scan.component_indices[0])
         } else {
             (
                 components[0].block_size.width,
@@ -1832,11 +2058,23 @@ impl<R: Source> Decoder<R> {
         // Whole bytes of the scan's data that no MCU used, here or (below)
         // beyond what the bit reader can hold before it meets a marker.
         let mut extraneous = huffman.unread_bytes() > 0;
-        let mut marker = huffman.take_marker(&mut self.reader)?;
+        let marker = huffman.take_marker(&mut self.reader)?;
         extraneous |= marker.is_none();
         if extraneous {
             self.warnings.raise(Warning::ExtraneousBytes)?;
         }
+        let marker = self.skip_stray_markers(marker)?;
+        if huffman.saw_bad_code() {
+            self.warnings.raise(Warning::BadHuffmanCode)?;
+        }
+        if huffman.hit_end_of_data() {
+            self.warnings.raise(Warning::Truncated)?;
+        }
+        Ok(marker)
+    }
+
+    /// The marker after a scan's data, given the one found there.
+    fn skip_stray_markers(&mut self, mut marker: Option<Marker>) -> Result<Option<Marker>> {
         // Some encoders emit a final RST after the entropy-coded data; skip it.
         // A TEM or RES code here is corrupt entropy data that merely looked
         // like a marker (FF followed by a byte below SOF0): skip to the next
@@ -1849,12 +2087,6 @@ impl<R: Source> Decoder<R> {
                 Err(Error::UnexpectedEof) => None,
                 Err(error) => return Err(error),
             };
-        }
-        if huffman.saw_bad_code() {
-            self.warnings.raise(Warning::BadHuffmanCode)?;
-        }
-        if huffman.hit_end_of_data() {
-            self.warnings.raise(Warning::Truncated)?;
         }
         Ok(marker)
     }

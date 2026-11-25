@@ -95,7 +95,7 @@ impl Progression {
     pub(crate) fn smoothing(
         &self,
         components: &[Component],
-        quantization_tables: &[Option<Arc<[u16; 64]>>; 4],
+        table_of: impl Fn(usize) -> Option<Arc<[u16; 64]>>,
     ) -> Option<Smoothing> {
         let mut useful = false;
         let mut smoothing = Smoothing {
@@ -103,8 +103,8 @@ impl Progression {
             prev_coef_bits: [[-1; SAVED_COEFS]; MAX_COMPONENTS],
             last_good_row: self.last_good_row,
         };
-        for (ci, component) in components.iter().enumerate() {
-            let table = quantization_tables[component.quantization_table_index].as_ref()?;
+        for ci in 0..components.len() {
+            let table = table_of(ci)?;
             if POSITIONS.iter().any(|&position| table[position] == 0) {
                 return None;
             }

@@ -98,6 +98,9 @@ jobs:
       - name: decode_planar
         run: cargo fuzz run decode_planar -- -max_total_time=60 -rss_limit_mb=4096
         working-directory: fuzz
+      - name: decode_modes
+        run: cargo fuzz run decode_modes -- -max_total_time=60 -rss_limit_mb=4096
+        working-directory: fuzz
       - name: roundtrip
         run: cargo fuzz run roundtrip -- -max_total_time=60 -rss_limit_mb=4096
         working-directory: fuzz

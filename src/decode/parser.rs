@@ -1,3 +1,4 @@
+use crate::decode::arith::Conditioning;
 use crate::decode::error::{Error, Result, UnsupportedFeature};
 use crate::decode::huffman::{HuffmanTable, HuffmanTableClass};
 use crate::decode::marker::Marker;
@@ -116,6 +117,49 @@ pub struct IccChunk {
 }
 
 impl FrameInfo {
+    /// A 12-bit lossy frame, whose samples are output as `u16`.
+    pub(crate) fn is_twelve_bit(&self) -> bool {
+        self.coding_process != CodingProcess::Lossless && self.precision > 8
+    }
+
+    /// Whether the frame's quantized coefficients are all kept and the planes
+    /// rendered from them once the last scan is in. Baseline and extended
+    /// Huffman frames of 8 bits stream through the worker instead.
+    pub(crate) fn stores_coefficients(&self) -> bool {
+        self.coding_process == CodingProcess::DctProgressive || self.renders_late()
+    }
+
+    /// The part of `stores_coefficients` that renders a component only at the
+    /// end, with the quantization table latched at its first scan.
+    pub(crate) fn renders_late(&self) -> bool {
+        self.coding_process != CodingProcess::Lossless
+            && (self.entropy_coding == EntropyCoding::Arithmetic || self.is_twelve_bit())
+    }
+
+    /// The blocks, across and down, of component `i` that carry samples of the
+    /// image: what a scan of that component alone codes (A.2.2).
+    pub(crate) fn image_blocks(&self, i: usize) -> (u16, u16) {
+        let max = |factor: fn(&Component) -> u8| {
+            usize::from(self.components.iter().map(factor).max().unwrap_or(1))
+        };
+        let blocks = |size: u16, factor: u8, max: usize| {
+            (usize::from(size) * usize::from(factor)).div_ceil(max * 8) as u16
+        };
+        let c = &self.components[i];
+        (
+            blocks(
+                self.image_size.width,
+                c.horizontal_sampling_factor,
+                max(|c| c.horizontal_sampling_factor),
+            ),
+            blocks(
+                self.image_size.height,
+                c.vertical_sampling_factor,
+                max(|c| c.vertical_sampling_factor),
+            ),
+        )
+    }
+
     pub(crate) fn update_idct_size(&mut self, idct_size: usize) -> Result<()> {
         for component in &mut self.components {
             component.dct_scale = idct_size;
@@ -459,13 +503,18 @@ pub fn parse_sos<R: Source>(reader: &mut R, frame: &FrameInfo) -> Result<ScanInf
         let dc_table_index = byte >> 4;
         let ac_table_index = byte & 0x0f;
 
-        if dc_table_index > 3 || (frame.is_baseline && dc_table_index > 1) {
+        // Arithmetic conditioning tables have sixteen destinations (B.2.4.3).
+        let last_table = match frame.entropy_coding {
+            EntropyCoding::Huffman => 3,
+            EntropyCoding::Arithmetic => 15,
+        };
+        if dc_table_index > last_table || (frame.is_baseline && dc_table_index > 1) {
             return Err(Error::Format(format!(
                 "invalid dc table index {}",
                 dc_table_index
             )));
         }
-        if ac_table_index > 3 || (frame.is_baseline && ac_table_index > 1) {
+        if ac_table_index > last_table || (frame.is_baseline && ac_table_index > 1) {
             return Err(Error::Format(format!(
                 "invalid ac table index {}",
                 ac_table_index
@@ -740,6 +789,37 @@ pub fn parse_dht<R: Source>(
     }
 
     Ok((dc_tables, ac_tables))
+}
+
+// Section B.2.4.3
+/// Read a DAC segment into `conditioning`, with libjpeg's checks (`get_dac`,
+/// jdmarker.c): the destination and the order of a DC table's bounds. A `Kx`
+/// outside 1..=63 only moves the split between the two bin sets.
+pub(crate) fn parse_dac<R: Source>(reader: &mut R, conditioning: &mut Conditioning) -> Result<()> {
+    let length = read_length(reader, DAC)?;
+    if !length.is_multiple_of(2) {
+        return Err(Error::Format("invalid length in DAC".to_owned()));
+    }
+
+    for _ in 0..length / 2 {
+        let byte = read_u8(reader)?;
+        let value = read_u8(reader)?;
+        let index = usize::from(byte & 0x0f);
+        match byte >> 4 {
+            0 => {
+                let (low, high) = (value & 0x0f, value >> 4);
+                if low > high {
+                    return Err(Error::Format(format!("invalid value {} in DAC", value)));
+                }
+                conditioning.dc[index] = (low, high);
+            }
+            1 => conditioning.ac[index] = value,
+            class => {
+                return Err(Error::Format(format!("invalid class {} in DAC", class)));
+            }
+        }
+    }
+    Ok(())
 }
 
 // Section B.2.4.4

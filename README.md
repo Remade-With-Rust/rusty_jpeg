@@ -78,8 +78,10 @@ campaign's harness runs under
 [rusty_alloc](https://github.com/Remade-With-Rust/rusty_alloc), the pure-Rust
 remake of mimalloc that our binaries ship with.
 
-**Not covered yet:** 12-bit DCT files and arithmetic-coded files are refused
-with `Error::Unsupported`. libjpeg-turbo opens both.
+**Not in this table:** 12-bit DCT files and arithmetic-coded files, which
+`Decoder` reads ([#28](https://github.com/Remade-With-Rust/rusty_jpeg/issues/28))
+but with scalar code. Lossless arithmetic coding (SOF11) is refused with
+`Error::Unsupported`; libjpeg-turbo does not read it either.
 
 ### Against FFmpeg (measured at 0.3.0)
 
