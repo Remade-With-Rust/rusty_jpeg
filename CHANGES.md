@@ -6,6 +6,39 @@ upstream possible.
 
 ## Unreleased
 
+- **12-bit, arithmetic-coded and two-component lossless JPEGs decode** (#28).
+  Oracle for all of it: libjpeg-turbo 3.1.0. Fixtures it wrote, and the hashes
+  of what it decodes them to, are in `tests/extended_modes.rs`
+  (`tools/generate_modes_libjpeg.c`).
+  - **12-bit DCT** (SOF1 and SOF2; a 12-bit SOF0 stays an error, as B.2.2
+    says). `decode` returns two bytes per sample in native byte order, as it
+    does for lossless images of more than 8 bits; samples are unscaled,
+    `0..=4095`. IDCT, upsampling and colour conversion are libjpeg-turbo's
+    12-bit arithmetic and match it sample for sample (`decoder/twelve.rs`,
+    scalar). The whole frame's coefficients are kept and rendered at the end.
+    `decode_planar` refuses these frames (`SamplePrecision(12)`).
+  - **Arithmetic coding**, SOF9 and SOF10 at 8 and 12 bits, and DAC: a port of
+    `jdarith.c` (`decode/arith.rs`). As there, running into a marker early is
+    legal and reads as zero bytes, and a coefficient that overflows its band
+    or 15 bits stops the segment: new `Warning::BadArithmeticCode`. SOF11
+    (lossless) stays `Unsupported(ArithmeticEntropyCoding)`. A DAC in a Huffman
+    file is checked and ignored; it was refused.
+  - **Two-component lossless** (SOF3), the layout DNG codes CFA tiles in:
+    interleaved samples. Full-size components only; every other process still
+    refuses two.
+  - **API:** `Decoder::decode_u16`, `Decoder::frame_header` -> `FrameHeader`
+    (dimensions, components, precision, coding process, arithmetic or not,
+    `bytes_per_sample`), `Warning::BadArithmeticCode`. `Decoder::info` is
+    `None` for two components, which no `PixelFormat` describes.
+  - **Lossless images with one scan per component decoded wrongly**, even when
+    intact: each scan's plane was stored by its position in the scan, so all
+    of them landed on component 0. They match libjpeg-turbo now.
+  - `set_max_decoding_buffer_size` counts a 12-bit sample as two bytes, and
+    also bounds the stored coefficients of 12-bit and arithmetic frames.
+  - Known limit, unchanged and shared with 8-bit: in a sequential scan a
+    damaged AC table's symbol `r0` (`1 <= r <= 14`) is read as a progressive
+    end-of-band run; libjpeg-turbo reads it as end of block.
+
 - **Four encoder defects, found by new property tests and Kani proofs.**
   `tests/properties.rs` and in-crate proptests check the encode -> decode
   round trip and Huffman table construction against real oracles; Kani

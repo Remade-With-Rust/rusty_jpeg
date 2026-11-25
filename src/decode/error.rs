@@ -18,11 +18,14 @@ pub type Result<T> = result::Result<T, Error>;
 pub enum UnsupportedFeature {
     /// Hierarchical JPEG.
     Hierarchical,
-    /// JPEG using arithmetic entropy coding instead of Huffman coding.
+    /// Lossless JPEG using arithmetic entropy coding (SOF11). Arithmetic-coded
+    /// DCT frames (SOF9, SOF10) are supported.
     ArithmeticEntropyCoding,
-    /// Sample precision in bits. 8 bit sample precision is what is currently supported in non-lossless coding process.
+    /// Sample precision in bits. 8 and 12 bits are supported in DCT frames, 2 to 16 in lossless ones;
+    /// [`Decoder::decode_planar`](crate::decode::Decoder::decode_planar) returns 8-bit planes only.
     SamplePrecision(u8),
-    /// Number of components in an image. 1, 3 and 4 components are currently supported.
+    /// Number of components in an image. 1, 3 and 4 components are currently supported, and 2 in
+    /// lossless frames.
     ComponentCount(u8),
     /// An image can specify a zero height in the frame header and use the DNL (Define Number of
     /// Lines) marker at the end of the first scan to define the number of lines in the frame.
@@ -92,6 +95,11 @@ pub enum Warning {
     /// marker (or the end of the scan). libjpeg-turbo: "Corrupt JPEG data:
     /// bad Huffman code".
     BadHuffmanCode,
+    /// An arithmetic-coded coefficient ran past the end of its block or out of
+    /// range. Nothing more of the segment is decoded, up to the next restart
+    /// marker (or the end of the scan). libjpeg-turbo: "Corrupt JPEG data: bad
+    /// arithmetic code".
+    BadArithmeticCode,
     /// The marker at a restart boundary was not the restart marker due there;
     /// the decoder resynchronised as libjpeg-turbo's `jpeg_resync_to_restart`
     /// does. libjpeg-turbo: "Corrupt JPEG data: found marker 0x.. instead of
@@ -125,6 +133,7 @@ impl fmt::Display for Warning {
             Warning::Truncated => "premature end of JPEG data",
             Warning::SegmentEndedEarly => "premature end of data segment",
             Warning::BadHuffmanCode => "bad Huffman code",
+            Warning::BadArithmeticCode => "bad arithmetic code",
             Warning::RestartMarkerMismatch => "restart marker missing or out of sequence",
             Warning::ExtraneousBytes => "extraneous bytes before marker",
             Warning::MissingScan => "no scan data for a component",

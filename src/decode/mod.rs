@@ -6,7 +6,9 @@
 #![deny(unsafe_code)]
 #![cfg_attr(feature = "platform_independent", forbid(unsafe_code))]
 
-pub use decoder::{ColorTransform, Decoder, ImageInfo, PixelFormat, PlanarComponent, PlanarImage};
+pub use decoder::{
+    ColorTransform, Decoder, FrameHeader, ImageInfo, PixelFormat, PlanarComponent, PlanarImage,
+};
 pub use error::{Error, UnsupportedFeature, Warning};
 pub use parser::CodingProcess;
 
@@ -14,6 +16,7 @@ use alloc::boxed::Box;
 
 #[cfg(not(feature = "platform_independent"))]
 mod arch;
+mod arith;
 mod decoder;
 mod error;
 mod huffman;

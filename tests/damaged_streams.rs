@@ -302,11 +302,16 @@ fn sof_stream(sof: u8, comps: &[(u8, u8)], scans: &[&[u8]]) -> Vec<u8> {
 
 /// A 2-component frame (grey + alpha, as JPEG-in-TIFF can carry) must be a
 /// clean `Unsupported(ComponentCount(2))` from every entry point, never a
-/// panic -- including `info()`, whose fallback arms were `panic!()`.
+/// panic -- including `info()`, whose fallback arms were `panic!()`. (The one
+/// exception, a lossless frame of two full-size components, is in
+/// `extended_modes.rs`.)
 #[test]
 fn two_component_frames_are_a_clean_error() {
     for sof in [0xC0u8, 0xC1, 0xC2, 0xC3] {
         for comps in [[(1u8, 1u8), (1, 1)], [(2, 2), (1, 1)], [(1, 1), (2, 1)]] {
+            if sof == 0xC3 && comps == [(1, 1), (1, 1)] {
+                continue;
+            }
             let data = sof_stream(sof, &comps, &[&[1, 2]]);
             let check = |r: Result<(), Error>| match r {
                 Err(Error::Unsupported(UnsupportedFeature::ComponentCount(2))) => {}
