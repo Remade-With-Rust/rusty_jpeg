@@ -95,11 +95,6 @@ pub enum Warning {
     /// marker (or the end of the scan). libjpeg-turbo: "Corrupt JPEG data:
     /// bad Huffman code".
     BadHuffmanCode,
-    /// An arithmetic-coded coefficient ran past the end of its block or out of
-    /// range. Nothing more of the segment is decoded, up to the next restart
-    /// marker (or the end of the scan). libjpeg-turbo: "Corrupt JPEG data: bad
-    /// arithmetic code".
-    BadArithmeticCode,
     /// The marker at a restart boundary was not the restart marker due there;
     /// the decoder resynchronised as libjpeg-turbo's `jpeg_resync_to_restart`
     /// does. libjpeg-turbo: "Corrupt JPEG data: found marker 0x.. instead of
@@ -112,6 +107,11 @@ pub enum Warning {
     /// The image ended with no scan data at all for a component. Its plane is
     /// uniform mid-grey, which is what libjpeg-turbo outputs for it.
     MissingScan,
+    /// An arithmetic-coded coefficient ran past the end of its block or out of
+    /// range. Nothing more of the segment is decoded, up to the next restart
+    /// marker (or the end of the scan). libjpeg-turbo: "Corrupt JPEG data: bad
+    /// arithmetic code".
+    BadArithmeticCode,
 }
 
 impl Warning {
