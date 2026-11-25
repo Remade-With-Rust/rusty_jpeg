@@ -22,6 +22,7 @@ full account is in [CHANGES.md](CHANGES.md#040).
 
 ### Fixed
 
+- *(decode)* lossless images with one scan per component decoded wrongly even when intact
 - *(decode)* add Warning::BadArithmeticCode last, so no existing discriminant changes
 
 ## [0.4.13](https://github.com/Remade-With-Rust/rusty_jpeg/compare/v0.4.12...v0.4.13) - 2026-11-23
