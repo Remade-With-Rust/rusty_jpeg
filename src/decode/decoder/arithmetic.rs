@@ -145,6 +145,12 @@ impl<R: Source> Decoder<R> {
         // row of the scan for decoded.
         self.progression.last_good_row = frame.mcu_size.height.saturating_sub(1);
 
+        // In the order libjpeg-turbo warns: its data source reports the end
+        // of the data when it runs dry, so before a bad code decoded from the
+        // zero bytes supplied after it.
+        if d.bad_code_after_end() {
+            self.warnings.raise(Warning::Truncated)?;
+        }
         if d.saw_bad_code() {
             self.warnings.raise(Warning::BadArithmeticCode)?;
         }

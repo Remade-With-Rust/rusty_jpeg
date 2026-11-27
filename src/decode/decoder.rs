@@ -2055,6 +2055,16 @@ impl<R: Source> Decoder<R> {
     /// The marker that ends a scan whose MCUs have all been decoded, and the
     /// warnings the scan's bit reader collected along the way.
     pub(crate) fn finish_scan(&mut self, huffman: &mut HuffmanDecoder) -> Result<Option<Marker>> {
+        // The scan loops look for exhausted data at the START of each MCU
+        // (row, in a lossless scan), so data that ran out inside the scan's
+        // LAST one is caught only here. libjpeg-turbo warns the moment the
+        // decode needs a bit that is not there (`jpeg_fill_bit_buffer`), last
+        // MCU or not, whether a real EOI or the end of the file follows. The
+        // pixels are unaffected: that MCU was finished from the zero fill
+        // either way. A segment already reported has nothing new to add.
+        if huffman.ran_out() {
+            segment_ended_early(&mut self.warnings, huffman)?;
+        }
         // Whole bytes of the scan's data that no MCU used, here or (below)
         // beyond what the bit reader can hold before it meets a marker.
         let mut extraneous = huffman.unread_bytes() > 0;
@@ -2188,6 +2198,13 @@ pub(crate) fn process_restart<R: Source>(
 
     if marker == Marker::RST(expected) {
         return Ok(true);
+    }
+    // The data ending is what put an EOI where the RST should be, and
+    // libjpeg-turbo reports it first: its data source warns "Premature end of
+    // JPEG file" as it runs dry, before `read_restart_marker` looks at the
+    // marker. Raised here so `warnings()` lists the two in that order.
+    if huffman.hit_end_of_data() {
+        warnings.raise(Warning::Truncated)?;
     }
     warnings.raise(Warning::RestartMarkerMismatch)?;
 

@@ -71,6 +71,9 @@ pub(crate) struct ArithDecoder {
     bad: bool,
     /// A `bad` was met at any time in the scan.
     saw_bad_code: bool,
+    /// The first `bad` of the scan came after the data source had ended, so
+    /// libjpeg-turbo warned of the end before the bad code.
+    bad_code_after_end: bool,
     source: HuffmanDecoder,
 }
 
@@ -83,6 +86,7 @@ impl ArithDecoder {
             ended: false,
             bad: false,
             saw_bad_code: false,
+            bad_code_after_end: false,
             source: HuffmanDecoder::new(strict),
         }
     }
@@ -94,6 +98,12 @@ impl ArithDecoder {
 
     pub(crate) fn saw_bad_code(&self) -> bool {
         self.saw_bad_code
+    }
+
+    /// Whether the scan's first bad code was met after the data source ended
+    /// (see `HuffmanDecoder::hit_end_of_data`).
+    pub(crate) fn bad_code_after_end(&self) -> bool {
+        self.bad_code_after_end
     }
 
     /// The marker and end-of-data state of the scan.
@@ -121,6 +131,9 @@ impl ArithDecoder {
 
     #[cold]
     fn fail(&mut self) {
+        if !self.saw_bad_code {
+            self.bad_code_after_end = self.source.hit_end_of_data();
+        }
         self.bad = true;
         self.saw_bad_code = true;
     }

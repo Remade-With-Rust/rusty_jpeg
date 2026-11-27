@@ -6,6 +6,26 @@ upstream possible.
 
 ## Unreleased
 
+- **Data that runs out inside a scan's last MCU is reported**
+  (`Warning::SegmentEndedEarly`), as libjpeg-turbo reports it ("Corrupt JPEG
+  data: premature end of data segment", `JWRN_HIT_MARKER`). The scan loops
+  looked for exhausted data at the start of each MCU, so a cut inside the last
+  one was silent when an EOI followed and reported only `Truncated` when none
+  did. Now `finish_scan` checks it too (DCT and lossless scans; arithmetic
+  coding reports nothing here, in both decoders). Diagnostics only: pixels are
+  unchanged, since that MCU was always finished from the zero fill. In strict
+  mode such a stream is now refused (`Error::Format`) where it decoded.
+  Two orders now follow libjpeg-turbo as well: `Truncated` comes before
+  `RestartMarkerMismatch` when the end of the data is what stood in for the
+  RST, and before `BadArithmeticCode` when the bad code was decoded from the
+  zero bytes after the end. Checked against libjpeg-turbo 3.1.0 on 14,590
+  streams cut near the end of every scan of 50 `cjpeg` files (baseline,
+  4:2:0/4:2:2/4:4:4/grey, restart intervals, progressive, multi-scan
+  sequential, lossless, arithmetic), with and without an appended EOI: the
+  warning kinds and their order now agree on all but the streams where this
+  decoder adds `MissingScan`, which libjpeg-turbo has no warning for.
+  Regression streams: section 6 of `tests/truncated_streams.rs`.
+
 - **12-bit, arithmetic-coded and two-component lossless JPEGs decode** (#28).
   Oracle for all of it: libjpeg-turbo 3.1.0. Fixtures it wrote, and the hashes
   of what it decodes them to, are in `tests/extended_modes.rs`

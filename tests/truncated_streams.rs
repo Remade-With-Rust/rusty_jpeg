@@ -846,3 +846,148 @@ fn lossless_point_transform_predicts_from_the_unscaled_samples() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. The data runs out inside the LAST MCU of a scan.
+// ---------------------------------------------------------------------------
+//
+// libjpeg-turbo warns "Corrupt JPEG data: premature end of data segment" the
+// moment a decode needs a bit the segment does not have (`jpeg_fill_bit_buffer`
+// in jdhuff.c), in whichever MCU that is. This decoder looked for exhausted
+// data only at the start of each MCU, so a cut inside the scan's last one was
+// silent when an EOI followed, and reported only `Truncated` when none did.
+// The pixels never depended on it: that MCU is finished from the zero fill
+// either way. Every expectation here was checked against libjpeg-turbo 3.1.0
+// (see `dump` in `stream_builder`).
+
+/// `warnings_of`, with the stream also written out for `RUSTY_JPEG_DUMP_STREAMS`.
+fn dumped_warnings(data: &[u8]) -> Vec<Warning> {
+    dump(data);
+    warnings_of(data)
+}
+
+/// `data` with its last `cut` bytes replaced by an EOI, and with nothing.
+fn cut_end(data: &[u8], cut: usize) -> (Vec<u8>, Vec<u8>) {
+    let kept = &data[..data.len() - 2 - cut];
+    ([kept, &[0xFF, 0xD9][..]].concat(), kept.to_vec())
+}
+
+#[test]
+fn data_ending_in_the_last_mcu_is_reported() {
+    for dri in [0u16, 4] {
+        for l in layouts(dri) {
+            let clean_data = l.clean();
+            let clean = l.decode(&clean_data);
+            // The last byte holds real bits of the last MCU (only a partial
+            // byte is padded), so losing it runs that MCU dry. (These
+            // streams fail on the decoder as it was, so the data does run out
+            // in the last MCU, not in one before it.)
+            for cut in [1, 2] {
+                let (with_eoi, without) = cut_end(&clean_data, cut);
+                // Every MCU before the last few, which the cut bytes held, is
+                // intact.
+                let tail: Vec<usize> = (l.mcus - 4 * cut..l.mcus).collect();
+                assert_recovered(&l.decode(&with_eoi), &clean, l.mcus, &[], &tail);
+                assert_recovered(&l.decode(&without), &clean, l.mcus, &[], &tail);
+                assert_eq!(
+                    dumped_warnings(&with_eoi),
+                    [Warning::SegmentEndedEarly],
+                    "dri={dri} ncomp={} cut={cut}",
+                    l.ncomp
+                );
+                assert_eq!(
+                    dumped_warnings(&without),
+                    [Warning::Truncated, Warning::SegmentEndedEarly],
+                    "dri={dri} ncomp={} cut={cut}",
+                    l.ncomp
+                );
+                assert!(matches!(strict_error(&with_eoi), Error::Format(_)));
+                assert!(matches!(strict_error(&without), Error::UnexpectedEof));
+            }
+        }
+    }
+}
+
+/// A progressive AC scan cut inside its last block (the last MCU of a
+/// non-interleaved scan), with and without the EOI.
+#[test]
+fn progressive_data_ending_in_the_last_block_is_reported() {
+    let p = Progressive::new(136, 136, |_| 40);
+    let full = p.full();
+    assert!(dumped_warnings(&full).is_empty());
+    let complete = p.luma(&full);
+    for cut in [1, 2] {
+        let (with_eoi, without) = cut_end(&full, cut);
+        for data in [&with_eoi, &without] {
+            let got = p.luma(data);
+            for b in 0..p.blocks - 4 * cut {
+                assert_eq!(block(&got, b), block(&complete, b), "cut={cut} block {b}");
+            }
+        }
+        assert_eq!(dumped_warnings(&with_eoi), [Warning::SegmentEndedEarly]);
+        assert_eq!(
+            dumped_warnings(&without),
+            [Warning::Truncated, Warning::SegmentEndedEarly]
+        );
+    }
+}
+
+/// A lossless scan cut inside its last row (the lossless decoder's unit).
+#[test]
+fn lossless_data_ending_in_the_last_row_is_reported() {
+    // `decode` only: the planar output does not take a lossless frame.
+    let warnings = |data: &[u8]| {
+        dump(data);
+        let mut all = Vec::new();
+        for single in [true, false] {
+            let mut d = Decoder::new(data);
+            d.set_single_threaded(single);
+            d.decode().unwrap_or_else(|e| panic!("lossless: {e}"));
+            all.push(d.warnings().to_vec());
+        }
+        assert_eq!(all[0], all[1]);
+        all.remove(0)
+    };
+    for restart_rows in [0usize, 4] {
+        let l = Lossless::new(16, 12, restart_rows);
+        let full = l.clean();
+        let clean = l.decode(&full);
+        assert!(warnings(&full).is_empty());
+        let (with_eoi, without) = cut_end(&full, 1);
+        for data in [&with_eoi, &without] {
+            assert_eq!(l.decode(data)[..11], clean[..11]);
+        }
+        assert_eq!(warnings(&with_eoi), [Warning::SegmentEndedEarly]);
+        assert_eq!(
+            warnings(&without),
+            [Warning::Truncated, Warning::SegmentEndedEarly]
+        );
+    }
+}
+
+/// The order of the warnings when the end of the data meets a restart
+/// boundary: libjpeg-turbo's data source reports the end as it runs dry, so
+/// before the EOI it supplies is found in place of the RST.
+#[test]
+fn end_of_data_at_a_restart_is_reported_before_the_marker_mismatch() {
+    use Warning::{RestartMarkerMismatch as Mismatch, SegmentEndedEarly as Early, Truncated};
+    for l in layouts(4) {
+        let mut prefix = l.hdr.clone();
+        for (i, seg) in l.segs[..10].iter().enumerate() {
+            prefix.extend_from_slice(seg);
+            prefix.extend(rst(i));
+        }
+        let mut one_byte_in = prefix.clone();
+        one_byte_in.push(l.segs[10][0]);
+        // After a restart marker, and one byte into the segment after it: the
+        // segment runs dry, then the next restart finds the end.
+        assert_eq!(dumped_warnings(&prefix), [Truncated, Early, Mismatch]);
+        assert_eq!(dumped_warnings(&one_byte_in), [Truncated, Early, Mismatch]);
+        // At the end of a segment, without its marker or with its FF only:
+        // the restart finds the end first, then the next segment is empty.
+        let at_marker = &prefix[..prefix.len() - 2];
+        let in_marker = &prefix[..prefix.len() - 1];
+        assert_eq!(dumped_warnings(at_marker), [Truncated, Mismatch, Early]);
+        assert_eq!(dumped_warnings(in_marker), [Truncated, Mismatch, Early]);
+    }
+}
