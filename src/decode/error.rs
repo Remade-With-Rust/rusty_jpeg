@@ -87,8 +87,10 @@ pub enum Warning {
     /// An entropy-coded segment ran out of data (it ended at a marker, or at
     /// the end of the data) before all of its MCUs were decoded. The rest of
     /// the segment is uniform grey, or left as earlier scans had it in a
-    /// progressive image. libjpeg-turbo: "Corrupt JPEG data: premature end of
-    /// data segment".
+    /// progressive image. Also raised when only the scan's last MCU is short:
+    /// that MCU is finished from zero bits, as in libjpeg-turbo, so nothing
+    /// else changes. libjpeg-turbo: "Corrupt JPEG data: premature end of data
+    /// segment".
     SegmentEndedEarly,
     /// A bit sequence that is no code of the scan's Huffman table. It reads as
     /// symbol 0 and decoding continues, out of step until the next restart
