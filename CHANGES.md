@@ -6,6 +6,58 @@ upstream possible.
 
 ## Unreleased
 
+- **Decoding now gives the same pixels on every CPU. On x86 the default
+  output changes: it now equals the scalar build and every other platform,
+  and differs from 0.4.15 by up to ±3 per sample.** Until now the SSSE3 and
+  AVX2 IDCT kernels (and the NEON and wasm ones) used Q15 `mulhrs` constants
+  with saturating 16-bit adds, and the YCbCr->RGB kernels used Q15 constants
+  against the scalar's 20-bit ones. So an x86 machine with SSSE3 decoded
+  most JPEGs differently from `platform_independent`, `no_std`, aarch64 or
+  an older CPU. On a 554-file corpus (libjpeg-turbo `cjpeg` across
+  subsamplings, qualities, progressive, restart and arithmetic coding; the
+  repo fixtures; 246 JPEGs from the pdf.js test PDFs), 536 files decode
+  differently from 0.4.15 on x86. 2.07% of output samples change: 87.9% of
+  those by 1, 11.9% by 2, 0.16% by 3. The IDCT alone (luma plane) accounts
+  for 1.32% of samples, all by 1; the rest is colour conversion. Scalar
+  output is unchanged, so non-x86 and scalar builds decode exactly as
+  before.
+  - **Scalar is the reference.** Neither path matches libjpeg-turbo's ISLOW
+    IDCT (3.1.0, `djpeg -dct int`), but the scalar comes closer: on luma it
+    differs from ISLOW in 0.30% of samples, the old SIMD path in 1.20%. The
+    scalar is stb_image's IDCT (12-bit constants); ISLOW uses 13-bit ones.
+  - **How the kernels are exact.** Up to its final shifts, the scalar IDCT
+    is wrapping `i32` arithmetic, i.e. linear modulo 2^32. So each 1-D output
+    regroups into dot products of input pairs (`idct::simd_k`), which
+    `pmaddwd`, `i32x4.dot_i16x8_s` and `vmlal` compute exactly. Their inputs
+    are 16-bit, so a block takes the vector path only if every dequantized
+    coefficient and every first-pass output fits `i16`. Every block of the
+    corpus above did (9.97 M blocks); one that does not (16-bit tables,
+    hostile data) goes to the scalar kernel whole. Colour:
+    `(y << 20 + HALF + K*c) >> 20 == y + ((HALF + K*c) >> 20)`. R and B use
+    16-bit `pmulhrsw` forms proven over all 256 inputs; G uses an exact
+    32-bit split of `K*c`.
+  - **Tests**, all exact equality: every IDCT kernel and the AVX2 pair
+    against the scalar over 300k/150k blocks in eight families that straddle
+    the fast-path limits, plus extremes. Every colour kernel on all 65,536
+    (cb, cr) pairs. Whole images decoded at each x86 rung against the
+    forced-scalar decode. The saturated-block test no longer skips SIMD
+    builds. The no_std golden hash now has a single decoded value, asserted
+    on every target. CI runs the NEON decode kernels (`--features
+    nightly_aarch64_neon`) on the ARM runner.
+  - **New knob:** `RUSTY_JPEG_DECODE_ISA=scalar|ssse3|avx2` caps the x86
+    decode kernels (read once), so one binary can be checked on every rung.
+  - **Speed: exactness costs up to 8%.** 3840x2400 q90 photos, median of
+    12 paired rounds against 0.4.15, in a run where 0.4.15 against itself
+    read 0.983-1.031: baseline 4:2:0 0.92-0.96x, 4:2:2 0.92x, 4:4:4 0.97x,
+    progressive 4:2:0 1.00x and 4:4:4 0.97x, greyscale 0.95x,
+    1024x640 4:2:0 0.97x. Instruction count per decode: +4.4% greyscale,
+    +7.7% 4:2:0, +10.4% 4:4:4 (callgrind). Still 1.19-1.64x faster than
+    zune-jpeg 0.5.15 on every layout. Recovered along the way: cheaper exact
+    R/B forms in the x86 colour kernels (colour line 250.6M -> 166.0M Ir
+    for six 4:4:4 decodes) and IDCT half-passes finished one at a time,
+    which cut the AVX2 pair kernel's stack spills from 153 to 99
+    references.
+
 - **Data that runs out inside a scan's last MCU is reported**
   (`Warning::SegmentEndedEarly`), as libjpeg-turbo reports it ("Corrupt JPEG
   data: premature end of data segment", `JWRN_HIT_MARKER`). The scan loops

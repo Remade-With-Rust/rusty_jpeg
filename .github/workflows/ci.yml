@@ -68,6 +68,12 @@ jobs:
       # run, that kernel is unverified.
       - name: Test (release, NEON)
         run: cargo test --release
+      # The decoder's NEON IDCT and YCbCr kernels sit behind
+      # `nightly_aarch64_neon`, so the step above never runs them. Here
+      # `idct_kernels_match_scalar` and `ycbcr_kernels_match_scalar` certify
+      # them bit-exact against the scalar oracle.
+      - name: Test (release, NEON decode kernels)
+        run: cargo test --release --features nightly_aarch64_neon
 
   aarch64-crosscheck:
     name: aarch64 (cross-compile only)

@@ -78,6 +78,38 @@ campaign's harness runs under
 [rusty_alloc](https://github.com/Remade-With-Rust/rusty_alloc), the pure-Rust
 remake of mimalloc that our binaries ship with.
 
+**Since the next release, the same pixels on every CPU, and somewhat
+slower.** The x86 IDCT and colour kernels used to round differently from
+the scalar code, so x86 output differed from every other platform. They are
+now bit-exact twins of it, which costs some speed. The table above predates
+that change. Re-measured against 0.4.15 and zune-jpeg 0.5.15:
+
+| case (3840&times;2400 unless noted) | exact kernels vs 0.4.15 | exact kernels vs zune-jpeg |
+|---|---:|---:|
+| baseline 4:2:0 | 0.96&times; | 1.28&times; |
+| baseline 4:2:0, second photo | 0.92&times; | 1.25&times; |
+| baseline 4:2:2 | 0.92&times; | 1.19&times; |
+| baseline 4:4:4 | 0.97&times; | 1.19&times; |
+| progressive 4:2:0 | 1.00&times; | 1.53&times; |
+| progressive 4:4:4 | 0.97&times; | 1.64&times; |
+| greyscale baseline | 0.95&times; | 1.50&times;&dagger; |
+| baseline 4:2:0, 1024&times;640 | 0.97&times; | 1.19&times; |
+
+So the decoder is still ahead of zune-jpeg on every layout, by less than
+the table above says. The instruction count tells the same story without the
+clock's noise: per decode, +4.4% greyscale, +7.7% 4:2:0 and +10.4% 4:4:4
+against 0.4.15 (callgrind).
+
+*Method:* photos written by libjpeg-turbo 3.1.0 `cjpeg`, quality 90; one
+measurement program built against each library, under rusty_alloc; one
+pinned core at High priority; minimum per-decode time over in-memory loops
+of 2.5 s per process; 12 rounds with the arm order rotated; ratio = median of
+the per-round ratios. A null arm (0.4.15 against itself) in the same run
+read 0.983&ndash;1.031, so differences under about 3% are noise. The box was
+shared with an unrelated job throughout, so absolute times are higher than
+the table above and are not comparable with it. &dagger;zune-jpeg expands
+greyscale to RGB by default, so this row flatters us.
+
 **Not in this table:** 12-bit DCT files and arithmetic-coded files, which
 `Decoder` reads ([#28](https://github.com/Remade-With-Rust/rusty_jpeg/issues/28))
 but with scalar code. Lossless arithmetic coding (SOF11) is refused with

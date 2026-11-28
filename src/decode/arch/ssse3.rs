@@ -1,104 +1,149 @@
+//! 128-bit x86 kernels: the single-block IDCT and YCbCr->RGB.
+//!
+//! Both are bit-exact twins of the scalar code (`idct.rs`,
+//! `decoder.rs::ycbcr_to_rgb`). The arithmetic is SSE2 (`pmaddwd`, 32-bit adds
+//! and shifts, saturating packs); SSSE3 is needed only for the `pshufb` RGB
+//! interleave, and is what the dispatcher detects.
+
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use crate::decode::decoder::ycc_k;
+use crate::decode::idct::simd_k;
+
+/// A `pmaddwd` operand: the pair `k = [even, odd]` in every 32-bit lane, so
+/// `madd(interleave(a, b), pair(k)) = a * k[0] + b * k[1]` per lane, exactly
+/// (modulo 2^32, which is the scalar's own arithmetic).
+#[inline]
 #[target_feature(enable = "ssse3")]
-unsafe fn idct8(data: &mut [__m128i; 8]) {
-    // The fixed-point constants here are obtained by taking the fractional part of the constants
-    // from the non-SIMD implementation and scaling them up by 1<<15. This is because
-    // _mm_mulhrs_epi16(a, b) is effectively equivalent to (a*b)>>15 (except for possibly some
-    // slight differences in rounding).
-
-    // The code here is effectively equivalent to the calls to "kernel" in idct.rs, except that it
-    // doesn't apply any further scaling and fixed point constants have a different precision.
-
-    let p2 = data[2];
-    let p3 = data[6];
-    let p1 = _mm_mulhrs_epi16(_mm_adds_epi16(p2, p3), _mm_set1_epi16(17734)); // 0.5411961
-    let t2 = _mm_subs_epi16(
-        _mm_subs_epi16(p1, p3),
-        _mm_mulhrs_epi16(p3, _mm_set1_epi16(27779)), // 0.847759065
-    );
-    let t3 = _mm_adds_epi16(p1, _mm_mulhrs_epi16(p2, _mm_set1_epi16(25079))); // 0.765366865
-
-    let p2 = data[0];
-    let p3 = data[4];
-    let t0 = _mm_adds_epi16(p2, p3);
-    let t1 = _mm_subs_epi16(p2, p3);
-
-    let x0 = _mm_adds_epi16(t0, t3);
-    let x3 = _mm_subs_epi16(t0, t3);
-    let x1 = _mm_adds_epi16(t1, t2);
-    let x2 = _mm_subs_epi16(t1, t2);
-
-    let t0 = data[7];
-    let t1 = data[5];
-    let t2 = data[3];
-    let t3 = data[1];
-
-    let p3 = _mm_adds_epi16(t0, t2);
-    let p4 = _mm_adds_epi16(t1, t3);
-    let p1 = _mm_adds_epi16(t0, t3);
-    let p2 = _mm_adds_epi16(t1, t2);
-    let p5 = _mm_adds_epi16(p3, p4);
-    let p5 = _mm_adds_epi16(p5, _mm_mulhrs_epi16(p5, _mm_set1_epi16(5763))); // 0.175875602
-
-    let t0 = _mm_mulhrs_epi16(t0, _mm_set1_epi16(9786)); // 0.298631336
-    let t1 = _mm_adds_epi16(
-        _mm_adds_epi16(t1, t1),
-        _mm_mulhrs_epi16(t1, _mm_set1_epi16(1741)), // 0.053119869
-    );
-    let t2 = _mm_adds_epi16(
-        _mm_adds_epi16(t2, _mm_adds_epi16(t2, t2)),
-        _mm_mulhrs_epi16(t2, _mm_set1_epi16(2383)), // 0.072711026
-    );
-    let t3 = _mm_adds_epi16(t3, _mm_mulhrs_epi16(t3, _mm_set1_epi16(16427))); // 0.501321110
-
-    let p1 = _mm_subs_epi16(p5, _mm_mulhrs_epi16(p1, _mm_set1_epi16(29490))); // 0.899976223
-    let p2 = _mm_subs_epi16(
-        _mm_subs_epi16(_mm_subs_epi16(p5, p2), p2),
-        _mm_mulhrs_epi16(p2, _mm_set1_epi16(18446)), // 0.562915447
-    );
-
-    let p3 = _mm_subs_epi16(
-        _mm_mulhrs_epi16(p3, _mm_set1_epi16(-31509)), // -0.961570560
-        p3,
-    );
-    let p4 = _mm_mulhrs_epi16(p4, _mm_set1_epi16(-12785)); // -0.390180644
-
-    let t3 = _mm_adds_epi16(_mm_adds_epi16(p1, p4), t3);
-    let t2 = _mm_adds_epi16(_mm_adds_epi16(p2, p3), t2);
-    let t1 = _mm_adds_epi16(_mm_adds_epi16(p2, p4), t1);
-    let t0 = _mm_adds_epi16(_mm_adds_epi16(p1, p3), t0);
-
-    data[0] = _mm_adds_epi16(x0, t3);
-    data[7] = _mm_subs_epi16(x0, t3);
-    data[1] = _mm_adds_epi16(x1, t2);
-    data[6] = _mm_subs_epi16(x1, t2);
-    data[2] = _mm_adds_epi16(x2, t1);
-    data[5] = _mm_subs_epi16(x2, t1);
-    data[3] = _mm_adds_epi16(x3, t0);
-    data[4] = _mm_subs_epi16(x3, t0);
+unsafe fn pair(k: [i16; 2]) -> __m128i {
+    _mm_set1_epi32((i32::from(k[1]) << 16) | i32::from(k[0] as u16))
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// Half of one 1-D pass: four lanes (columns, or rows on the second pass) of
+/// the scalar `kernel`, from inputs interleaved as `(s0,s4)`, `(s2,s6)`,
+/// `(s1,s3)` and `(s5,s7)`. Returns output `n` as `L_n(s) + bias` in `i32`,
+/// exactly the scalar's value before its shift (see `idct::simd_k`).
+#[inline]
 #[target_feature(enable = "ssse3")]
-unsafe fn transpose8(data: &mut [__m128i; 8]) {
-    // Transpose a 8x8 matrix with a sequence of interleaving operations.
-    // Naming: dABl contains elements from the *l*ower halves of vectors A and B, interleaved, i.e.
-    // A0 B0 A1 B1 ...
-    // dABCDll contains elements from the lower quarter (ll) of vectors A, B, C, D, interleaved -
-    // A0 B0 C0 D0 A1 B1 C1 D1 ...
-    let d01l = _mm_unpacklo_epi16(data[0], data[1]);
-    let d23l = _mm_unpacklo_epi16(data[2], data[3]);
-    let d45l = _mm_unpacklo_epi16(data[4], data[5]);
-    let d67l = _mm_unpacklo_epi16(data[6], data[7]);
-    let d01h = _mm_unpackhi_epi16(data[0], data[1]);
-    let d23h = _mm_unpackhi_epi16(data[2], data[3]);
-    let d45h = _mm_unpackhi_epi16(data[4], data[5]);
-    let d67h = _mm_unpackhi_epi16(data[6], data[7]);
+unsafe fn pass_half(
+    s04: __m128i,
+    s26: __m128i,
+    s13: __m128i,
+    s57: __m128i,
+    bias: __m128i,
+) -> [__m128i; 8] {
+    let t2 = _mm_madd_epi16(s26, pair(simd_k::EVEN_T2));
+    let t3 = _mm_madd_epi16(s26, pair(simd_k::EVEN_T3));
+    let t0 = _mm_add_epi32(_mm_madd_epi16(s04, pair([simd_k::FSH, simd_k::FSH])), bias);
+    let t1 = _mm_add_epi32(_mm_madd_epi16(s04, pair([simd_k::FSH, -simd_k::FSH])), bias);
+    let x = [
+        _mm_add_epi32(t0, t3),
+        _mm_add_epi32(t1, t2),
+        _mm_sub_epi32(t1, t2),
+        _mm_sub_epi32(t0, t3),
+    ];
+    let mut t = [_mm_setzero_si128(); 4];
+    for (n, c) in simd_k::ODD.iter().enumerate() {
+        t[n] = _mm_add_epi32(
+            _mm_madd_epi16(s13, pair([c[0], c[1]])),
+            _mm_madd_epi16(s57, pair([c[2], c[3]])),
+        );
+    }
+    // The scalar's output order: out[n] = xs[n] + ts[3-n], out[7-n] = xs[n] - ts[3-n].
+    let mut out = [_mm_setzero_si128(); 8];
+    for n in 0..4 {
+        out[n] = _mm_add_epi32(x[n], t[3 - n]);
+        out[7 - n] = _mm_sub_epi32(x[n], t[3 - n]);
+    }
+    out
+}
+
+/// Half of a pass, finished at once: shifted by `SHIFT` and packed to i16 in
+/// output pairs, `[packs(out0, out1), packs(out2, out3), ...]`. With `CHECK`,
+/// ORs `v + 0x8000` of every shifted output into `range` (its high half stays
+/// zero exactly when every `v` fits i16).
+///
+/// Finishing each half before starting the other keeps 8 registers live
+/// between them instead of 16 -- holding both halves' sixteen 32-bit outputs
+/// spilled to the stack. And `[out(2j) lanes 0-3 | out(2j+1) lanes 0-3]` is
+/// the first stage of the transpose up to a word shuffle, so the packing
+/// costs nothing extra (see `transpose_packed`).
+#[inline]
+#[target_feature(enable = "ssse3")]
+unsafe fn half<const SHIFT: i32, const CHECK: bool>(
+    s04: __m128i,
+    s26: __m128i,
+    s13: __m128i,
+    s57: __m128i,
+    bias: __m128i,
+    range: &mut __m128i,
+) -> [__m128i; 4] {
+    let o = pass_half(s04, s26, s13, s57, bias);
+    let k8000 = _mm_set1_epi32(0x8000);
+    let mut p = [_mm_setzero_si128(); 4];
+    for (j, pj) in p.iter_mut().enumerate() {
+        let a = _mm_srai_epi32::<SHIFT>(o[2 * j]);
+        let b = _mm_srai_epi32::<SHIFT>(o[2 * j + 1]);
+        if CHECK {
+            *range = _mm_or_si128(
+                *range,
+                _mm_or_si128(_mm_add_epi32(a, k8000), _mm_add_epi32(b, k8000)),
+            );
+        }
+        *pj = _mm_packs_epi32(a, b);
+    }
+    p
+}
+
+/// One 1-D pass over eight 16-bit lanes (`s[k]` holds input `k` for each
+/// lane), shifted, narrowed to i16 with signed saturation and transposed:
+/// element `n` of lane `r` comes back as element `r` of vector `n`.
+#[inline]
+#[target_feature(enable = "ssse3")]
+unsafe fn pass_t<const SHIFT: i32, const CHECK: bool>(
+    s: &[__m128i; 8],
+    bias: i32,
+    range: &mut __m128i,
+) -> [__m128i; 8] {
+    let bias = _mm_set1_epi32(bias);
+    let lo = half::<SHIFT, CHECK>(
+        _mm_unpacklo_epi16(s[0], s[4]),
+        _mm_unpacklo_epi16(s[2], s[6]),
+        _mm_unpacklo_epi16(s[1], s[3]),
+        _mm_unpacklo_epi16(s[5], s[7]),
+        bias,
+        range,
+    );
+    let hi = half::<SHIFT, CHECK>(
+        _mm_unpackhi_epi16(s[0], s[4]),
+        _mm_unpackhi_epi16(s[2], s[6]),
+        _mm_unpackhi_epi16(s[1], s[3]),
+        _mm_unpackhi_epi16(s[5], s[7]),
+        bias,
+        range,
+    );
+    transpose_packed(&lo, &hi)
+}
+
+/// Transpose an 8x8 i16 matrix given as row pairs: `lo[j]` holds columns
+/// 0-3 of rows `2j` and `2j+1`, `hi[j]` columns 4-7.
+#[inline]
+#[target_feature(enable = "ssse3")]
+unsafe fn transpose_packed(lo: &[__m128i; 4], hi: &[__m128i; 4]) -> [__m128i; 8] {
+    // [A0 A1 A2 A3 B0 B1 B2 B3] -> [A0 B0 A1 B1 A2 B2 A3 B3]: exactly
+    // `unpacklo/hi_epi16(A, B)` of the full rows, the usual first stage.
+    let m = _mm_setr_epi8(0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15);
+    let d01l = _mm_shuffle_epi8(lo[0], m);
+    let d23l = _mm_shuffle_epi8(lo[1], m);
+    let d45l = _mm_shuffle_epi8(lo[2], m);
+    let d67l = _mm_shuffle_epi8(lo[3], m);
+    let d01h = _mm_shuffle_epi8(hi[0], m);
+    let d23h = _mm_shuffle_epi8(hi[1], m);
+    let d45h = _mm_shuffle_epi8(hi[2], m);
+    let d67h = _mm_shuffle_epi8(hi[3], m);
     // Operating on 32-bits will interleave *consecutive pairs* of 16-bit integers.
     let d0123ll = _mm_unpacklo_epi32(d01l, d23l);
     let d0123lh = _mm_unpackhi_epi32(d01l, d23l);
@@ -109,16 +154,30 @@ unsafe fn transpose8(data: &mut [__m128i; 8]) {
     let d4567hl = _mm_unpacklo_epi32(d45h, d67h);
     let d4567hh = _mm_unpackhi_epi32(d45h, d67h);
     // Operating on 64-bits will interleave *consecutive quadruples* of 16-bit integers.
-    data[0] = _mm_unpacklo_epi64(d0123ll, d4567ll);
-    data[1] = _mm_unpackhi_epi64(d0123ll, d4567ll);
-    data[2] = _mm_unpacklo_epi64(d0123lh, d4567lh);
-    data[3] = _mm_unpackhi_epi64(d0123lh, d4567lh);
-    data[4] = _mm_unpacklo_epi64(d0123hl, d4567hl);
-    data[5] = _mm_unpackhi_epi64(d0123hl, d4567hl);
-    data[6] = _mm_unpacklo_epi64(d0123hh, d4567hh);
-    data[7] = _mm_unpackhi_epi64(d0123hh, d4567hh);
+    [
+        _mm_unpacklo_epi64(d0123ll, d4567ll),
+        _mm_unpackhi_epi64(d0123ll, d4567ll),
+        _mm_unpacklo_epi64(d0123lh, d4567lh),
+        _mm_unpackhi_epi64(d0123lh, d4567lh),
+        _mm_unpacklo_epi64(d0123hl, d4567hl),
+        _mm_unpackhi_epi64(d0123hl, d4567hl),
+        _mm_unpacklo_epi64(d0123hh, d4567hh),
+        _mm_unpackhi_epi64(d0123hh, d4567hh),
+    ]
 }
 
+/// Dequantize and inverse-transform one 8x8 block: the scalar
+/// `dequantize_and_idct_block_8x8_inner`, bit for bit.
+///
+/// The block takes the vector path when every dequantized coefficient and
+/// every first-pass output fits `i16` (always, for real images); otherwise it
+/// is handed to the scalar kernel whole. See `idct::simd_k` for why that makes
+/// the result exact.
+///
+/// # Safety
+///
+/// The CPU must support SSSE3. `output` must hold `output_linestride * 7 + 8`
+/// bytes (asserted).
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "ssse3")]
 pub unsafe fn dequantize_and_idct_block_8x8(
@@ -128,7 +187,7 @@ pub unsafe fn dequantize_and_idct_block_8x8(
     output: &mut [u8],
 ) {
     // The loop below will write to positions [output_linestride * i, output_linestride * i + 8)
-    // for 0<=i<8. Thus, the last accessed position is at an offset of output_linestrade * 7 + 7,
+    // for 0<=i<8. Thus, the last accessed position is at an offset of output_linestride * 7 + 7,
     // and if that position is in-bounds, so are all other accesses.
     assert!(
         output.len()
@@ -139,58 +198,62 @@ pub unsafe fn dequantize_and_idct_block_8x8(
                 .unwrap()
     );
 
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::*;
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::*;
+    let zero = _mm_setzero_si128();
 
-    const SHIFT: i32 = 3;
+    // Dequantize. `mullo` is the product's low half; the product fits `i16`
+    // exactly when the signed high half is the low half's sign extension.
+    // That high half is only right for `q < 0x8000`, so a table with any
+    // larger entry is treated as not fitting.
+    let mut s = [zero; 8];
+    let mut bad = zero;
+    let mut qor = zero;
+    for (i, row) in s.iter_mut().enumerate() {
+        // SAFETY: rows 0..8 of 8 elements lie inside the 64-element arrays.
+        let c = _mm_loadu_si128(coefficients.as_ptr().add(i * 8) as *const __m128i);
+        let q = _mm_loadu_si128(quantization_table.as_ptr().add(i * 8) as *const __m128i);
+        let lo = _mm_mullo_epi16(c, q);
+        let hi = _mm_mulhi_epi16(c, q);
+        bad = _mm_or_si128(bad, _mm_xor_si128(hi, _mm_srai_epi16(lo, 15)));
+        qor = _mm_or_si128(qor, q);
+        *row = lo;
+    }
+    bad = _mm_or_si128(bad, _mm_and_si128(qor, _mm_set1_epi16(i16::MIN)));
 
-    // Read the DCT coefficients, scale them up and dequantize them.
-    let mut data = [_mm_setzero_si128(); 8];
-    for (i, item) in data.iter_mut().enumerate() {
-        *item = _mm_slli_epi16(
-            _mm_mullo_epi16(
-                _mm_loadu_si128(coefficients.as_ptr().wrapping_add(i * 8) as *const _),
-                _mm_loadu_si128(quantization_table.as_ptr().wrapping_add(i * 8) as *const _),
-            ),
-            SHIFT,
-        );
+    // Columns. The outputs must fit i16 for the second pass: `v + 0x8000`
+    // has a zero high half exactly when `v` is in range, so OR-ing them all
+    // and testing the high halves checks every lane at once.
+    let mut range = zero;
+    let t = pass_t::<{ simd_k::PASS1_SHIFT }, true>(&s, simd_k::PASS1_BIAS, &mut range);
+    bad = _mm_or_si128(bad, _mm_srli_epi32(range, 16));
+    if _mm_movemask_epi8(_mm_cmpeq_epi8(bad, zero)) != 0xFFFF {
+        return super::idct_fallback(coefficients, quantization_table, output_linestride, output);
     }
 
-    // Usual column IDCT - transpose - column IDCT - transpose approach.
-    idct8(&mut data);
-    transpose8(&mut data);
-    idct8(&mut data);
-    transpose8(&mut data);
-
-    for (i, item) in data.iter_mut().enumerate() {
-        let mut buf = [0u8; 16];
-        // The two passes of the IDCT algorithm give us a factor of 8, so the shift here is
-        // increased by 3.
-        // As values will be stored in a u8, they need to be 128-centered and not 0-centered.
-        // We add 128 with the appropriate shift for that purpose.
-        const OFFSET: i16 = 128 << (SHIFT + 3);
-        // We want rounding right shift, so we should add (1/2) << (SHIFT+3) before shifting.
-        const ROUNDING_BIAS: i16 = (1 << (SHIFT + 3)) >> 1;
-
-        let data_with_offset = _mm_adds_epi16(*item, _mm_set1_epi16(OFFSET + ROUNDING_BIAS));
-
-        _mm_storeu_si128(
-            buf.as_mut_ptr() as *mut _,
-            _mm_packus_epi16(
-                _mm_srai_epi16(data_with_offset, SHIFT + 3),
-                _mm_setzero_si128(),
-            ),
-        );
-        core::ptr::copy_nonoverlapping::<u8>(
-            buf.as_ptr(),
-            output.as_mut_ptr().wrapping_add(output_linestride * i) as *mut _,
-            8,
+    // Rows. `packs` to i16 then `packus` to u8 saturate in turn, which is the
+    // scalar's `clamp(0, 255)` of the shifted value.
+    let o = pass_t::<{ simd_k::PASS2_SHIFT }, false>(&t, simd_k::PASS2_BIAS, &mut range);
+    for (i, row) in o.iter().enumerate() {
+        // SAFETY: the assert above bounds `output_linestride * i + 8`.
+        _mm_storel_epi64(
+            output.as_mut_ptr().add(output_linestride * i) as *mut __m128i,
+            _mm_packus_epi16(*row, *row),
         );
     }
 }
 
+/// YCbCr -> RGB for 8 pixels per step: `ycbcr_to_rgb`, bit for bit.
+///
+/// Each channel is `y + ((HALF + K * c) >> 20)` (see `decoder::ycc_k`). The R
+/// and B offsets come from 16-bit `pmulhrsw` forms proven exact over every
+/// input; G's from `pmaddwd` of `(c << 8, c)` pairs against
+/// `(K >> 8, K & 255)` in 32-bit lanes. Each is added to `y` in 16-bit lanes
+/// and narrowed with unsigned saturation, which is the scalar's clamp.
+/// Returns the number of pixels converted (a multiple of 8); the caller does
+/// the rest.
+///
+/// # Safety
+///
+/// The CPU must support SSSE3. Lengths are asserted.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "ssse3")]
 pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &mut [u8]) -> usize {
@@ -199,89 +262,86 @@ pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &
     assert!(num <= y.len());
     assert!(num <= cb.len());
     assert!(num <= cr.len());
-    // _mm_loadu_si64 generates incorrect code for Rust <1.58. To circumvent this, we use a full
-    // 128-bit load, but that requires leaving an extra vector of border to the scalar code.
-    // From Rust 1.58 on, the _mm_loadu_si128 can be replaced with _mm_loadu_si64 and this
-    // .saturating_sub() can be removed.
-    let num_vecs = (num / 8).saturating_sub(1);
+    let num_vecs = num / 8;
+
+    let zero = _mm_setzero_si128();
+    let c128 = _mm_set1_epi16(128);
+    let half = _mm_set1_epi32(ycc_k::HALF);
+    let k_r = _mm_set1_epi16(ycc_k::R_MULHRS);
+    let k_b = _mm_set1_epi16(ycc_k::B_MULHRS);
+    let k_gb = pair(ycc_k::split(ycc_k::CB_G));
+    let k_gr = pair(ycc_k::split(ycc_k::CR_G));
+
+    // Control vectors for _mm_shuffle_epi8. -0x7F is selected so that the resulting position
+    // after _mm_shuffle_epi8 will be filled with 0, so that the r, g, and b vectors can then
+    // be OR-ed together.
+    let shufr = _mm_setr_epi8(
+        0, -0x7F, -0x7F, 1, -0x7F, -0x7F, 2, -0x7F, -0x7F, 3, -0x7F, -0x7F, 4, -0x7F, -0x7F, 5,
+    );
+    let shufg = _mm_setr_epi8(
+        -0x7F, 0, -0x7F, -0x7F, 1, -0x7F, -0x7F, 2, -0x7F, -0x7F, 3, -0x7F, -0x7F, 4, -0x7F, -0x7F,
+    );
+    let shufb = _mm_alignr_epi8(shufg, shufg, 15);
+    // For the next part of the rgb vectors, we need to select R values from 6 up, G and B from
+    // 5 up. The highest bit of -0x7F + 6 is still set, so the corresponding location will
+    // still be 0.
+    let shufr1 = _mm_add_epi8(shufb, _mm_set1_epi8(6));
+    let shufg1 = _mm_add_epi8(shufr, _mm_set1_epi8(5));
+    let shufb1 = _mm_add_epi8(shufg, _mm_set1_epi8(5));
 
     for i in 0..num_vecs {
-        const SHIFT: i32 = 6;
-        // Load.
-        let y = _mm_loadu_si128(y.as_ptr().wrapping_add(i * 8) as *const _);
-        let cb = _mm_loadu_si128(cb.as_ptr().wrapping_add(i * 8) as *const _);
-        let cr = _mm_loadu_si128(cr.as_ptr().wrapping_add(i * 8) as *const _);
+        // SAFETY: 8 * i + 8 <= num, which the asserts bound by every slice.
+        let load =
+            |p: &[u8]| _mm_unpacklo_epi8(_mm_loadl_epi64(p.as_ptr().add(i * 8) as *const _), zero);
+        let yv = load(y);
+        let cbv = _mm_sub_epi16(load(cb), c128);
+        let crv = _mm_sub_epi16(load(cr), c128);
 
-        // Convert to 16 bit.
-        let shuf16 = _mm_setr_epi8(
-            0, -0x7F, 1, -0x7F, 2, -0x7F, 3, -0x7F, 4, -0x7F, 5, -0x7F, 6, -0x7F, 7, -0x7F,
+        // R and B: the 16-bit forms proven over all 256 inputs (`ycc_k`).
+        let dr = _mm_mulhrs_epi16(_mm_slli_epi16(crv, 1), k_r);
+        let db = _mm_add_epi16(cbv, _mm_mulhrs_epi16(cbv, k_b));
+
+        // G: (c << 8, c) pairs against `split(K)`, exact in 32-bit lanes;
+        // `c << 8` stays within i16 for c in -128..=127.
+        let cb_lo = _mm_unpacklo_epi16(_mm_slli_epi16(cbv, 8), cbv);
+        let cb_hi = _mm_unpackhi_epi16(_mm_slli_epi16(cbv, 8), cbv);
+        let cr_lo = _mm_unpacklo_epi16(_mm_slli_epi16(crv, 8), crv);
+        let cr_hi = _mm_unpackhi_epi16(_mm_slli_epi16(crv, 8), crv);
+        let dg = _mm_packs_epi32(
+            _mm_srai_epi32(
+                _mm_add_epi32(
+                    _mm_add_epi32(_mm_madd_epi16(cb_lo, k_gb), _mm_madd_epi16(cr_lo, k_gr)),
+                    half,
+                ),
+                ycc_k::SHIFT,
+            ),
+            _mm_srai_epi32(
+                _mm_add_epi32(
+                    _mm_add_epi32(_mm_madd_epi16(cb_hi, k_gb), _mm_madd_epi16(cr_hi, k_gr)),
+                    half,
+                ),
+                ycc_k::SHIFT,
+            ),
         );
-        let y = _mm_slli_epi16(_mm_shuffle_epi8(y, shuf16), SHIFT);
-        let cb = _mm_slli_epi16(_mm_shuffle_epi8(cb, shuf16), SHIFT);
-        let cr = _mm_slli_epi16(_mm_shuffle_epi8(cr, shuf16), SHIFT);
 
-        // Add offsets
-        let c128 = _mm_set1_epi16(128 << SHIFT);
-        let y = _mm_adds_epi16(y, _mm_set1_epi16((1 << SHIFT) >> 1));
-        let cb = _mm_subs_epi16(cb, c128);
-        let cr = _mm_subs_epi16(cr, c128);
-
-        // Compute cr * 1.402, cb * 0.34414, cr * 0.71414, cb * 1.772
-        let cr_140200 = _mm_adds_epi16(_mm_mulhrs_epi16(cr, _mm_set1_epi16(13173)), cr);
-        let cb_034414 = _mm_mulhrs_epi16(cb, _mm_set1_epi16(11276));
-        let cr_071414 = _mm_mulhrs_epi16(cr, _mm_set1_epi16(23401));
-        let cb_177200 = _mm_adds_epi16(_mm_mulhrs_epi16(cb, _mm_set1_epi16(25297)), cb);
-
-        // Last conversion step.
-        let r = _mm_adds_epi16(y, cr_140200);
-        let g = _mm_subs_epi16(y, _mm_adds_epi16(cb_034414, cr_071414));
-        let b = _mm_adds_epi16(y, cb_177200);
-
-        // Shift back and convert to u8.
-        let zero = _mm_setzero_si128();
-        let r = _mm_packus_epi16(_mm_srai_epi16(r, SHIFT), zero);
-        let g = _mm_packus_epi16(_mm_srai_epi16(g, SHIFT), zero);
-        let b = _mm_packus_epi16(_mm_srai_epi16(b, SHIFT), zero);
+        let r = _mm_packus_epi16(_mm_add_epi16(yv, dr), zero);
+        let g = _mm_packus_epi16(_mm_add_epi16(yv, dg), zero);
+        let b = _mm_packus_epi16(_mm_add_epi16(yv, db), zero);
 
         // Shuffle rrrrrrrrggggggggbbbbbbbb to rgbrgbrgb...
-
-        // Control vectors for _mm_shuffle_epi8. -0x7F is selected so that the resulting position
-        // after _mm_shuffle_epi8 will be filled with 0, so that the r, g, and b vectors can then
-        // be OR-ed together.
-        let shufr = _mm_setr_epi8(
-            0, -0x7F, -0x7F, 1, -0x7F, -0x7F, 2, -0x7F, -0x7F, 3, -0x7F, -0x7F, 4, -0x7F, -0x7F, 5,
-        );
-        let shufg = _mm_setr_epi8(
-            -0x7F, 0, -0x7F, -0x7F, 1, -0x7F, -0x7F, 2, -0x7F, -0x7F, 3, -0x7F, -0x7F, 4, -0x7F,
-            -0x7F,
-        );
-        let shufb = _mm_alignr_epi8(shufg, shufg, 15);
-
         let rgb_low = _mm_or_si128(
             _mm_shuffle_epi8(r, shufr),
             _mm_or_si128(_mm_shuffle_epi8(g, shufg), _mm_shuffle_epi8(b, shufb)),
         );
-
-        // For the next part of the rgb vectors, we need to select R values from 6 up, G and B from
-        // 5 up. The highest bit of -0x7F + 6 is still set, so the corresponding location will
-        // still be 0.
-        let shufr1 = _mm_add_epi8(shufb, _mm_set1_epi8(6));
-        let shufg1 = _mm_add_epi8(shufr, _mm_set1_epi8(5));
-        let shufb1 = _mm_add_epi8(shufg, _mm_set1_epi8(5));
-
         let rgb_hi = _mm_or_si128(
             _mm_shuffle_epi8(r, shufr1),
             _mm_or_si128(_mm_shuffle_epi8(g, shufg1), _mm_shuffle_epi8(b, shufb1)),
         );
 
-        let mut data = [0u8; 32];
-        _mm_storeu_si128(data.as_mut_ptr() as *mut _, rgb_low);
-        _mm_storeu_si128(data.as_mut_ptr().wrapping_add(16) as *mut _, rgb_hi);
-        core::ptr::copy_nonoverlapping::<u8>(
-            data.as_ptr(),
-            output.as_mut_ptr().wrapping_add(24 * i),
-            24,
-        );
+        // SAFETY: bytes 24 * i .. 24 * i + 24 lie inside `output` (3 * num).
+        let out = output.as_mut_ptr().add(24 * i);
+        _mm_storeu_si128(out as *mut __m128i, rgb_low);
+        _mm_storel_epi64(out.add(16) as *mut __m128i, rgb_hi);
     }
 
     num_vecs * 8

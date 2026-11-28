@@ -274,8 +274,306 @@ pub fn dequantize_and_idct_block_8x8(
         }
     }
 
+    dequantize_and_idct_block_8x8_scalar(
+        coefficients,
+        quantization_table,
+        output_linestride,
+        output,
+    )
+}
+
+/// The scalar 8x8 IDCT: the definition every vector kernel must reproduce bit
+/// for bit, and the path those kernels hand a block to when its values leave
+/// the range their 16-bit lanes can carry (see [`simd_k`]).
+pub(crate) fn dequantize_and_idct_block_8x8_scalar(
+    coefficients: &[i16; 64],
+    quantization_table: &[u16; 64],
+    output_linestride: usize,
+    output: &mut [u8],
+) {
     let output = output.chunks_mut(output_linestride);
     dequantize_and_idct_block_8x8_inner(coefficients, quantization_table, output)
+}
+
+/// Fixed-point constants for the vector IDCT kernels, derived from the scalar
+/// kernel's so the two compute the same integers.
+///
+/// # Why the kernels can be bit-exact with 16-bit inputs
+///
+/// The scalar kernel does nothing but wrapping `i32` adds and multiplies
+/// between its input load and its final shifts. That is arithmetic modulo
+/// 2^32, where multiplication distributes, so each 1-D output is ONE linear
+/// form in the eight inputs and any regrouping of it gives the same `i32`.
+/// The kernels regroup it into dot products of input pairs -- `pmaddwd` on
+/// x86, `i32x4.dot_i16x8_s` on wasm, `vmlal` on NEON -- whose products and sums
+/// are also exact modulo 2^32. Each entry below is one coefficient of those
+/// forms; e.g. `t2 = (s2 + s6) * A + s6 * B = s2 * A + s6 * (A + B)`.
+///
+/// Those instructions take 16-bit inputs, so a block qualifies only when every
+/// dequantized coefficient AND every first-pass output fits `i16`. Real images
+/// always do (the values are bounded by the sample range); a block that does
+/// not -- 16-bit quantization tables, hostile data -- goes to the scalar kernel
+/// whole. Under that condition the scalar's per-column DC shortcut
+/// (`dcterm = s0 << 2`) equals the full transform (`s0 << 12` cannot wrap), so
+/// the kernels need no shortcut of their own.
+///
+/// `simd_constants_match_scalar` pins every base constant to `stbi_f2f`.
+#[allow(dead_code)]
+pub(crate) mod simd_k {
+    // The scalar kernel's constants: `stbi_f2f(x)` = `(x * 4096 + 0.5) as i32`,
+    // which truncates toward zero, so the negative ones are NOT rounded.
+    pub const A: i32 = 2217; // 0.5411961
+    pub const B: i32 = -7567; // -1.847759065
+    pub const C: i32 = 3135; // 0.765366865
+    pub const D: i32 = 4816; // 1.175875602
+    pub const E: i32 = 1223; // 0.298631336
+    pub const F: i32 = 8410; // 2.053119869
+    pub const G: i32 = 12586; // 3.072711026
+    pub const H: i32 = 6149; // 1.501321110
+    pub const I: i32 = -3685; // -0.899976223
+    pub const J: i32 = -10497; // -2.562915447
+    pub const K: i32 = -8034; // -1.961570560
+    pub const L: i32 = -1597; // -0.390180644
+
+    const fn narrow(v: i32) -> i16 {
+        assert!(v >= i16::MIN as i32 && v <= i16::MAX as i32);
+        v as i16
+    }
+
+    /// `stbi_fsh` is `<< 12`, i.e. a multiply by 4096.
+    pub const FSH: i16 = 4096;
+    /// Even part: `t2 = s2 * EVEN_T2[0] + s6 * EVEN_T2[1]`, likewise `t3`.
+    pub const EVEN_T2: [i16; 2] = [narrow(A), narrow(A + B)];
+    pub const EVEN_T3: [i16; 2] = [narrow(A + C), narrow(A)];
+    /// Odd part: `ODD[n] = [c1, c3, c5, c7]`, so the scalar's `ts[n]` is
+    /// `s1 * c1 + s3 * c3 + s5 * c5 + s7 * c7`.
+    pub const ODD: [[i16; 4]; 4] = [
+        [
+            narrow(D + I),
+            narrow(D + K),
+            narrow(D),
+            narrow(E + D + I + K),
+        ],
+        [
+            narrow(D + L),
+            narrow(D + J),
+            narrow(F + D + J + L),
+            narrow(D),
+        ],
+        [
+            narrow(D),
+            narrow(G + D + J + K),
+            narrow(D + J),
+            narrow(D + K),
+        ],
+        [
+            narrow(H + D + I + L),
+            narrow(D),
+            narrow(D + L),
+            narrow(D + I),
+        ],
+    ];
+    /// The scalar's `x_scale` for each pass and the shift after it.
+    pub const PASS1_BIAS: i32 = 512;
+    pub const PASS1_SHIFT: i32 = 10;
+    pub const PASS2_BIAS: i32 = 65536 + (128 << 17);
+    pub const PASS2_SHIFT: i32 = 17;
+
+    /// The coefficient of input `k` in 1-D output `n` (before the bias).
+    pub const fn coef(n: usize, k: usize) -> i32 {
+        // Even part, as `[s0, s2, s4, s6]` coefficients of `xs[m]`.
+        let even: [[i32; 4]; 4] = [
+            [FSH as i32, EVEN_T3[0] as i32, FSH as i32, EVEN_T3[1] as i32],
+            [
+                FSH as i32,
+                EVEN_T2[0] as i32,
+                -(FSH as i32),
+                EVEN_T2[1] as i32,
+            ],
+            [
+                FSH as i32,
+                -(EVEN_T2[0] as i32),
+                -(FSH as i32),
+                -(EVEN_T2[1] as i32),
+            ],
+            [
+                FSH as i32,
+                -(EVEN_T3[0] as i32),
+                FSH as i32,
+                -(EVEN_T3[1] as i32),
+            ],
+        ];
+        // out[m] = xs[m] + ts[3-m], out[7-m] = xs[m] - ts[3-m].
+        let (m, sign) = if n < 4 { (n, 1) } else { (7 - n, -1) };
+        if k & 1 == 0 {
+            even[m][k / 2]
+        } else {
+            sign * ODD[3 - m][k / 2] as i32
+        }
+    }
+
+    /// The largest `sum_k |coef(n, k)|` over the outputs `n`: no first-pass
+    /// output exceeds `ROW_ABS_SUM * max|s|` in magnitude.
+    pub const ROW_ABS_SUM: i32 = {
+        let mut best = 0;
+        let mut n = 0;
+        while n < 8 {
+            let mut sum = 0;
+            let mut k = 0;
+            while k < 8 {
+                let c = coef(n, k);
+                sum += if c < 0 { -c } else { c };
+                k += 1;
+            }
+            if sum > best {
+                best = sum;
+            }
+            n += 1;
+        }
+        best
+    };
+
+    /// The largest dequantized magnitude for which every first-pass output
+    /// `(L(s) + PASS1_BIAS) >> PASS1_SHIFT` is guaranteed to fit `i16`; one
+    /// more and the worst sign pattern overflows. The oracle tests aim blocks
+    /// at it (`idct_kernels_match_scalar`, family 6), where the kernels' own
+    /// first-pass range check is decided.
+    ///
+    /// Skipping that check for blocks under this bound was built and measured:
+    /// classifying every coefficient cost more instructions than the check it
+    /// saved (531 against 523 Ir per AVX2 pair on a greyscale photo), so the
+    /// kernels check every block.
+    pub const FAST_MAX_IN: i32 = {
+        let m = ((i16::MAX as i32) * 1024 + 1023 - PASS1_BIAS) / ROW_ABS_SUM;
+        // The negative side: -ROW_ABS_SUM * m + bias must stay >= -32768 << 10.
+        assert!(-ROW_ABS_SUM * m + PASS1_BIAS >= (i16::MIN as i32) << PASS1_SHIFT);
+        assert!(m <= i16::MAX as i32);
+        m
+    };
+}
+
+/// `simd_k::coef` is the scalar kernel's linear form, and `FAST_MAX_IN` is a
+/// real bound: at the worst-case sign pattern for every output, the scalar's
+/// first pass stays inside `i16`, and one step past it, it does not.
+#[test]
+fn simd_fast_bound_is_tight_and_safe() {
+    use simd_k::*;
+    for n in 0..8 {
+        for k in 0..8 {
+            let mut s = [Wrapping(0i32); 8];
+            s[k] = Wrapping(1);
+            let Kernel { xs, ts } = kernel(s, 0);
+            let out = [
+                xs[0] + ts[3],
+                xs[1] + ts[2],
+                xs[2] + ts[1],
+                xs[3] + ts[0],
+                xs[3] - ts[0],
+                xs[2] - ts[1],
+                xs[1] - ts[2],
+                xs[0] - ts[3],
+            ];
+            assert_eq!(out[n].0, coef(n, k), "coef({n}, {k})");
+        }
+    }
+    let first_pass = |s: [Wrapping<i32>; 8], n: usize| {
+        let Kernel { xs, ts } = kernel(s, PASS1_BIAS);
+        let v = if n < 4 {
+            xs[n] + ts[3 - n]
+        } else {
+            xs[7 - n] - ts[n - 4]
+        };
+        v.0 >> PASS1_SHIFT
+    };
+    let mut worst_hi = i32::MIN;
+    let mut worst_lo = i32::MAX;
+    for n in 0..8 {
+        for sign in [1, -1] {
+            let s = core::array::from_fn(|k| Wrapping(sign * FAST_MAX_IN * coef(n, k).signum()));
+            let v = first_pass(s, n);
+            worst_hi = worst_hi.max(v);
+            worst_lo = worst_lo.min(v);
+        }
+    }
+    assert!(worst_hi <= i32::from(i16::MAX) && worst_lo >= i32::from(i16::MIN));
+    // Tight: one more and the worst output overflows.
+    let mut over = false;
+    for n in 0..8 {
+        for sign in [1, -1] {
+            let s =
+                core::array::from_fn(|k| Wrapping(sign * (FAST_MAX_IN + 1) * coef(n, k).signum()));
+            let v = first_pass(s, n);
+            over |= v > i32::from(i16::MAX) || v < i32::from(i16::MIN);
+        }
+    }
+    assert!(over, "FAST_MAX_IN is not tight");
+}
+
+#[test]
+fn simd_constants_match_scalar() {
+    use simd_k::*;
+    let pairs = [
+        (A, 0.5411961),
+        (B, -1.847759065),
+        (C, 0.765366865),
+        (D, 1.175875602),
+        (E, 0.298631336),
+        (F, 2.053119869),
+        (G, 3.072711026),
+        (H, 1.501321110),
+        (I, -0.899976223),
+        (J, -2.562915447),
+        (K, -1.961570560),
+        (L, -0.390180644),
+    ];
+    for (k, x) in pairs {
+        assert_eq!(Wrapping(k), stbi_f2f(x), "constant for {x}");
+    }
+    assert_eq!(Wrapping(i32::from(FSH)), stbi_fsh(Wrapping(1)));
+}
+
+/// The regrouped linear forms in [`simd_k`], evaluated as plain wrapping `i32`
+/// arithmetic, must equal the scalar `kernel` for every input -- the algebra
+/// the vector kernels rest on, checked without any vector code. Inputs are
+/// full-range `i32`, so this also covers the wrapping cases.
+#[test]
+fn simd_linear_forms_match_scalar_kernel() {
+    use simd_k::*;
+    let mut state = 0x0123_4567_89ab_cdefu64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let w = |v: i16| Wrapping(i32::from(v));
+    for round in 0..20_000 {
+        let s: [Wrapping<i32>; 8] = core::array::from_fn(|_| {
+            let r = next();
+            // Mix full-range values with i16-range ones.
+            if round % 2 == 0 {
+                Wrapping(r as i32)
+            } else {
+                Wrapping(r as i16 as i32)
+            }
+        });
+        let bias = if round % 3 == 0 {
+            PASS1_BIAS
+        } else {
+            PASS2_BIAS
+        };
+        let Kernel { xs, ts } = kernel(s, bias);
+
+        let t2 = s[2] * w(EVEN_T2[0]) + s[6] * w(EVEN_T2[1]);
+        let t3 = s[2] * w(EVEN_T3[0]) + s[6] * w(EVEN_T3[1]);
+        let t0 = s[0] * w(FSH) + s[4] * w(FSH) + Wrapping(bias);
+        let t1 = s[0] * w(FSH) - s[4] * w(FSH) + Wrapping(bias);
+        assert_eq!(xs, [t0 + t3, t1 + t2, t1 - t2, t0 - t3]);
+        for (n, c) in ODD.iter().enumerate() {
+            let v = s[1] * w(c[0]) + s[3] * w(c[1]) + s[5] * w(c[2]) + s[7] * w(c[3]);
+            assert_eq!(ts[n], v, "ts[{n}]");
+        }
+    }
 }
 
 /// Write the constant output of a block that has no AC energy.
@@ -691,11 +989,9 @@ fn test_dequantize_and_idct_block_8x8_all_zero() {
 
 #[test]
 fn test_dequantize_and_idct_block_8x8_saturated() {
-    // Arch-specific IDCT implementations need not handle i16::MAX values.
-    #[cfg(not(feature = "platform_independent"))]
-    if crate::decode::arch::get_dequantize_and_idct_block_8x8().is_some() {
-        return;
-    }
+    // Runs through the dispatcher, so on a SIMD build this is the arch kernel:
+    // it must hand an out-of-range block to the scalar kernel and so produce
+    // exactly the scalar's output.
     let mut output = [0u8; 8 * 8];
     dequantize_and_idct_block_8x8(&[i16::MAX; 8 * 8], &[u16::MAX; 8 * 8], 8, &mut output);
     #[rustfmt::skip]

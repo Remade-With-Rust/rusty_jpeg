@@ -1,113 +1,140 @@
-//! AVX2 IDCT that transforms **two 8x8 blocks at once**.
-//!
-//! This is the SSSE3 kernel widened to 256 bits, with block A in the low
-//! 128-bit lane and block B in the high one. That is safe to do mechanically
-//! because every operation involved is lane-independent:
-//!
-//! - the arithmetic is elementwise (`mulhrs`/`adds`/`subs`/`slli`/`srai`);
-//! - `_mm256_unpack*` interleave WITHIN each 128-bit lane, so the 8x8 transpose
-//!   below transposes each block separately without any cross-lane traffic;
-//! - `_mm256_packus_epi16` likewise packs per lane.
-//!
-//! So each lane executes exactly the instruction sequence SSSE3 executed, on
-//! exactly the same inputs. The output is **byte-identical** to calling the
-//! SSSE3 kernel twice -- which is what `avx2_pair_matches_ssse3_twice` asserts,
-//! and why this needed no tolerance and no requantisation of the constants.
+//! 256-bit x86 kernels: the two-block IDCT, YCbCr->RGB and the fancy
+//! upsampler interiors. Every one is a bit-exact twin of its scalar code.
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64::*;
 
-/// One IDCT pass over 8 rows, each holding two blocks' worth of coefficients.
-///
-/// Line-for-line the SSSE3 `idct8`; only the register width differs. The
-/// fixed-point constants are unchanged, so the rounding is unchanged.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+use crate::decode::decoder::ycc_k;
+use crate::decode::idct::simd_k;
+
+/// A `pmaddwd` operand: the pair `k = [even, odd]` in every 32-bit lane.
+#[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn idct8(data: &mut [__m256i; 8]) {
-    let p2 = data[2];
-    let p3 = data[6];
-    let p1 = _mm256_mulhrs_epi16(_mm256_adds_epi16(p2, p3), _mm256_set1_epi16(17734)); // 0.5411961
-    let t2 = _mm256_subs_epi16(
-        _mm256_subs_epi16(p1, p3),
-        _mm256_mulhrs_epi16(p3, _mm256_set1_epi16(27779)), // 0.847759065
-    );
-    let t3 = _mm256_adds_epi16(p1, _mm256_mulhrs_epi16(p2, _mm256_set1_epi16(25079))); // 0.765366865
-
-    let p2 = data[0];
-    let p3 = data[4];
-    let t0 = _mm256_adds_epi16(p2, p3);
-    let t1 = _mm256_subs_epi16(p2, p3);
-
-    let x0 = _mm256_adds_epi16(t0, t3);
-    let x3 = _mm256_subs_epi16(t0, t3);
-    let x1 = _mm256_adds_epi16(t1, t2);
-    let x2 = _mm256_subs_epi16(t1, t2);
-
-    let t0 = data[7];
-    let t1 = data[5];
-    let t2 = data[3];
-    let t3 = data[1];
-
-    let p3 = _mm256_adds_epi16(t0, t2);
-    let p4 = _mm256_adds_epi16(t1, t3);
-    let p1 = _mm256_adds_epi16(t0, t3);
-    let p2 = _mm256_adds_epi16(t1, t2);
-    let p5 = _mm256_adds_epi16(p3, p4);
-    let p5 = _mm256_adds_epi16(p5, _mm256_mulhrs_epi16(p5, _mm256_set1_epi16(5763))); // 0.175875602
-
-    let t0 = _mm256_mulhrs_epi16(t0, _mm256_set1_epi16(9786)); // 0.298631336
-    let t1 = _mm256_adds_epi16(
-        _mm256_adds_epi16(t1, t1),
-        _mm256_mulhrs_epi16(t1, _mm256_set1_epi16(1741)), // 0.053119869
-    );
-    let t2 = _mm256_adds_epi16(
-        _mm256_adds_epi16(t2, _mm256_adds_epi16(t2, t2)),
-        _mm256_mulhrs_epi16(t2, _mm256_set1_epi16(2383)), // 0.072711026
-    );
-    let t3 = _mm256_adds_epi16(t3, _mm256_mulhrs_epi16(t3, _mm256_set1_epi16(16427))); // 0.501321110
-
-    let p1 = _mm256_subs_epi16(p5, _mm256_mulhrs_epi16(p1, _mm256_set1_epi16(29490))); // 0.899976223
-    let p2 = _mm256_subs_epi16(
-        _mm256_subs_epi16(_mm256_subs_epi16(p5, p2), p2),
-        _mm256_mulhrs_epi16(p2, _mm256_set1_epi16(18446)), // 0.562915447
-    );
-
-    let p3 = _mm256_subs_epi16(
-        _mm256_mulhrs_epi16(p3, _mm256_set1_epi16(-31509)), // -0.961570560
-        p3,
-    );
-    let p4 = _mm256_mulhrs_epi16(p4, _mm256_set1_epi16(-12785)); // -0.390180644
-
-    let t3 = _mm256_adds_epi16(_mm256_adds_epi16(p1, p4), t3);
-    let t2 = _mm256_adds_epi16(_mm256_adds_epi16(p2, p3), t2);
-    let t1 = _mm256_adds_epi16(_mm256_adds_epi16(p2, p4), t1);
-    let t0 = _mm256_adds_epi16(_mm256_adds_epi16(p1, p3), t0);
-
-    data[0] = _mm256_adds_epi16(x0, t3);
-    data[7] = _mm256_subs_epi16(x0, t3);
-    data[1] = _mm256_adds_epi16(x1, t2);
-    data[6] = _mm256_subs_epi16(x1, t2);
-    data[2] = _mm256_adds_epi16(x2, t1);
-    data[5] = _mm256_subs_epi16(x2, t1);
-    data[3] = _mm256_adds_epi16(x3, t0);
-    data[4] = _mm256_subs_epi16(x3, t0);
+unsafe fn pair(k: [i16; 2]) -> __m256i {
+    _mm256_set1_epi32((i32::from(k[1]) << 16) | i32::from(k[0] as u16))
 }
 
-/// Transpose both blocks. The unpack instructions never cross the 128-bit lane
-/// boundary, so this is two independent 8x8 transposes for the price of one.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// Half of one 1-D pass, as `ssse3::pass_half`, with block A in the low
+/// 128-bit lane and block B in the high one. Every operation is per lane.
+#[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn transpose8(data: &mut [__m256i; 8]) {
-    let d01l = _mm256_unpacklo_epi16(data[0], data[1]);
-    let d23l = _mm256_unpacklo_epi16(data[2], data[3]);
-    let d45l = _mm256_unpacklo_epi16(data[4], data[5]);
-    let d67l = _mm256_unpacklo_epi16(data[6], data[7]);
-    let d01h = _mm256_unpackhi_epi16(data[0], data[1]);
-    let d23h = _mm256_unpackhi_epi16(data[2], data[3]);
-    let d45h = _mm256_unpackhi_epi16(data[4], data[5]);
-    let d67h = _mm256_unpackhi_epi16(data[6], data[7]);
+unsafe fn pass_half(
+    s04: __m256i,
+    s26: __m256i,
+    s13: __m256i,
+    s57: __m256i,
+    bias: __m256i,
+) -> [__m256i; 8] {
+    let t2 = _mm256_madd_epi16(s26, pair(simd_k::EVEN_T2));
+    let t3 = _mm256_madd_epi16(s26, pair(simd_k::EVEN_T3));
+    let t0 = _mm256_add_epi32(
+        _mm256_madd_epi16(s04, pair([simd_k::FSH, simd_k::FSH])),
+        bias,
+    );
+    let t1 = _mm256_add_epi32(
+        _mm256_madd_epi16(s04, pair([simd_k::FSH, -simd_k::FSH])),
+        bias,
+    );
+    let x = [
+        _mm256_add_epi32(t0, t3),
+        _mm256_add_epi32(t1, t2),
+        _mm256_sub_epi32(t1, t2),
+        _mm256_sub_epi32(t0, t3),
+    ];
+    let mut t = [_mm256_setzero_si256(); 4];
+    for (n, c) in simd_k::ODD.iter().enumerate() {
+        t[n] = _mm256_add_epi32(
+            _mm256_madd_epi16(s13, pair([c[0], c[1]])),
+            _mm256_madd_epi16(s57, pair([c[2], c[3]])),
+        );
+    }
+    let mut out = [_mm256_setzero_si256(); 8];
+    for n in 0..4 {
+        out[n] = _mm256_add_epi32(x[n], t[3 - n]);
+        out[7 - n] = _mm256_sub_epi32(x[n], t[3 - n]);
+    }
+    out
+}
+
+/// Half of a pass, finished at once, as `ssse3::half`: shifted, packed to
+/// i16 in output pairs, and (with `CHECK`) range-accumulated. Per lane, so
+/// lane 0 is block A and lane 1 block B.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn half<const SHIFT: i32, const CHECK: bool>(
+    s04: __m256i,
+    s26: __m256i,
+    s13: __m256i,
+    s57: __m256i,
+    bias: __m256i,
+    range: &mut __m256i,
+) -> [__m256i; 4] {
+    let o = pass_half(s04, s26, s13, s57, bias);
+    let k8000 = _mm256_set1_epi32(0x8000);
+    let mut p = [_mm256_setzero_si256(); 4];
+    for (j, pj) in p.iter_mut().enumerate() {
+        let a = _mm256_srai_epi32::<SHIFT>(o[2 * j]);
+        let b = _mm256_srai_epi32::<SHIFT>(o[2 * j + 1]);
+        if CHECK {
+            *range = _mm256_or_si256(
+                *range,
+                _mm256_or_si256(_mm256_add_epi32(a, k8000), _mm256_add_epi32(b, k8000)),
+            );
+        }
+        *pj = _mm256_packs_epi32(a, b);
+    }
+    p
+}
+
+/// One 1-D pass, shifted, narrowed and transposed, as `ssse3::pass_t`.
+/// `unpack*`, `shuffle_epi8` and `packs` all work within each 128-bit lane,
+/// so the two blocks never mix.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn pass_t<const SHIFT: i32, const CHECK: bool>(
+    s: &[__m256i; 8],
+    bias: i32,
+    range: &mut __m256i,
+) -> [__m256i; 8] {
+    let bias = _mm256_set1_epi32(bias);
+    let lo = half::<SHIFT, CHECK>(
+        _mm256_unpacklo_epi16(s[0], s[4]),
+        _mm256_unpacklo_epi16(s[2], s[6]),
+        _mm256_unpacklo_epi16(s[1], s[3]),
+        _mm256_unpacklo_epi16(s[5], s[7]),
+        bias,
+        range,
+    );
+    let hi = half::<SHIFT, CHECK>(
+        _mm256_unpackhi_epi16(s[0], s[4]),
+        _mm256_unpackhi_epi16(s[2], s[6]),
+        _mm256_unpackhi_epi16(s[1], s[3]),
+        _mm256_unpackhi_epi16(s[5], s[7]),
+        bias,
+        range,
+    );
+    transpose_packed(&lo, &hi)
+}
+
+/// Transpose both blocks from row pairs, as `ssse3::transpose_packed`; every
+/// instruction stays inside its 128-bit lane, so this is two independent
+/// 8x8 transposes for the price of one.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose_packed(lo: &[__m256i; 4], hi: &[__m256i; 4]) -> [__m256i; 8] {
+    let m = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+        0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15,
+    ));
+    let d01l = _mm256_shuffle_epi8(lo[0], m);
+    let d23l = _mm256_shuffle_epi8(lo[1], m);
+    let d45l = _mm256_shuffle_epi8(lo[2], m);
+    let d67l = _mm256_shuffle_epi8(lo[3], m);
+    let d01h = _mm256_shuffle_epi8(hi[0], m);
+    let d23h = _mm256_shuffle_epi8(hi[1], m);
+    let d45h = _mm256_shuffle_epi8(hi[2], m);
+    let d67h = _mm256_shuffle_epi8(hi[3], m);
 
     let d0123ll = _mm256_unpacklo_epi32(d01l, d23l);
     let d0123lh = _mm256_unpackhi_epi32(d01l, d23l);
@@ -118,17 +145,26 @@ unsafe fn transpose8(data: &mut [__m256i; 8]) {
     let d4567hl = _mm256_unpacklo_epi32(d45h, d67h);
     let d4567hh = _mm256_unpackhi_epi32(d45h, d67h);
 
-    data[0] = _mm256_unpacklo_epi64(d0123ll, d4567ll);
-    data[1] = _mm256_unpackhi_epi64(d0123ll, d4567ll);
-    data[2] = _mm256_unpacklo_epi64(d0123lh, d4567lh);
-    data[3] = _mm256_unpackhi_epi64(d0123lh, d4567lh);
-    data[4] = _mm256_unpacklo_epi64(d0123hl, d4567hl);
-    data[5] = _mm256_unpackhi_epi64(d0123hl, d4567hl);
-    data[6] = _mm256_unpacklo_epi64(d0123hh, d4567hh);
-    data[7] = _mm256_unpackhi_epi64(d0123hh, d4567hh);
+    [
+        _mm256_unpacklo_epi64(d0123ll, d4567ll),
+        _mm256_unpackhi_epi64(d0123ll, d4567ll),
+        _mm256_unpacklo_epi64(d0123lh, d4567lh),
+        _mm256_unpackhi_epi64(d0123lh, d4567lh),
+        _mm256_unpacklo_epi64(d0123hl, d4567hl),
+        _mm256_unpackhi_epi64(d0123hl, d4567hl),
+        _mm256_unpacklo_epi64(d0123hh, d4567hh),
+        _mm256_unpackhi_epi64(d0123hh, d4567hh),
+    ]
 }
 
-/// Dequantize and inverse-transform two 8x8 blocks in one instruction stream.
+/// Dequantize and inverse-transform two 8x8 blocks in one instruction stream:
+/// the scalar kernel, bit for bit, on each.
+///
+/// This is `ssse3::dequantize_and_idct_block_8x8` widened to 256 bits, block A
+/// in the low 128-bit lane and block B in the high one; every operation is
+/// lane-independent (`madd`, 32-bit arithmetic, `unpack*`, `packs`/`packus`
+/// all work per lane), so each block sees exactly the 128-bit sequence. If
+/// either block leaves the 16-bit fast path, both go to the scalar kernel.
 ///
 /// Both blocks belong to the SAME component, so they share a quantization
 /// table and a line stride, and both write into one plane. Taking a single
@@ -136,6 +172,12 @@ unsafe fn transpose8(data: &mut [__m256i; 8]) {
 /// overlapping `&mut` slices -- the blocks interleave row by row without ever
 /// touching the same byte, which is true but not something the borrow checker
 /// can be told.
+///
+/// # Safety
+///
+/// The CPU must support AVX2. `output` must hold
+/// `output_offset_b + output_linestride * 7 + 8` bytes (asserted), and the
+/// two blocks' rows must not overlap (`output_offset_b >= 8`).
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 pub unsafe fn dequantize_and_idct_block_8x8_pair(
@@ -156,58 +198,63 @@ pub unsafe fn dequantize_and_idct_block_8x8_pair(
                 .unwrap()
     );
 
-    const SHIFT: i32 = 3;
-
-    let mut data = [_mm256_setzero_si256(); 8];
-    for (i, item) in data.iter_mut().enumerate() {
+    let zero = _mm256_setzero_si256();
+    let mut s = [zero; 8];
+    let mut bad = zero;
+    let mut qor = zero;
+    for (i, row) in s.iter_mut().enumerate() {
+        // SAFETY: rows 0..8 of 8 elements lie inside the 64-element arrays.
         // Lane 0 <- block A row i, lane 1 <- block B row i.
-        let coef = _mm256_inserti128_si256::<1>(
+        let c = _mm256_inserti128_si256::<1>(
             _mm256_castsi128_si256(_mm_loadu_si128(
-                coefficients_a.as_ptr().wrapping_add(i * 8) as *const _
+                coefficients_a.as_ptr().add(i * 8) as *const __m128i
             )),
-            _mm_loadu_si128(coefficients_b.as_ptr().wrapping_add(i * 8) as *const _),
+            _mm_loadu_si128(coefficients_b.as_ptr().add(i * 8) as *const __m128i),
         );
         // Same table in both lanes.
-        let quant = _mm256_broadcastsi128_si256(_mm_loadu_si128(
-            quantization_table.as_ptr().wrapping_add(i * 8) as *const _,
+        let q = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+            quantization_table.as_ptr().add(i * 8) as *const __m128i,
         ));
-        *item = _mm256_slli_epi16::<SHIFT>(_mm256_mullo_epi16(coef, quant));
+        let lo = _mm256_mullo_epi16(c, q);
+        let hi = _mm256_mulhi_epi16(c, q);
+        bad = _mm256_or_si256(bad, _mm256_xor_si256(hi, _mm256_srai_epi16::<15>(lo)));
+        qor = _mm256_or_si256(qor, q);
+        *row = lo;
+    }
+    bad = _mm256_or_si256(bad, _mm256_and_si256(qor, _mm256_set1_epi16(i16::MIN)));
+
+    let mut range = zero;
+    let t = pass_t::<{ simd_k::PASS1_SHIFT }, true>(&s, simd_k::PASS1_BIAS, &mut range);
+    bad = _mm256_or_si256(bad, _mm256_srli_epi32::<16>(range));
+    if _mm256_movemask_epi8(_mm256_cmpeq_epi8(bad, zero)) != -1 {
+        super::idct_fallback(
+            coefficients_a,
+            quantization_table,
+            output_linestride,
+            output,
+        );
+        super::idct_fallback(
+            coefficients_b,
+            quantization_table,
+            output_linestride,
+            &mut output[output_offset_b..],
+        );
+        return;
     }
 
-    // A half-height column pass for the 82.7% of blocks whose rows 4-7 are zero
-    // was built, gated bit-identical, and MEASURED WORSE (2/11, z -2.11, twice):
-    // the per-pair zero test plus an unpredictable branch cost more than the ~15
-    // instructions it saved, and the pair kernel needs BOTH blocks sparse where
-    // 82.7% is a per-block figure. Removed rather than left behind a toggle,
-    // because the branch was the cost. See WHYS.md D4g.
-    idct8(&mut data);
-    transpose8(&mut data);
-    idct8(&mut data);
-    transpose8(&mut data);
+    let o = pass_t::<{ simd_k::PASS2_SHIFT }, false>(&t, simd_k::PASS2_BIAS, &mut range);
 
-    for (i, item) in data.iter().enumerate() {
-        const OFFSET: i16 = 128 << (SHIFT + 3);
-        const ROUNDING_BIAS: i16 = (1 << (SHIFT + 3)) >> 1;
-
-        let with_offset = _mm256_adds_epi16(*item, _mm256_set1_epi16(OFFSET + ROUNDING_BIAS));
-        // packus is per-lane: lane 0's low 8 bytes are block A's row, lane 1's
+    for (i, row) in o.iter().enumerate() {
+        // packus is per lane: lane 0's low 8 bytes are block A's row, lane 1's
         // low 8 bytes are block B's.
-        let packed = _mm256_packus_epi16(
-            _mm256_srai_epi16::<{ SHIFT + 3 }>(with_offset),
-            _mm256_setzero_si256(),
-        );
-
-        let base = output.as_mut_ptr().wrapping_add(output_linestride * i);
-
-        let mut buf = [0u8; 16];
-        _mm_storeu_si128(buf.as_mut_ptr() as *mut _, _mm256_castsi256_si128(packed));
-        core::ptr::copy_nonoverlapping::<u8>(buf.as_ptr(), base, 8);
-
-        _mm_storeu_si128(
-            buf.as_mut_ptr() as *mut _,
+        let packed = _mm256_packus_epi16(*row, *row);
+        // SAFETY: the assert above bounds both 8-byte stores.
+        let base = output.as_mut_ptr().add(output_linestride * i);
+        _mm_storel_epi64(base as *mut __m128i, _mm256_castsi256_si128(packed));
+        _mm_storel_epi64(
+            base.add(output_offset_b) as *mut __m128i,
             _mm256_extracti128_si256::<1>(packed),
         );
-        core::ptr::copy_nonoverlapping::<u8>(buf.as_ptr(), base.wrapping_add(output_offset_b), 8);
     }
 }
 
@@ -233,16 +280,51 @@ const fn rgb_mask(part: usize, channel: usize) -> [i8; 16] {
     mask
 }
 
-/// YCbCr -> RGB, 16 pixels per step: the SSSE3 kernel widened to 256 bits.
+/// The three channel offsets `(HALF + K * c) >> 20` for 16 pixels in 16-bit
+/// lanes, lane for lane (see `ssse3::color_convert_line_ycbcr`): R and B by
+/// the 16-bit `pmulhrsw` forms proven over every input, G exactly in 32-bit
+/// lanes. Every operation is per lane, so any pixel order in comes out in
+/// the same order.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn ycc_offsets(cbv: __m256i, crv: __m256i) -> [__m256i; 3] {
+    let dr = _mm256_mulhrs_epi16(
+        _mm256_slli_epi16::<1>(crv),
+        _mm256_set1_epi16(ycc_k::R_MULHRS),
+    );
+    let db = _mm256_add_epi16(
+        cbv,
+        _mm256_mulhrs_epi16(cbv, _mm256_set1_epi16(ycc_k::B_MULHRS)),
+    );
+    let half = _mm256_set1_epi32(ycc_k::HALF);
+    // Per 128-bit lane: lo = elements 0-3, hi = 4-7; `packs` of (lo, hi)
+    // puts them back in order.
+    let cb_lo = _mm256_unpacklo_epi16(_mm256_slli_epi16::<8>(cbv), cbv);
+    let cb_hi = _mm256_unpackhi_epi16(_mm256_slli_epi16::<8>(cbv), cbv);
+    let cr_lo = _mm256_unpacklo_epi16(_mm256_slli_epi16::<8>(crv), crv);
+    let cr_hi = _mm256_unpackhi_epi16(_mm256_slli_epi16::<8>(crv), crv);
+    let (k_gb, k_gr) = (
+        pair(ycc_k::split(ycc_k::CB_G)),
+        pair(ycc_k::split(ycc_k::CR_G)),
+    );
+    let g = |c_b: __m256i, c_r: __m256i| {
+        _mm256_srai_epi32::<{ ycc_k::SHIFT }>(_mm256_add_epi32(
+            _mm256_add_epi32(_mm256_madd_epi16(c_b, k_gb), _mm256_madd_epi16(c_r, k_gr)),
+            half,
+        ))
+    };
+    let dg = _mm256_packs_epi32(g(cb_lo, cr_lo), g(cb_hi, cr_hi));
+    [dr, dg, db]
+}
+
+/// YCbCr -> RGB, 32 pixels per step: `ycbcr_to_rgb`, bit for bit, by the
+/// arithmetic of `ssse3::color_convert_line_ycbcr` widened to 256 bits. A
+/// 16-pixel step and the SSSE3 kernel take the remainder; returns the pixels
+/// converted.
 ///
-/// Converts **exactly the pixels the SSSE3 kernel converts** (all but the last
-/// 8-15, which stay with the scalar tail) and returns that count, because the
-/// scalar formula rounds differently: covering a different set of pixels would
-/// change the image. The arithmetic is the SSSE3 sequence per 16-bit lane
-/// (`slli`/`adds`/`subs`/`mulhrs`/`srai`/`packus`, same constants), so each
-/// pixel is bit-identical to what SSSE3 produced; only the RGB interleave
-/// differs, and that is pure byte movement. `color_convert_matches_ssse3`
-/// asserts both properties.
+/// # Safety
+///
+/// The CPU must support AVX2 and SSSE3. Lengths are asserted.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &mut [u8]) -> usize {
@@ -251,17 +333,8 @@ pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &
     assert!(num <= y.len());
     assert!(num <= cb.len());
     assert!(num <= cr.len());
-    // The SSSE3 kernel's coverage: it reads 16 bytes to use 8, so it stops one
-    // vector short of the end.
-    let covered = (num / 8).saturating_sub(1) * 8;
 
-    const SHIFT: i32 = 6;
-    let c128 = _mm256_set1_epi16(128 << SHIFT);
-    let half = _mm256_set1_epi16((1 << SHIFT) >> 1);
-    let k_cr_r = _mm256_set1_epi16(13173);
-    let k_cb_g = _mm256_set1_epi16(11276);
-    let k_cr_g = _mm256_set1_epi16(23401);
-    let k_cb_b = _mm256_set1_epi16(25297);
+    let c128 = _mm256_set1_epi16(128);
     let mask = |part: usize, channel: usize| {
         _mm_loadu_si128(RGB_MASKS[part][channel].as_ptr() as *const __m128i)
     };
@@ -270,54 +343,35 @@ pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &
         [mask(1, 0), mask(1, 1), mask(1, 2)],
         [mask(2, 0), mask(2, 1), mask(2, 2)],
     ];
+    let wide = |m: &[__m128i; 3]| {
+        [
+            _mm256_broadcastsi128_si256(m[0]),
+            _mm256_broadcastsi128_si256(m[1]),
+            _mm256_broadcastsi128_si256(m[2]),
+        ]
+    };
+    let wide_masks = [wide(&masks[0]), wide(&masks[1]), wide(&masks[2])];
+    let zero = _mm256_setzero_si256();
 
     let mut i = 0;
-
     // 32 pixels per step. A 256-bit load widened with `unpacklo/hi_epi8`
     // holds pixels 0-7 | 16-23 and 8-15 | 24-31 per 128-bit lane; the
-    // arithmetic is the 16-pixel step's, lane for lane, and `packus` of the
-    // two halves puts each channel back in pixel order (lane 0 = pixels
-    // 0-15, lane 1 = 16-31). The interleave shuffles both lanes at once, and
-    // `permute2x128` joins the six 16-byte parts into three full stores.
-    // Same pixels covered, same per-lane operations, so the same bytes.
-    let zero = _mm256_setzero_si256();
-    let wide_masks = [
-        [
-            _mm256_broadcastsi128_si256(masks[0][0]),
-            _mm256_broadcastsi128_si256(masks[0][1]),
-            _mm256_broadcastsi128_si256(masks[0][2]),
-        ],
-        [
-            _mm256_broadcastsi128_si256(masks[1][0]),
-            _mm256_broadcastsi128_si256(masks[1][1]),
-            _mm256_broadcastsi128_si256(masks[1][2]),
-        ],
-        [
-            _mm256_broadcastsi128_si256(masks[2][0]),
-            _mm256_broadcastsi128_si256(masks[2][1]),
-            _mm256_broadcastsi128_si256(masks[2][2]),
-        ],
-    ];
-    while i + 32 <= covered {
+    // arithmetic is per lane, and `packus` of the two halves puts each channel
+    // back in pixel order (lane 0 = pixels 0-15, lane 1 = 16-31). The
+    // interleave shuffles both lanes at once, and `permute2x128` joins the six
+    // 16-byte parts into three full stores.
+    while i + 32 <= num {
+        // SAFETY: i + 32 <= num, which the asserts bound by every slice.
         let load = |p: &[u8]| _mm256_loadu_si256(p.as_ptr().add(i) as *const __m256i);
         let (yb, cbb, crb) = (load(y), load(cb), load(cr));
         let convert = |yw: __m256i, cbw: __m256i, crw: __m256i| {
-            let yv = _mm256_adds_epi16(_mm256_slli_epi16(yw, SHIFT), half);
-            let cbv = _mm256_subs_epi16(_mm256_slli_epi16(cbw, SHIFT), c128);
-            let crv = _mm256_subs_epi16(_mm256_slli_epi16(crw, SHIFT), c128);
-
-            let cr_140200 = _mm256_adds_epi16(_mm256_mulhrs_epi16(crv, k_cr_r), crv);
-            let cb_034414 = _mm256_mulhrs_epi16(cbv, k_cb_g);
-            let cr_071414 = _mm256_mulhrs_epi16(crv, k_cr_g);
-            let cb_177200 = _mm256_adds_epi16(_mm256_mulhrs_epi16(cbv, k_cb_b), cbv);
-
-            let r = _mm256_srai_epi16(_mm256_adds_epi16(yv, cr_140200), SHIFT);
-            let g = _mm256_srai_epi16(
-                _mm256_subs_epi16(yv, _mm256_adds_epi16(cb_034414, cr_071414)),
-                SHIFT,
-            );
-            let b = _mm256_srai_epi16(_mm256_adds_epi16(yv, cb_177200), SHIFT);
-            (r, g, b)
+            let [dr, dg, db] =
+                ycc_offsets(_mm256_sub_epi16(cbw, c128), _mm256_sub_epi16(crw, c128));
+            (
+                _mm256_add_epi16(yw, dr),
+                _mm256_add_epi16(yw, dg),
+                _mm256_add_epi16(yw, db),
+            )
         };
         let (r_lo, g_lo, b_lo) = convert(
             _mm256_unpacklo_epi8(yb, zero),
@@ -343,53 +397,43 @@ pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &
                 ),
             )
         };
-        // Lane 0 of part p is output bytes 16p.. of pixels 0-15, lane 1 the
-        // same bytes of pixels 16-31 (48 bytes on).
         let (p0, p1, p2) = (
             part(&wide_masks[0]),
             part(&wide_masks[1]),
             part(&wide_masks[2]),
         );
+        // SAFETY: bytes 3 * i .. 3 * i + 96 lie inside `output` (3 * num).
         let out = output.as_mut_ptr().add(3 * i) as *mut __m256i;
-        _mm256_storeu_si256(out, _mm256_permute2x128_si256(p0, p1, 0x20));
-        _mm256_storeu_si256(out.add(1), _mm256_permute2x128_si256(p2, p0, 0x30));
-        _mm256_storeu_si256(out.add(2), _mm256_permute2x128_si256(p1, p2, 0x31));
+        _mm256_storeu_si256(out, _mm256_permute2x128_si256::<0x20>(p0, p1));
+        _mm256_storeu_si256(out.add(1), _mm256_permute2x128_si256::<0x30>(p2, p0));
+        _mm256_storeu_si256(out.add(2), _mm256_permute2x128_si256::<0x31>(p1, p2));
         i += 32;
     }
 
-    while i + 16 <= covered {
-        let widen = |p: &[u8]| {
-            _mm256_slli_epi16(
-                _mm256_cvtepu8_epi16(_mm_loadu_si128(p.as_ptr().add(i) as *const _)),
-                SHIFT,
-            )
-        };
-        let yv = _mm256_adds_epi16(widen(y), half);
-        let cbv = _mm256_subs_epi16(widen(cb), c128);
-        let crv = _mm256_subs_epi16(widen(cr), c128);
-
-        let cr_140200 = _mm256_adds_epi16(_mm256_mulhrs_epi16(crv, k_cr_r), crv);
-        let cb_034414 = _mm256_mulhrs_epi16(cbv, k_cb_g);
-        let cr_071414 = _mm256_mulhrs_epi16(crv, k_cr_g);
-        let cb_177200 = _mm256_adds_epi16(_mm256_mulhrs_epi16(cbv, k_cb_b), cbv);
-
-        let r = _mm256_srai_epi16(_mm256_adds_epi16(yv, cr_140200), SHIFT);
-        let g = _mm256_srai_epi16(
-            _mm256_subs_epi16(yv, _mm256_adds_epi16(cb_034414, cr_071414)),
-            SHIFT,
+    while i + 16 <= num {
+        // SAFETY: i + 16 <= num, which the asserts bound by every slice.
+        let widen =
+            |p: &[u8]| _mm256_cvtepu8_epi16(_mm_loadu_si128(p.as_ptr().add(i) as *const __m128i));
+        let yv = widen(y);
+        let [dr, dg, db] = ycc_offsets(
+            _mm256_sub_epi16(widen(cb), c128),
+            _mm256_sub_epi16(widen(cr), c128),
         );
-        let b = _mm256_srai_epi16(_mm256_adds_epi16(yv, cb_177200), SHIFT);
+        let r = _mm256_add_epi16(yv, dr);
+        let g = _mm256_add_epi16(yv, dg);
+        let b = _mm256_add_epi16(yv, db);
 
         // packus works per 128-bit lane: [r0-7 g0-7 | r8-15 g8-15]. Reorder the
         // quadwords to [r0-7 r8-15 | g0-7 g8-15].
-        let rg = _mm256_permute4x64_epi64(_mm256_packus_epi16(r, g), 0b11_01_10_00);
-        let bb = _mm256_permute4x64_epi64(_mm256_packus_epi16(b, b), 0b11_01_10_00);
+        let rg = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packus_epi16(r, g));
+        let bb = _mm256_permute4x64_epi64::<0b11_01_10_00>(_mm256_packus_epi16(b, b));
         let channels = [
             _mm256_castsi256_si128(rg),
-            _mm256_extracti128_si256(rg, 1),
+            _mm256_extracti128_si256::<1>(rg),
             _mm256_castsi256_si128(bb),
         ];
 
+        // SAFETY: bytes 3 * i .. 3 * i + 48 lie inside `output` (3 * num).
         let out = output.as_mut_ptr().add(3 * i);
         for (part, part_masks) in masks.iter().enumerate() {
             let v = _mm_or_si128(
@@ -404,19 +448,15 @@ pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &
         i += 16;
     }
 
-    // An odd 8-pixel step remains when `covered` is not a multiple of 16. Give
-    // the tail to the SSSE3 kernel: its own coverage of the tail is exactly
-    // `covered - i` (both stop one vector short of the same end).
-    if i < covered {
-        let done = super::ssse3::color_convert_line_ycbcr(
+    if num - i >= 8 {
+        i += super::ssse3::color_convert_line_ycbcr(
             &y[i..],
             &cb[i..],
             &cr[i..],
             &mut output[3 * i..],
         );
-        debug_assert_eq!(i + done, covered);
     }
-    covered
+    i
 }
 
 /// The interior of a 4:2:0 "fancy" upsampled row, 16 sample pairs per step.
@@ -503,41 +543,4 @@ pub unsafe fn upsample_h2v1_windows(input: &[u8], out: &mut [u8]) -> usize {
         j += 16;
     }
     j
-}
-
-#[cfg(test)]
-mod color_tests {
-    #[test]
-    fn color_convert_matches_ssse3() {
-        if !std::is_x86_feature_detected!("avx2") || !std::is_x86_feature_detected!("ssse3") {
-            return;
-        }
-        let mut state = 0x9e37_79b9_7f4a_7c15u64;
-        let mut byte = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state as u8
-        };
-        for num in (0..80).chain([255, 256, 257, 959, 960, 961, 1920, 4097]) {
-            let y: Vec<u8> = (0..num).map(|_| byte()).collect();
-            let mut cb: Vec<u8> = (0..num).map(|_| byte()).collect();
-            let cr: Vec<u8> = (0..num).map(|_| byte()).collect();
-            // Saturation corners.
-            if num > 4 {
-                cb[0] = 0;
-                cb[1] = 255;
-            }
-            let mut want = vec![0xAAu8; 3 * num];
-            let mut got = vec![0x55u8; 3 * num];
-            let (nw, ng) = unsafe {
-                (
-                    super::super::ssse3::color_convert_line_ycbcr(&y, &cb, &cr, &mut want),
-                    super::color_convert_line_ycbcr(&y, &cb, &cr, &mut got),
-                )
-            };
-            assert_eq!(ng, nw, "coverage differs at num {num}");
-            assert_eq!(got[..3 * nw], want[..3 * nw], "pixels differ at num {num}");
-        }
-    }
 }
