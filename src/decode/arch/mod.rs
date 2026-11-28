@@ -335,6 +335,28 @@ mod idct_tests {
                     c[i] = (rng.next() % 3) as i16 - 1;
                 }
             }
+            // Worst cases for the first pass: columns whose coefficients carry
+            // the sign pattern that maximises one output, at magnitudes around
+            // `FAST_MAX_IN` (the bound under which no check is made), so the
+            // outputs land just inside or just outside i16.
+            6 => {
+                use crate::decode::idct::simd_k::{coef, FAST_MAX_IN};
+                q = [1; 64];
+                for col in 0..8 {
+                    if rng.next() & 1 == 0 {
+                        let n = (rng.next() % 8) as usize;
+                        let m = FAST_MAX_IN - 40 + (rng.next() % 440) as i32;
+                        let sign = if rng.next() & 1 == 0 { 1 } else { -1 };
+                        for k in 0..8 {
+                            c[col + 8 * k] = (sign * m * coef(n, k).signum()) as i16;
+                        }
+                    } else {
+                        for k in 0..8 {
+                            c[col + 8 * k] = rng.mag(10) as i16;
+                        }
+                    }
+                }
+            }
             // Sparse: one column DC-only (the scalar's column shortcut), the
             // rest random; rows 4-7 zero half the time.
             _ => {
@@ -405,7 +427,7 @@ mod idct_tests {
             }
             let mut rng = Rng(0x1234_5678_9abc_def0);
             for round in 0..rounds {
-                let family = round % 7;
+                let family = round % 8;
                 let (c, q) = block(&mut rng, family);
                 run_single(name, kernel, &c, &q, &format!("family {family}"));
             }
@@ -450,8 +472,8 @@ mod idct_tests {
         for round in 0..rounds {
             // Mix families across the two lanes: one block on the fast path
             // and its neighbour off it must both still come out exact.
-            let (ca, q) = block(&mut rng, round % 7);
-            let (cb, _) = block(&mut rng, (round / 7) % 7);
+            let (ca, q) = block(&mut rng, round % 8);
+            let (cb, _) = block(&mut rng, (round / 8) % 8);
             check(&ca, &cb, &q, &format!("round {round}"));
         }
     }

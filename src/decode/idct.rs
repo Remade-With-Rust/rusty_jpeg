@@ -378,6 +378,135 @@ pub(crate) mod simd_k {
     pub const PASS1_SHIFT: i32 = 10;
     pub const PASS2_BIAS: i32 = 65536 + (128 << 17);
     pub const PASS2_SHIFT: i32 = 17;
+
+    /// The coefficient of input `k` in 1-D output `n` (before the bias).
+    pub const fn coef(n: usize, k: usize) -> i32 {
+        // Even part, as `[s0, s2, s4, s6]` coefficients of `xs[m]`.
+        let even: [[i32; 4]; 4] = [
+            [FSH as i32, EVEN_T3[0] as i32, FSH as i32, EVEN_T3[1] as i32],
+            [
+                FSH as i32,
+                EVEN_T2[0] as i32,
+                -(FSH as i32),
+                EVEN_T2[1] as i32,
+            ],
+            [
+                FSH as i32,
+                -(EVEN_T2[0] as i32),
+                -(FSH as i32),
+                -(EVEN_T2[1] as i32),
+            ],
+            [
+                FSH as i32,
+                -(EVEN_T3[0] as i32),
+                FSH as i32,
+                -(EVEN_T3[1] as i32),
+            ],
+        ];
+        // out[m] = xs[m] + ts[3-m], out[7-m] = xs[m] - ts[3-m].
+        let (m, sign) = if n < 4 { (n, 1) } else { (7 - n, -1) };
+        if k & 1 == 0 {
+            even[m][k / 2]
+        } else {
+            sign * ODD[3 - m][k / 2] as i32
+        }
+    }
+
+    /// The largest `sum_k |coef(n, k)|` over the outputs `n`: no first-pass
+    /// output exceeds `ROW_ABS_SUM * max|s|` in magnitude.
+    pub const ROW_ABS_SUM: i32 = {
+        let mut best = 0;
+        let mut n = 0;
+        while n < 8 {
+            let mut sum = 0;
+            let mut k = 0;
+            while k < 8 {
+                let c = coef(n, k);
+                sum += if c < 0 { -c } else { c };
+                k += 1;
+            }
+            if sum > best {
+                best = sum;
+            }
+            n += 1;
+        }
+        best
+    };
+
+    /// The largest dequantized magnitude for which every first-pass output
+    /// `(L(s) + PASS1_BIAS) >> PASS1_SHIFT` is guaranteed to fit `i16`; one
+    /// more and the worst sign pattern overflows. The oracle tests aim blocks
+    /// at it (`idct_kernels_match_scalar`, family 6), where the kernels' own
+    /// first-pass range check is decided.
+    ///
+    /// Skipping that check for blocks under this bound was built and measured:
+    /// classifying every coefficient cost more instructions than the check it
+    /// saved (531 against 523 Ir per AVX2 pair on a greyscale photo), so the
+    /// kernels check every block.
+    pub const FAST_MAX_IN: i32 = {
+        let m = ((i16::MAX as i32) * 1024 + 1023 - PASS1_BIAS) / ROW_ABS_SUM;
+        // The negative side: -ROW_ABS_SUM * m + bias must stay >= -32768 << 10.
+        assert!(-ROW_ABS_SUM * m + PASS1_BIAS >= (i16::MIN as i32) << PASS1_SHIFT);
+        assert!(m <= i16::MAX as i32);
+        m
+    };
+}
+
+/// `simd_k::coef` is the scalar kernel's linear form, and `FAST_MAX_IN` is a
+/// real bound: at the worst-case sign pattern for every output, the scalar's
+/// first pass stays inside `i16`, and one step past it, it does not.
+#[test]
+fn simd_fast_bound_is_tight_and_safe() {
+    use simd_k::*;
+    for n in 0..8 {
+        for k in 0..8 {
+            let mut s = [Wrapping(0i32); 8];
+            s[k] = Wrapping(1);
+            let Kernel { xs, ts } = kernel(s, 0);
+            let out = [
+                xs[0] + ts[3],
+                xs[1] + ts[2],
+                xs[2] + ts[1],
+                xs[3] + ts[0],
+                xs[3] - ts[0],
+                xs[2] - ts[1],
+                xs[1] - ts[2],
+                xs[0] - ts[3],
+            ];
+            assert_eq!(out[n].0, coef(n, k), "coef({n}, {k})");
+        }
+    }
+    let first_pass = |s: [Wrapping<i32>; 8], n: usize| {
+        let Kernel { xs, ts } = kernel(s, PASS1_BIAS);
+        let v = if n < 4 {
+            xs[n] + ts[3 - n]
+        } else {
+            xs[7 - n] - ts[n - 4]
+        };
+        v.0 >> PASS1_SHIFT
+    };
+    let mut worst_hi = i32::MIN;
+    let mut worst_lo = i32::MAX;
+    for n in 0..8 {
+        for sign in [1, -1] {
+            let s = core::array::from_fn(|k| Wrapping(sign * FAST_MAX_IN * coef(n, k).signum()));
+            let v = first_pass(s, n);
+            worst_hi = worst_hi.max(v);
+            worst_lo = worst_lo.min(v);
+        }
+    }
+    assert!(worst_hi <= i32::from(i16::MAX) && worst_lo >= i32::from(i16::MIN));
+    // Tight: one more and the worst output overflows.
+    let mut over = false;
+    for n in 0..8 {
+        for sign in [1, -1] {
+            let s =
+                core::array::from_fn(|k| Wrapping(sign * (FAST_MAX_IN + 1) * coef(n, k).signum()));
+            let v = first_pass(s, n);
+            over |= v > i32::from(i16::MAX) || v < i32::from(i16::MIN);
+        }
+    }
+    assert!(over, "FAST_MAX_IN is not tight");
 }
 
 #[test]

@@ -2931,11 +2931,34 @@ pub(crate) mod ycc_k {
         assert!(hi >= i16::MIN as i32 && hi <= i16::MAX as i32);
         [hi as i16, (k & 255) as i16]
     }
+
+    /// The R and B offsets each depend on ONE chroma value, so a 16-bit form
+    /// can be proven exact by checking all 256 inputs:
+    /// `R = mulhrs(cr << 1, R_MULHRS)` and `B = cb + mulhrs(cb, B_MULHRS)`,
+    /// with `mulhrs(x, m) = (x * m + 2^14) >> 15` (`pmulhrsw`).
+    /// `mulhrs_forms_match_scalar` is that check. (G depends on both and has
+    /// no such form; it keeps the exact 32-bit `split` arithmetic.)
+    pub const R_MULHRS: i16 = 22971;
+    pub const B_MULHRS: i16 = 25297;
 }
 
 #[cfg(test)]
 mod ycc_tests {
     use super::*;
+
+    #[test]
+    fn mulhrs_forms_match_scalar() {
+        let mulhrs = |x: i32, m: i16| (x * i32::from(m) + (1 << 14)) >> 15;
+        for c in -128i32..=127 {
+            let off = |k: i32| (ycc_k::HALF + k * c) >> ycc_k::SHIFT;
+            assert_eq!(
+                mulhrs(c << 1, ycc_k::R_MULHRS),
+                off(ycc_k::CR_R),
+                "R at {c}"
+            );
+            assert_eq!(c + mulhrs(c, ycc_k::B_MULHRS), off(ycc_k::CB_B), "B at {c}");
+        }
+    }
 
     #[test]
     fn ycc_constants_match_scalar() {

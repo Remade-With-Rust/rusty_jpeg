@@ -258,49 +258,47 @@ const fn rgb_mask(part: usize, channel: usize) -> [i8; 16] {
     mask
 }
 
-/// The three channel offsets `(HALF + K * c) >> 20` for 16 pixels, in 16-bit
-/// lanes in pixel order (see `ssse3::color_convert_line_ycbcr`).
+/// The three channel offsets `(HALF + K * c) >> 20` for 16 pixels in 16-bit
+/// lanes, lane for lane (see `ssse3::color_convert_line_ycbcr`): R and B by
+/// the 16-bit `pmulhrsw` forms proven over every input, G exactly in 32-bit
+/// lanes. Every operation is per lane, so any pixel order in comes out in
+/// the same order.
 #[inline]
 #[target_feature(enable = "avx2")]
 unsafe fn ycc_offsets(cbv: __m256i, crv: __m256i) -> [__m256i; 3] {
+    let dr = _mm256_mulhrs_epi16(
+        _mm256_slli_epi16::<1>(crv),
+        _mm256_set1_epi16(ycc_k::R_MULHRS),
+    );
+    let db = _mm256_add_epi16(
+        cbv,
+        _mm256_mulhrs_epi16(cbv, _mm256_set1_epi16(ycc_k::B_MULHRS)),
+    );
     let half = _mm256_set1_epi32(ycc_k::HALF);
-    // Per 128-bit lane: lo = pixels 0-3 | 8-11, hi = 4-7 | 12-15; `packs`
-    // of (lo, hi) puts them back in order.
+    // Per 128-bit lane: lo = elements 0-3, hi = 4-7; `packs` of (lo, hi)
+    // puts them back in order.
     let cb_lo = _mm256_unpacklo_epi16(_mm256_slli_epi16::<8>(cbv), cbv);
     let cb_hi = _mm256_unpackhi_epi16(_mm256_slli_epi16::<8>(cbv), cbv);
     let cr_lo = _mm256_unpacklo_epi16(_mm256_slli_epi16::<8>(crv), crv);
     let cr_hi = _mm256_unpackhi_epi16(_mm256_slli_epi16::<8>(crv), crv);
-    let (k_r, k_gb, k_gr, k_b) = (
-        pair(ycc_k::split(ycc_k::CR_R)),
+    let (k_gb, k_gr) = (
         pair(ycc_k::split(ycc_k::CB_G)),
         pair(ycc_k::split(ycc_k::CR_G)),
-        pair(ycc_k::split(ycc_k::CB_B)),
     );
-    let offset = |lo: __m256i, hi: __m256i| {
-        _mm256_packs_epi32(
-            _mm256_srai_epi32::<{ ycc_k::SHIFT }>(_mm256_add_epi32(lo, half)),
-            _mm256_srai_epi32::<{ ycc_k::SHIFT }>(_mm256_add_epi32(hi, half)),
-        )
+    let g = |c_b: __m256i, c_r: __m256i| {
+        _mm256_srai_epi32::<{ ycc_k::SHIFT }>(_mm256_add_epi32(
+            _mm256_add_epi32(_mm256_madd_epi16(c_b, k_gb), _mm256_madd_epi16(c_r, k_gr)),
+            half,
+        ))
     };
-    [
-        offset(_mm256_madd_epi16(cr_lo, k_r), _mm256_madd_epi16(cr_hi, k_r)),
-        offset(
-            _mm256_add_epi32(
-                _mm256_madd_epi16(cb_lo, k_gb),
-                _mm256_madd_epi16(cr_lo, k_gr),
-            ),
-            _mm256_add_epi32(
-                _mm256_madd_epi16(cb_hi, k_gb),
-                _mm256_madd_epi16(cr_hi, k_gr),
-            ),
-        ),
-        offset(_mm256_madd_epi16(cb_lo, k_b), _mm256_madd_epi16(cb_hi, k_b)),
-    ]
+    let dg = _mm256_packs_epi32(g(cb_lo, cr_lo), g(cb_hi, cr_hi));
+    [dr, dg, db]
 }
 
-/// YCbCr -> RGB, 16 pixels per step: `ycbcr_to_rgb`, bit for bit, by the
-/// arithmetic of `ssse3::color_convert_line_ycbcr` widened to 256 bits. An
-/// 8-pixel remainder goes to the SSSE3 kernel; returns the pixels converted.
+/// YCbCr -> RGB, 32 pixels per step: `ycbcr_to_rgb`, bit for bit, by the
+/// arithmetic of `ssse3::color_convert_line_ycbcr` widened to 256 bits. A
+/// 16-pixel step and the SSSE3 kernel take the remainder; returns the pixels
+/// converted.
 ///
 /// # Safety
 ///
@@ -323,8 +321,73 @@ pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &
         [mask(1, 0), mask(1, 1), mask(1, 2)],
         [mask(2, 0), mask(2, 1), mask(2, 2)],
     ];
+    let wide = |m: &[__m128i; 3]| {
+        [
+            _mm256_broadcastsi128_si256(m[0]),
+            _mm256_broadcastsi128_si256(m[1]),
+            _mm256_broadcastsi128_si256(m[2]),
+        ]
+    };
+    let wide_masks = [wide(&masks[0]), wide(&masks[1]), wide(&masks[2])];
+    let zero = _mm256_setzero_si256();
 
     let mut i = 0;
+    // 32 pixels per step. A 256-bit load widened with `unpacklo/hi_epi8`
+    // holds pixels 0-7 | 16-23 and 8-15 | 24-31 per 128-bit lane; the
+    // arithmetic is per lane, and `packus` of the two halves puts each channel
+    // back in pixel order (lane 0 = pixels 0-15, lane 1 = 16-31). The
+    // interleave shuffles both lanes at once, and `permute2x128` joins the six
+    // 16-byte parts into three full stores.
+    while i + 32 <= num {
+        // SAFETY: i + 32 <= num, which the asserts bound by every slice.
+        let load = |p: &[u8]| _mm256_loadu_si256(p.as_ptr().add(i) as *const __m256i);
+        let (yb, cbb, crb) = (load(y), load(cb), load(cr));
+        let convert = |yw: __m256i, cbw: __m256i, crw: __m256i| {
+            let [dr, dg, db] =
+                ycc_offsets(_mm256_sub_epi16(cbw, c128), _mm256_sub_epi16(crw, c128));
+            (
+                _mm256_add_epi16(yw, dr),
+                _mm256_add_epi16(yw, dg),
+                _mm256_add_epi16(yw, db),
+            )
+        };
+        let (r_lo, g_lo, b_lo) = convert(
+            _mm256_unpacklo_epi8(yb, zero),
+            _mm256_unpacklo_epi8(cbb, zero),
+            _mm256_unpacklo_epi8(crb, zero),
+        );
+        let (r_hi, g_hi, b_hi) = convert(
+            _mm256_unpackhi_epi8(yb, zero),
+            _mm256_unpackhi_epi8(cbb, zero),
+            _mm256_unpackhi_epi8(crb, zero),
+        );
+        let channels = [
+            _mm256_packus_epi16(r_lo, r_hi),
+            _mm256_packus_epi16(g_lo, g_hi),
+            _mm256_packus_epi16(b_lo, b_hi),
+        ];
+        let part = |m: &[__m256i; 3]| {
+            _mm256_or_si256(
+                _mm256_shuffle_epi8(channels[0], m[0]),
+                _mm256_or_si256(
+                    _mm256_shuffle_epi8(channels[1], m[1]),
+                    _mm256_shuffle_epi8(channels[2], m[2]),
+                ),
+            )
+        };
+        let (p0, p1, p2) = (
+            part(&wide_masks[0]),
+            part(&wide_masks[1]),
+            part(&wide_masks[2]),
+        );
+        // SAFETY: bytes 3 * i .. 3 * i + 96 lie inside `output` (3 * num).
+        let out = output.as_mut_ptr().add(3 * i) as *mut __m256i;
+        _mm256_storeu_si256(out, _mm256_permute2x128_si256::<0x20>(p0, p1));
+        _mm256_storeu_si256(out.add(1), _mm256_permute2x128_si256::<0x30>(p2, p0));
+        _mm256_storeu_si256(out.add(2), _mm256_permute2x128_si256::<0x31>(p1, p2));
+        i += 32;
+    }
+
     while i + 16 <= num {
         // SAFETY: i + 16 <= num, which the asserts bound by every slice.
         let widen =

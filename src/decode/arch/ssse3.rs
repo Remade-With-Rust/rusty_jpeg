@@ -218,11 +218,13 @@ pub unsafe fn dequantize_and_idct_block_8x8(
 
 /// YCbCr -> RGB for 8 pixels per step: `ycbcr_to_rgb`, bit for bit.
 ///
-/// Each channel is `y + ((HALF + K * c) >> 20)` (see `decoder::ycc_k`): the
-/// offsets in 32-bit lanes from `pmaddwd` of `(c << 8, c)` pairs against
-/// `(K >> 8, K & 255)`, then added to `y` in 16-bit lanes and narrowed with
-/// unsigned saturation, which is the scalar's clamp. Returns the number of
-/// pixels converted (a multiple of 8); the caller does the rest.
+/// Each channel is `y + ((HALF + K * c) >> 20)` (see `decoder::ycc_k`). The R
+/// and B offsets come from 16-bit `pmulhrsw` forms proven exact over every
+/// input; G's from `pmaddwd` of `(c << 8, c)` pairs against
+/// `(K >> 8, K & 255)` in 32-bit lanes. Each is added to `y` in 16-bit lanes
+/// and narrowed with unsigned saturation, which is the scalar's clamp.
+/// Returns the number of pixels converted (a multiple of 8); the caller does
+/// the rest.
 ///
 /// # Safety
 ///
@@ -240,10 +242,10 @@ pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &
     let zero = _mm_setzero_si128();
     let c128 = _mm_set1_epi16(128);
     let half = _mm_set1_epi32(ycc_k::HALF);
-    let k_r = pair(ycc_k::split(ycc_k::CR_R));
+    let k_r = _mm_set1_epi16(ycc_k::R_MULHRS);
+    let k_b = _mm_set1_epi16(ycc_k::B_MULHRS);
     let k_gb = pair(ycc_k::split(ycc_k::CB_G));
     let k_gr = pair(ycc_k::split(ycc_k::CR_G));
-    let k_b = pair(ycc_k::split(ycc_k::CB_B));
 
     // Control vectors for _mm_shuffle_epi8. -0x7F is selected so that the resulting position
     // after _mm_shuffle_epi8 will be filled with 0, so that the r, g, and b vectors can then
@@ -270,24 +272,32 @@ pub unsafe fn color_convert_line_ycbcr(y: &[u8], cb: &[u8], cr: &[u8], output: &
         let cbv = _mm_sub_epi16(load(cb), c128);
         let crv = _mm_sub_epi16(load(cr), c128);
 
-        // (c << 8, c) pairs; `c << 8` stays within i16 for c in -128..=127.
+        // R and B: the 16-bit forms proven over all 256 inputs (`ycc_k`).
+        let dr = _mm_mulhrs_epi16(_mm_slli_epi16(crv, 1), k_r);
+        let db = _mm_add_epi16(cbv, _mm_mulhrs_epi16(cbv, k_b));
+
+        // G: (c << 8, c) pairs against `split(K)`, exact in 32-bit lanes;
+        // `c << 8` stays within i16 for c in -128..=127.
         let cb_lo = _mm_unpacklo_epi16(_mm_slli_epi16(cbv, 8), cbv);
         let cb_hi = _mm_unpackhi_epi16(_mm_slli_epi16(cbv, 8), cbv);
         let cr_lo = _mm_unpacklo_epi16(_mm_slli_epi16(crv, 8), crv);
         let cr_hi = _mm_unpackhi_epi16(_mm_slli_epi16(crv, 8), crv);
-
-        let offset = |lo: __m128i, hi: __m128i| {
-            _mm_packs_epi32(
-                _mm_srai_epi32(_mm_add_epi32(lo, half), ycc_k::SHIFT),
-                _mm_srai_epi32(_mm_add_epi32(hi, half), ycc_k::SHIFT),
-            )
-        };
-        let dr = offset(_mm_madd_epi16(cr_lo, k_r), _mm_madd_epi16(cr_hi, k_r));
-        let dg = offset(
-            _mm_add_epi32(_mm_madd_epi16(cb_lo, k_gb), _mm_madd_epi16(cr_lo, k_gr)),
-            _mm_add_epi32(_mm_madd_epi16(cb_hi, k_gb), _mm_madd_epi16(cr_hi, k_gr)),
+        let dg = _mm_packs_epi32(
+            _mm_srai_epi32(
+                _mm_add_epi32(
+                    _mm_add_epi32(_mm_madd_epi16(cb_lo, k_gb), _mm_madd_epi16(cr_lo, k_gr)),
+                    half,
+                ),
+                ycc_k::SHIFT,
+            ),
+            _mm_srai_epi32(
+                _mm_add_epi32(
+                    _mm_add_epi32(_mm_madd_epi16(cb_hi, k_gb), _mm_madd_epi16(cr_hi, k_gr)),
+                    half,
+                ),
+                ycc_k::SHIFT,
+            ),
         );
-        let db = offset(_mm_madd_epi16(cb_lo, k_b), _mm_madd_epi16(cb_hi, k_b));
 
         let r = _mm_packus_epi16(_mm_add_epi16(yv, dr), zero);
         let g = _mm_packus_epi16(_mm_add_epi16(yv, dg), zero);
