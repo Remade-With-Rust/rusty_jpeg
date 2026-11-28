@@ -2900,6 +2900,131 @@ fn clamp_fixed_point(value: i32) -> u8 {
     (value >> FIXED_POINT_OFFSET).clamp(0, 255) as u8
 }
 
+/// The scalar YCbCr->RGB constants, for the vector kernels to reproduce
+/// [`ycbcr_to_rgb`] exactly.
+///
+/// `y << 20` is a multiple of 2^20 and nothing overflows `i32` (the largest
+/// magnitude is under 2^29), so
+/// `(y << 20 + HALF + K * c) >> 20 == y + ((HALF + K * c) >> 20)`: a kernel
+/// computes the small signed offset `(HALF + K * c) >> 20` in 32-bit lanes,
+/// adds it to `y` in 16-bit lanes, and a saturating narrow to `u8` is the
+/// scalar's clamp. `K * c` with `c` in `-128..=127` is formed exactly from
+/// 16-bit pieces as `(K >> 8) * (c << 8) + (K & 255) * c` where a lane has no
+/// 32-bit multiply (`pmaddwd`). `ycc_constants_match_scalar` pins the values
+/// and `ycbcr_kernels_match_scalar` checks every kernel on all (cb, cr).
+#[allow(dead_code)]
+pub(crate) mod ycc_k {
+    pub const SHIFT: i32 = 20;
+    pub const HALF: i32 = 1 << 19;
+    /// `R = y + (HALF + CR_R * cr) >> 20`
+    pub const CR_R: i32 = 1470104;
+    /// `G = y + (HALF + CB_G * cb + CR_G * cr) >> 20` (signs folded in)
+    pub const CB_G: i32 = -360857;
+    pub const CR_G: i32 = -748830;
+    /// `B = y + (HALF + CB_B * cb) >> 20`
+    pub const CB_B: i32 = 1858077;
+
+    /// `[K >> 8, K & 255]`: the 16-bit pair whose dot product with
+    /// `[c << 8, c]` is `K * c`, exactly.
+    pub const fn split(k: i32) -> [i16; 2] {
+        let hi = k >> 8;
+        assert!(hi >= i16::MIN as i32 && hi <= i16::MAX as i32);
+        [hi as i16, (k & 255) as i16]
+    }
+}
+
+#[cfg(test)]
+mod ycc_tests {
+    use super::*;
+
+    #[test]
+    fn ycc_constants_match_scalar() {
+        assert_eq!(ycc_k::CR_R, stbi_f2f(1.40200));
+        assert_eq!(ycc_k::CB_G, -stbi_f2f(0.34414));
+        assert_eq!(ycc_k::CR_G, -stbi_f2f(0.71414));
+        assert_eq!(ycc_k::CB_B, stbi_f2f(1.77200));
+        assert_eq!(ycc_k::HALF, HALF);
+        assert_eq!(ycc_k::SHIFT, FIXED_POINT_OFFSET);
+        for k in [ycc_k::CR_R, ycc_k::CB_G, ycc_k::CR_G, ycc_k::CB_B] {
+            let [hi, lo] = ycc_k::split(k);
+            for c in -128i32..=127 {
+                assert_eq!(i32::from(hi) * (c << 8) + i32::from(lo) * c, k * c);
+            }
+        }
+    }
+
+    /// The offset decomposition the kernels use equals `ycbcr_to_rgb` on
+    /// every one of the 2^24 inputs.
+    #[test]
+    fn ycc_offset_form_matches_scalar() {
+        let off = |v: i32| (ycc_k::HALF + v) >> ycc_k::SHIFT;
+        for cb in 0..=255u8 {
+            for cr in 0..=255u8 {
+                let (cbs, crs) = (i32::from(cb) - 128, i32::from(cr) - 128);
+                let (dr, dg, db) = (
+                    off(ycc_k::CR_R * crs),
+                    off(ycc_k::CB_G * cbs + ycc_k::CR_G * crs),
+                    off(ycc_k::CB_B * cbs),
+                );
+                for y in 0..=255u8 {
+                    let c = |d: i32| (i32::from(y) + d).clamp(0, 255) as u8;
+                    assert_eq!(ycbcr_to_rgb(y, cb, cr), (c(dr), c(dg), c(db)));
+                }
+            }
+        }
+    }
+
+    /// Every vector YCbCr kernel this CPU can run, against the scalar formula,
+    /// on all 65,536 (cb, cr) pairs with three different `y` patterns, at a
+    /// line length that leaves a scalar tail.
+    #[cfg(not(feature = "platform_independent"))]
+    #[test]
+    fn ycbcr_kernels_match_scalar() {
+        let kernels = crate::decode::arch::all_color_convert_kernels();
+        let n = 65536 + 13;
+        for (name, kernel) in kernels {
+            for pattern in 0..3u32 {
+                let mut y = vec![0u8; n];
+                let mut cb = vec![0u8; n];
+                let mut cr = vec![0u8; n];
+                for i in 0..n {
+                    let p = (i % 65536) as u32;
+                    cb[i] = (p >> 8) as u8;
+                    cr[i] = p as u8;
+                    y[i] = match pattern {
+                        0 => (p.wrapping_mul(2_654_435_761) >> 24) as u8,
+                        1 => {
+                            if p & 1 == 0 {
+                                0
+                            } else {
+                                255
+                            }
+                        }
+                        _ => (p >> 3) as u8 ^ (p as u8),
+                    };
+                }
+                let mut want = vec![0u8; 3 * n];
+                for (i, px) in want.chunks_exact_mut(3).enumerate() {
+                    let (r, g, b) = ycbcr_to_rgb(y[i], cb[i], cr[i]);
+                    px.copy_from_slice(&[r, g, b]);
+                }
+                // Odd sub-lengths too, so every kernel's own tail handling runs.
+                for len in [n, 1, 7, 8, 9, 15, 16, 17, 31, 33, 47, 1000] {
+                    let mut got = vec![0x5Au8; 3 * len];
+                    #[allow(unsafe_code)]
+                    let done = unsafe { kernel(&y[..len], &cb[..len], &cr[..len], &mut got) };
+                    assert!(done <= len, "{name}: claimed {done} of {len}");
+                    assert_eq!(
+                        got[..3 * done],
+                        want[..3 * done],
+                        "{name}: pattern {pattern}, len {len}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod color_no_convert_tests {
     #[test]

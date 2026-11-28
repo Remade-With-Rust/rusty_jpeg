@@ -1,87 +1,94 @@
-#[cfg(target_arch = "wasm32")]
+//! wasm simd128 kernels: the single-block IDCT and YCbCr->RGB, both bit-exact
+//! twins of the scalar code. `i32x4.dot_i16x8_s` is `pmaddwd`, so the IDCT is
+//! the x86 kernel's arithmetic (see `idct::simd_k`); the colour kernel uses
+//! the native 32-bit multiply.
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 use core::arch::wasm32::*;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+use crate::decode::{decoder::ycc_k, idct::simd_k};
+
+/// A dot-product operand: the pair `k = [even, odd]` in every 32-bit lane.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
 #[target_feature(enable = "simd128")]
-fn idct8(data: &mut [v128; 8]) {
-    // The fixed-point constants here are obtained by taking the fractional part of the constants
-    // from the non-SIMD implementation and scaling them up by 1<<15. This is because
-    // i16x8_q15mulr_sat(a, b) is effectively equivalent to (a*b)>>15 (except for possibly some
-    // slight differences in rounding).
-
-    // The code here is effectively equivalent to the calls to "kernel" in idct.rs, except that it
-    // doesn't apply any further scaling and fixed point constants have a different precision.
-
-    let p2 = data[2];
-    let p3 = data[6];
-    let p1 = i16x8_q15mulr_sat(i16x8_add_sat(p2, p3), i16x8_splat(17734)); // 0.5411961
-    let t2 = i16x8_sub_sat(
-        i16x8_sub_sat(p1, p3),
-        i16x8_q15mulr_sat(p3, i16x8_splat(27779)), // 0.847759065
-    );
-    let t3 = i16x8_add_sat(p1, i16x8_q15mulr_sat(p2, i16x8_splat(25079))); // 0.765366865
-
-    let p2 = data[0];
-    let p3 = data[4];
-    let t0 = i16x8_add_sat(p2, p3);
-    let t1 = i16x8_sub_sat(p2, p3);
-
-    let x0 = i16x8_add_sat(t0, t3);
-    let x3 = i16x8_sub_sat(t0, t3);
-    let x1 = i16x8_add_sat(t1, t2);
-    let x2 = i16x8_sub_sat(t1, t2);
-
-    let t0 = data[7];
-    let t1 = data[5];
-    let t2 = data[3];
-    let t3 = data[1];
-
-    let p3 = i16x8_add_sat(t0, t2);
-    let p4 = i16x8_add_sat(t1, t3);
-    let p1 = i16x8_add_sat(t0, t3);
-    let p2 = i16x8_add_sat(t1, t2);
-    let p5 = i16x8_add_sat(p3, p4);
-    let p5 = i16x8_add_sat(p5, i16x8_q15mulr_sat(p5, i16x8_splat(5763))); // 0.175875602
-
-    let t0 = i16x8_q15mulr_sat(t0, i16x8_splat(9786)); // 0.298631336
-    let t1 = i16x8_add_sat(
-        i16x8_add_sat(t1, t1),
-        i16x8_q15mulr_sat(t1, i16x8_splat(1741)), // 0.053119869
-    );
-    let t2 = i16x8_add_sat(
-        i16x8_add_sat(t2, i16x8_add_sat(t2, t2)),
-        i16x8_q15mulr_sat(t2, i16x8_splat(2383)), // 0.072711026
-    );
-    let t3 = i16x8_add_sat(t3, i16x8_q15mulr_sat(t3, i16x8_splat(16427))); // 0.501321110
-
-    let p1 = i16x8_sub_sat(p5, i16x8_q15mulr_sat(p1, i16x8_splat(29490))); // 0.899976223
-    let p2 = i16x8_sub_sat(
-        i16x8_sub_sat(i16x8_sub_sat(p5, p2), p2),
-        i16x8_q15mulr_sat(p2, i16x8_splat(18446)), // 0.562915447
-    );
-
-    let p3 = i16x8_sub_sat(
-        i16x8_q15mulr_sat(p3, i16x8_splat(-31509)), // -0.961570560
-        p3,
-    );
-    let p4 = i16x8_q15mulr_sat(p4, i16x8_splat(-12785)); // -0.390180644
-
-    let t3 = i16x8_add_sat(i16x8_add_sat(p1, p4), t3);
-    let t2 = i16x8_add_sat(i16x8_add_sat(p2, p3), t2);
-    let t1 = i16x8_add_sat(i16x8_add_sat(p2, p4), t1);
-    let t0 = i16x8_add_sat(i16x8_add_sat(p1, p3), t0);
-
-    data[0] = i16x8_add_sat(x0, t3);
-    data[7] = i16x8_sub_sat(x0, t3);
-    data[1] = i16x8_add_sat(x1, t2);
-    data[6] = i16x8_sub_sat(x1, t2);
-    data[2] = i16x8_add_sat(x2, t1);
-    data[5] = i16x8_sub_sat(x2, t1);
-    data[3] = i16x8_add_sat(x3, t0);
-    data[4] = i16x8_sub_sat(x3, t0);
+fn pair(k: [i16; 2]) -> v128 {
+    i32x4_splat((i32::from(k[1]) << 16) | i32::from(k[0] as u16))
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+#[target_feature(enable = "simd128")]
+fn interleave_lo(a: v128, b: v128) -> v128 {
+    i16x8_shuffle::<0, 8, 1, 9, 2, 10, 3, 11>(a, b)
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+#[target_feature(enable = "simd128")]
+fn interleave_hi(a: v128, b: v128) -> v128 {
+    i16x8_shuffle::<4, 12, 5, 13, 6, 14, 7, 15>(a, b)
+}
+
+/// Half of one 1-D pass: four lanes of the scalar `kernel`, each output as
+/// `L_n(s) + bias` in `i32` -- the scalar's value before its shift.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+#[target_feature(enable = "simd128")]
+fn pass_half(s04: v128, s26: v128, s13: v128, s57: v128, bias: v128) -> [v128; 8] {
+    let t2 = i32x4_dot_i16x8(s26, pair(simd_k::EVEN_T2));
+    let t3 = i32x4_dot_i16x8(s26, pair(simd_k::EVEN_T3));
+    let t0 = i32x4_add(i32x4_dot_i16x8(s04, pair([simd_k::FSH, simd_k::FSH])), bias);
+    let t1 = i32x4_add(
+        i32x4_dot_i16x8(s04, pair([simd_k::FSH, -simd_k::FSH])),
+        bias,
+    );
+    let x = [
+        i32x4_add(t0, t3),
+        i32x4_add(t1, t2),
+        i32x4_sub(t1, t2),
+        i32x4_sub(t0, t3),
+    ];
+    let mut t = [i32x4_splat(0); 4];
+    for (n, c) in simd_k::ODD.iter().enumerate() {
+        t[n] = i32x4_add(
+            i32x4_dot_i16x8(s13, pair([c[0], c[1]])),
+            i32x4_dot_i16x8(s57, pair([c[2], c[3]])),
+        );
+    }
+    let mut out = [i32x4_splat(0); 8];
+    for n in 0..4 {
+        out[n] = i32x4_add(x[n], t[3 - n]);
+        out[7 - n] = i32x4_sub(x[n], t[3 - n]);
+    }
+    out
+}
+
+/// One 1-D pass over eight 16-bit lanes; returns lanes 0-3 and 4-7 as `i32`.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[inline]
+#[target_feature(enable = "simd128")]
+fn pass(s: &[v128; 8], bias: i32) -> ([v128; 8], [v128; 8]) {
+    let bias = i32x4_splat(bias);
+    let lo = pass_half(
+        interleave_lo(s[0], s[4]),
+        interleave_lo(s[2], s[6]),
+        interleave_lo(s[1], s[3]),
+        interleave_lo(s[5], s[7]),
+        bias,
+    );
+    let hi = pass_half(
+        interleave_hi(s[0], s[4]),
+        interleave_hi(s[2], s[6]),
+        interleave_hi(s[1], s[3]),
+        interleave_hi(s[5], s[7]),
+        bias,
+    );
+    (lo, hi)
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[target_feature(enable = "simd128")]
 fn transpose8(data: &mut [v128; 8]) {
     // Transpose a 8x8 matrix with a sequence of interleaving operations.
@@ -119,7 +126,10 @@ fn transpose8(data: &mut [v128; 8]) {
     data[7] = i64x2_shuffle::<1, 3>(d0123hh, d4567hh);
 }
 
-#[cfg(target_arch = "wasm32")]
+/// Dequantize and inverse-transform one 8x8 block: the scalar kernel, bit for
+/// bit. A block whose dequantized coefficients or first-pass outputs leave
+/// `i16` (never, for real images) is handed to the scalar kernel whole.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[target_feature(enable = "simd128")]
 pub fn dequantize_and_idct_block_8x8(
     coefficients: &[i16; 64],
@@ -128,7 +138,7 @@ pub fn dequantize_and_idct_block_8x8(
     output: &mut [u8],
 ) {
     // The loop below will write to positions [output_linestride * i, output_linestride * i + 8)
-    // for 0<=i<8. Thus, the last accessed position is at an offset of output_linestrade * 7 + 7,
+    // for 0<=i<8. Thus, the last accessed position is at an offset of output_linestride * 7 + 7,
     // and if that position is in-bounds, so are all other accesses.
     assert!(
         output.len()
@@ -139,51 +149,69 @@ pub fn dequantize_and_idct_block_8x8(
                 .unwrap()
     );
 
-    const SHIFT: u32 = 3;
-
-    // Read the DCT coefficients, scale them up and dequantize them.
-    let mut data = [i16x8_splat(0); 8];
-    unsafe {
-        for i in 0..8 {
-            data[i] = i16x8_shl(
-                i16x8_mul(
-                    v128_load(coefficients.as_ptr().wrapping_add(i * 8) as *const _),
-                    v128_load(quantization_table.as_ptr().wrapping_add(i * 8) as *const _),
-                ),
-                SHIFT,
-            );
-        }
+    // Dequantize in 32-bit lanes (exact for q < 0x8000; a larger table entry
+    // sends the block to the scalar kernel), recording whether every product
+    // fits i16: `v + 0x8000` has a zero high half exactly when it does.
+    let k8000 = i32x4_splat(0x8000);
+    let mut range = i32x4_splat(0);
+    let mut qor = i32x4_splat(0);
+    let mut s = [i32x4_splat(0); 8];
+    for (i, row) in s.iter_mut().enumerate() {
+        // SAFETY: rows 0..8 of 8 elements lie inside the 64-element arrays.
+        let (c, q) = unsafe {
+            (
+                v128_load(coefficients.as_ptr().add(i * 8) as *const v128),
+                v128_load(quantization_table.as_ptr().add(i * 8) as *const v128),
+            )
+        };
+        qor = v128_or(qor, q);
+        let plo = i32x4_extmul_low_i16x8(c, q);
+        let phi = i32x4_extmul_high_i16x8(c, q);
+        range = v128_or(range, v128_or(i32x4_add(plo, k8000), i32x4_add(phi, k8000)));
+        *row = i16x8_narrow_i32x4(plo, phi);
     }
 
-    // Usual column IDCT - transpose - column IDCT - transpose approach.
-    idct8(&mut data);
-    transpose8(&mut data);
-    idct8(&mut data);
-    transpose8(&mut data);
+    let (lo, hi) = pass(&s, simd_k::PASS1_BIAS);
+    let mut t = [i32x4_splat(0); 8];
+    for n in 0..8 {
+        let a = i32x4_shr(lo[n], simd_k::PASS1_SHIFT as u32);
+        let b = i32x4_shr(hi[n], simd_k::PASS1_SHIFT as u32);
+        range = v128_or(range, v128_or(i32x4_add(a, k8000), i32x4_add(b, k8000)));
+        t[n] = i16x8_narrow_i32x4(a, b);
+    }
+    let bad = v128_or(u32x4_shr(range, 16), v128_and(qor, i16x8_splat(i16::MIN)));
+    if v128_any_true(bad) {
+        return super::idct_fallback(coefficients, quantization_table, output_linestride, output);
+    }
 
-    for i in 0..8 {
-        // The two passes of the IDCT algorithm give us a factor of 8, so the shift here is
-        // increased by 3.
-        // As values will be stored in a u8, they need to be 128-centered and not 0-centered.
-        // We add 128 with the appropriate shift for that purpose.
-        const OFFSET: i16 = 128 << (SHIFT + 3);
-        // We want rounding right shift, so we should add (1/2) << (SHIFT+3) before shifting.
-        const ROUNDING_BIAS: i16 = (1 << (SHIFT + 3)) >> 1;
+    // Rows. Saturating narrows to i16 then u8 are the scalar's clamp.
+    transpose8(&mut t);
+    let (lo, hi) = pass(&t, simd_k::PASS2_BIAS);
+    let mut o = [i32x4_splat(0); 8];
+    for n in 0..8 {
+        o[n] = i16x8_narrow_i32x4(
+            i32x4_shr(lo[n], simd_k::PASS2_SHIFT as u32),
+            i32x4_shr(hi[n], simd_k::PASS2_SHIFT as u32),
+        );
+    }
+    transpose8(&mut o);
 
-        let data_with_offset = i16x8_add_sat(data[i], i16x8_splat(OFFSET + ROUNDING_BIAS));
-
-        // SAFETY: the assert at the start of this function ensures
-        // `output_linestride * i + 7` < output.len(), so all accesses are in-bounds.
+    for (i, row) in o.iter().enumerate() {
+        // SAFETY: the assert above bounds `output_linestride * i + 8`.
         unsafe {
             v128_store64_lane::<0>(
-                u8x16_narrow_i16x8(i16x8_shr(data_with_offset, SHIFT + 3), i16x8_splat(0)),
-                output.as_mut_ptr().wrapping_add(output_linestride * i) as *mut _,
+                u8x16_narrow_i16x8(*row, *row),
+                output.as_mut_ptr().add(output_linestride * i) as *mut u64,
             );
         }
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+/// YCbCr -> RGB, 8 pixels per step: `ycbcr_to_rgb`, bit for bit. Each channel
+/// is `y + ((HALF + K * c) >> 20)` (see `decoder::ycc_k`) in 32-bit lanes,
+/// added to `y` in 16-bit lanes and narrowed with unsigned saturation (the
+/// scalar's clamp). Returns the number of pixels converted.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
 #[target_feature(enable = "simd128")]
 pub fn color_convert_line_ycbcr(
     y_slice: &[u8],
@@ -191,55 +219,62 @@ pub fn color_convert_line_ycbcr(
     cr_slice: &[u8],
     output: &mut [u8],
 ) -> usize {
-    assert!(output.len() % 3 == 0);
+    assert!(output.len().is_multiple_of(3));
     let num = output.len() / 3;
     assert!(num <= y_slice.len());
     assert!(num <= cb_slice.len());
     assert!(num <= cr_slice.len());
 
     let num_vecs = num / 8;
+    let half = i32x4_splat(ycc_k::HALF);
+    let c128 = i16x8_splat(128);
 
     for i in 0..num_vecs {
-        const SHIFT: u32 = 6;
-        // Load.
         let y: v128;
         let cb: v128;
         let cr: v128;
-        // SAFETY: i is at most `num / 8 - 8`, so the highest v128_load64_zero reads from
-        // [num - 8, num). The above asserts ensure this is in-bounds.
+        // SAFETY: 8 * i + 8 <= num, which the asserts bound by every slice.
         unsafe {
-            y = v128_load64_zero(y_slice.as_ptr().wrapping_add(i * 8) as *const _);
-            cb = v128_load64_zero(cb_slice.as_ptr().wrapping_add(i * 8) as *const _);
-            cr = v128_load64_zero(cr_slice.as_ptr().wrapping_add(i * 8) as *const _);
+            y = v128_load64_zero(y_slice.as_ptr().add(i * 8) as *const _);
+            cb = v128_load64_zero(cb_slice.as_ptr().add(i * 8) as *const _);
+            cr = v128_load64_zero(cr_slice.as_ptr().add(i * 8) as *const _);
         }
 
-        // Convert to 16 bit.
-        let y = i16x8_shl(i16x8_extend_low_u8x16(y), SHIFT);
-        let cb = i16x8_shl(i16x8_extend_low_u8x16(cb), SHIFT);
-        let cr = i16x8_shl(i16x8_extend_low_u8x16(cr), SHIFT);
+        let yv = i16x8_extend_low_u8x16(y);
+        let cbv = i16x8_sub(i16x8_extend_low_u8x16(cb), c128);
+        let crv = i16x8_sub(i16x8_extend_low_u8x16(cr), c128);
+        let (cb_lo, cb_hi) = (i32x4_extend_low_i16x8(cbv), i32x4_extend_high_i16x8(cbv));
+        let (cr_lo, cr_hi) = (i32x4_extend_low_i16x8(crv), i32x4_extend_high_i16x8(crv));
+        let k = |v: i32| i32x4_splat(v);
+        let offset = |lo: v128, hi: v128| {
+            i16x8_narrow_i32x4(
+                i32x4_shr(i32x4_add(lo, half), ycc_k::SHIFT as u32),
+                i32x4_shr(i32x4_add(hi, half), ycc_k::SHIFT as u32),
+            )
+        };
+        let dr = offset(
+            i32x4_mul(cr_lo, k(ycc_k::CR_R)),
+            i32x4_mul(cr_hi, k(ycc_k::CR_R)),
+        );
+        let dg = offset(
+            i32x4_add(
+                i32x4_mul(cb_lo, k(ycc_k::CB_G)),
+                i32x4_mul(cr_lo, k(ycc_k::CR_G)),
+            ),
+            i32x4_add(
+                i32x4_mul(cb_hi, k(ycc_k::CB_G)),
+                i32x4_mul(cr_hi, k(ycc_k::CR_G)),
+            ),
+        );
+        let db = offset(
+            i32x4_mul(cb_lo, k(ycc_k::CB_B)),
+            i32x4_mul(cb_hi, k(ycc_k::CB_B)),
+        );
 
-        // Add offsets
-        let c128 = i16x8_splat(128 << SHIFT);
-        let y = i16x8_add_sat(y, i16x8_splat((1 << SHIFT) >> 1));
-        let cb = i16x8_sub_sat(cb, c128);
-        let cr = i16x8_sub_sat(cr, c128);
-
-        // Compute cr * 1.402, cb * 0.34414, cr * 0.71414, cb * 1.772
-        let cr_140200 = i16x8_add_sat(i16x8_q15mulr_sat(cr, i16x8_splat(13173)), cr);
-        let cb_034414 = i16x8_q15mulr_sat(cb, i16x8_splat(11276));
-        let cr_071414 = i16x8_q15mulr_sat(cr, i16x8_splat(23401));
-        let cb_177200 = i16x8_add_sat(i16x8_q15mulr_sat(cb, i16x8_splat(25297)), cb);
-
-        // Last conversion step.
-        let r = i16x8_add_sat(y, cr_140200);
-        let g = i16x8_sub_sat(y, i16x8_add_sat(cb_034414, cr_071414));
-        let b = i16x8_add_sat(y, cb_177200);
-
-        // Shift back and convert to u8.
         let zero = u8x16_splat(0);
-        let r = u8x16_narrow_i16x8(i16x8_shr(r, SHIFT), zero);
-        let g = u8x16_narrow_i16x8(i16x8_shr(g, SHIFT), zero);
-        let b = u8x16_narrow_i16x8(i16x8_shr(b, SHIFT), zero);
+        let r = u8x16_narrow_i16x8(i16x8_add(yv, dr), zero);
+        let g = u8x16_narrow_i16x8(i16x8_add(yv, dg), zero);
+        let b = u8x16_narrow_i16x8(i16x8_add(yv, db), zero);
 
         // Shuffle rrrrrrrrggggggggbbbbbbbb to rgbrgbrgb...
 
@@ -284,14 +319,10 @@ pub fn color_convert_line_ycbcr(
             0,
         >(rg_lanes, b); // --
 
-        // SAFETY: i is at most `output.len() / 24 - 1` so the highest possible write is to
-        // `output.len() - 1`.
+        // SAFETY: bytes 24 * i .. 24 * i + 24 lie inside `output` (3 * num).
         unsafe {
-            v128_store(output.as_mut_ptr().wrapping_add(24 * i) as *mut _, rgb_low);
-            v128_store64_lane::<0>(
-                rgb_hi,
-                output.as_mut_ptr().wrapping_add(24 * i + 16) as *mut _,
-            );
+            v128_store(output.as_mut_ptr().add(24 * i) as *mut _, rgb_low);
+            v128_store64_lane::<0>(rgb_hi, output.as_mut_ptr().add(24 * i + 16) as *mut _);
         }
     }
 
