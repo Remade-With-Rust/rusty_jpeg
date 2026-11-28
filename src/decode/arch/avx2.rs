@@ -58,42 +58,83 @@ unsafe fn pass_half(
     out
 }
 
-/// One 1-D pass. `unpack*` interleave within each 128-bit lane, so lane 0
-/// carries block A's lanes 0-3 / 4-7 and lane 1 block B's.
+/// Half of a pass, finished at once, as `ssse3::half`: shifted, packed to
+/// i16 in output pairs, and (with `CHECK`) range-accumulated. Per lane, so
+/// lane 0 is block A and lane 1 block B.
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn pass(s: &[__m256i; 8], bias: i32) -> ([__m256i; 8], [__m256i; 8]) {
+unsafe fn half<const SHIFT: i32, const CHECK: bool>(
+    s04: __m256i,
+    s26: __m256i,
+    s13: __m256i,
+    s57: __m256i,
+    bias: __m256i,
+    range: &mut __m256i,
+) -> [__m256i; 4] {
+    let o = pass_half(s04, s26, s13, s57, bias);
+    let k8000 = _mm256_set1_epi32(0x8000);
+    let mut p = [_mm256_setzero_si256(); 4];
+    for (j, pj) in p.iter_mut().enumerate() {
+        let a = _mm256_srai_epi32::<SHIFT>(o[2 * j]);
+        let b = _mm256_srai_epi32::<SHIFT>(o[2 * j + 1]);
+        if CHECK {
+            *range = _mm256_or_si256(
+                *range,
+                _mm256_or_si256(_mm256_add_epi32(a, k8000), _mm256_add_epi32(b, k8000)),
+            );
+        }
+        *pj = _mm256_packs_epi32(a, b);
+    }
+    p
+}
+
+/// One 1-D pass, shifted, narrowed and transposed, as `ssse3::pass_t`.
+/// `unpack*`, `shuffle_epi8` and `packs` all work within each 128-bit lane,
+/// so the two blocks never mix.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn pass_t<const SHIFT: i32, const CHECK: bool>(
+    s: &[__m256i; 8],
+    bias: i32,
+    range: &mut __m256i,
+) -> [__m256i; 8] {
     let bias = _mm256_set1_epi32(bias);
-    let lo = pass_half(
+    let lo = half::<SHIFT, CHECK>(
         _mm256_unpacklo_epi16(s[0], s[4]),
         _mm256_unpacklo_epi16(s[2], s[6]),
         _mm256_unpacklo_epi16(s[1], s[3]),
         _mm256_unpacklo_epi16(s[5], s[7]),
         bias,
+        range,
     );
-    let hi = pass_half(
+    let hi = half::<SHIFT, CHECK>(
         _mm256_unpackhi_epi16(s[0], s[4]),
         _mm256_unpackhi_epi16(s[2], s[6]),
         _mm256_unpackhi_epi16(s[1], s[3]),
         _mm256_unpackhi_epi16(s[5], s[7]),
         bias,
+        range,
     );
-    (lo, hi)
+    transpose_packed(&lo, &hi)
 }
 
-/// Transpose both blocks. The unpack instructions never cross the 128-bit lane
-/// boundary, so this is two independent 8x8 transposes for the price of one.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+/// Transpose both blocks from row pairs, as `ssse3::transpose_packed`; every
+/// instruction stays inside its 128-bit lane, so this is two independent
+/// 8x8 transposes for the price of one.
+#[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn transpose8(data: &mut [__m256i; 8]) {
-    let d01l = _mm256_unpacklo_epi16(data[0], data[1]);
-    let d23l = _mm256_unpacklo_epi16(data[2], data[3]);
-    let d45l = _mm256_unpacklo_epi16(data[4], data[5]);
-    let d67l = _mm256_unpacklo_epi16(data[6], data[7]);
-    let d01h = _mm256_unpackhi_epi16(data[0], data[1]);
-    let d23h = _mm256_unpackhi_epi16(data[2], data[3]);
-    let d45h = _mm256_unpackhi_epi16(data[4], data[5]);
-    let d67h = _mm256_unpackhi_epi16(data[6], data[7]);
+unsafe fn transpose_packed(lo: &[__m256i; 4], hi: &[__m256i; 4]) -> [__m256i; 8] {
+    let m = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+        0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15,
+    ));
+    let d01l = _mm256_shuffle_epi8(lo[0], m);
+    let d23l = _mm256_shuffle_epi8(lo[1], m);
+    let d45l = _mm256_shuffle_epi8(lo[2], m);
+    let d67l = _mm256_shuffle_epi8(lo[3], m);
+    let d01h = _mm256_shuffle_epi8(hi[0], m);
+    let d23h = _mm256_shuffle_epi8(hi[1], m);
+    let d45h = _mm256_shuffle_epi8(hi[2], m);
+    let d67h = _mm256_shuffle_epi8(hi[3], m);
 
     let d0123ll = _mm256_unpacklo_epi32(d01l, d23l);
     let d0123lh = _mm256_unpackhi_epi32(d01l, d23l);
@@ -104,14 +145,16 @@ unsafe fn transpose8(data: &mut [__m256i; 8]) {
     let d4567hl = _mm256_unpacklo_epi32(d45h, d67h);
     let d4567hh = _mm256_unpackhi_epi32(d45h, d67h);
 
-    data[0] = _mm256_unpacklo_epi64(d0123ll, d4567ll);
-    data[1] = _mm256_unpackhi_epi64(d0123ll, d4567ll);
-    data[2] = _mm256_unpacklo_epi64(d0123lh, d4567lh);
-    data[3] = _mm256_unpackhi_epi64(d0123lh, d4567lh);
-    data[4] = _mm256_unpacklo_epi64(d0123hl, d4567hl);
-    data[5] = _mm256_unpackhi_epi64(d0123hl, d4567hl);
-    data[6] = _mm256_unpacklo_epi64(d0123hh, d4567hh);
-    data[7] = _mm256_unpackhi_epi64(d0123hh, d4567hh);
+    [
+        _mm256_unpacklo_epi64(d0123ll, d4567ll),
+        _mm256_unpackhi_epi64(d0123ll, d4567ll),
+        _mm256_unpacklo_epi64(d0123lh, d4567lh),
+        _mm256_unpackhi_epi64(d0123lh, d4567lh),
+        _mm256_unpacklo_epi64(d0123hl, d4567hl),
+        _mm256_unpackhi_epi64(d0123hl, d4567hl),
+        _mm256_unpacklo_epi64(d0123hh, d4567hh),
+        _mm256_unpackhi_epi64(d0123hh, d4567hh),
+    ]
 }
 
 /// Dequantize and inverse-transform two 8x8 blocks in one instruction stream:
@@ -180,20 +223,8 @@ pub unsafe fn dequantize_and_idct_block_8x8_pair(
     }
     bad = _mm256_or_si256(bad, _mm256_and_si256(qor, _mm256_set1_epi16(i16::MIN)));
 
-    let (lo, hi) = pass(&s, simd_k::PASS1_BIAS);
-    let k8000 = _mm256_set1_epi32(0x8000);
     let mut range = zero;
-    let mut t = [zero; 8];
-    for n in 0..8 {
-        let a = _mm256_srai_epi32::<{ simd_k::PASS1_SHIFT }>(lo[n]);
-        let b = _mm256_srai_epi32::<{ simd_k::PASS1_SHIFT }>(hi[n]);
-        range = _mm256_or_si256(
-            range,
-            _mm256_or_si256(_mm256_add_epi32(a, k8000), _mm256_add_epi32(b, k8000)),
-        );
-        // `packs` is per lane: [A lanes 0-7 | B lanes 0-7].
-        t[n] = _mm256_packs_epi32(a, b);
-    }
+    let t = pass_t::<{ simd_k::PASS1_SHIFT }, true>(&s, simd_k::PASS1_BIAS, &mut range);
     bad = _mm256_or_si256(bad, _mm256_srli_epi32::<16>(range));
     if _mm256_movemask_epi8(_mm256_cmpeq_epi8(bad, zero)) != -1 {
         super::idct_fallback(
@@ -211,16 +242,7 @@ pub unsafe fn dequantize_and_idct_block_8x8_pair(
         return;
     }
 
-    transpose8(&mut t);
-    let (lo, hi) = pass(&t, simd_k::PASS2_BIAS);
-    let mut o = [zero; 8];
-    for n in 0..8 {
-        o[n] = _mm256_packs_epi32(
-            _mm256_srai_epi32::<{ simd_k::PASS2_SHIFT }>(lo[n]),
-            _mm256_srai_epi32::<{ simd_k::PASS2_SHIFT }>(hi[n]),
-        );
-    }
-    transpose8(&mut o);
+    let o = pass_t::<{ simd_k::PASS2_SHIFT }, false>(&t, simd_k::PASS2_BIAS, &mut range);
 
     for (i, row) in o.iter().enumerate() {
         // packus is per lane: lane 0's low 8 bytes are block A's row, lane 1's
